@@ -27,37 +27,46 @@ pub struct TextChunk {
 }
 
 pub fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
-    if text.len() <= chunk_size {
+    let byte_positions: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    let char_count = byte_positions.len();
+
+    if char_count <= chunk_size {
         return vec![text.to_string()];
     }
 
     let mut chunks = Vec::new();
-    let mut start = 0;
+    let mut start_char = 0;
 
-    while start < text.len() {
-        let end = (start + chunk_size).min(text.len());
+    while start_char < char_count {
+        let end_char = (start_char + chunk_size).min(char_count);
+        let end_byte = if end_char < char_count { byte_positions[end_char] } else { text.len() };
 
-        if end == text.len() {
-            chunks.push(text[start..].to_string());
+        if end_char >= char_count {
+            chunks.push(text[byte_positions[start_char]..].to_string());
             break;
         }
 
-        let mut split = end;
-        if let Some(pos) = text[start..end].rfind('\n') {
-            split = start + pos + 1;
-        } else if let Some(pos) = text[start..end].rfind(". ") {
-            split = start + pos + 2;
-        } else if let Some(pos) = text[start..end].rfind(' ') {
-            split = start + pos + 1;
+        let slice_start = byte_positions[start_char];
+        let slice = &text[slice_start..end_byte];
+
+        let mut split_byte = end_byte;
+        if let Some(pos) = slice.rfind('\n') {
+            split_byte = slice_start + pos + 1;
+        } else if let Some(pos) = slice.rfind(". ") {
+            split_byte = slice_start + pos + 2;
+        } else if let Some(pos) = slice.rfind(' ') {
+            split_byte = slice_start + pos + 1;
         }
 
-        chunks.push(text[start..split].to_string());
+        chunks.push(text[slice_start..split_byte].to_string());
 
-        if split >= text.len() {
+        let split_end = byte_positions.iter().position(|&b| b >= split_byte).unwrap_or(char_count);
+        if split_end >= char_count {
             break;
         }
 
-        start = if split > overlap { split - overlap } else { 0 };
+        let overlap_chars = overlap.min(split_end);
+        start_char = split_end.saturating_sub(overlap_chars);
     }
 
     chunks
