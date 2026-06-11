@@ -1,5 +1,6 @@
 mod format;
 mod integrity;
+mod patcher;
 mod reader;
 mod writer;
 
@@ -113,6 +114,84 @@ mod tests {
 
         std::fs::remove_file(path).ok();
     }
+
+    #[test]
+    fn append_neuron_round_trip() {
+        use manas_core::Neuron;
+        let path = Path::new("/tmp/test_append.manas");
+        let brain = ManasBrain::new(path);
+
+        let net = test_network();
+        brain.save(&net).unwrap();
+        let before = brain.inspect().unwrap();
+
+        let new_n = Neuron::new(100, 4, Activation::ReLU);
+        brain.append_neuron(0, &new_n).unwrap();
+
+        assert!(brain.verify().unwrap());
+        let stats = brain.inspect().unwrap();
+        assert_eq!(stats.neuron_count, before.neuron_count + 1);
+        assert_eq!(stats.layer_count, before.layer_count);
+
+        let loaded = brain.load().unwrap();
+        let found = loaded.all_neurons().iter().any(|(_, n)| n.id == 100);
+        assert!(found, "appended neuron 100 not found in loaded network");
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn update_neuron_in_place() {
+        let path = Path::new("/tmp/test_update.manas");
+        let brain = ManasBrain::new(path);
+
+        let net = test_network();
+        brain.save(&net).unwrap();
+
+        let neurons = net.all_neurons();
+        let (_, old) = neurons[0];
+        let mut updated = old.clone();
+        updated.bias = 42.0;
+        updated.last_activated = 999999;
+
+        brain.update_neuron(old.id, &updated).unwrap();
+
+        assert!(brain.verify().unwrap());
+        let loaded = brain.load().unwrap();
+        let found: Vec<&manas_core::Neuron> = loaded.all_neurons().iter().map(|(_, n)| *n).filter(|n| n.id == old.id).collect();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].bias.to_bits(), 42.0f32.to_bits());
+        assert_eq!(found[0].last_activated, 999999);
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn append_multiple_neurons() {
+        use manas_core::Neuron;
+        let path = Path::new("/tmp/test_append_multi.manas");
+        let brain = ManasBrain::new(path);
+
+        let net = test_network();
+        brain.save(&net).unwrap();
+        let before = brain.inspect().unwrap();
+
+        for i in 0..5 {
+            let n = Neuron::new(200 + i, 4, Activation::ReLU);
+            brain.append_neuron(0, &n).unwrap();
+        }
+
+        let stats = brain.inspect().unwrap();
+        assert_eq!(stats.neuron_count, before.neuron_count + 5);
+
+        let loaded = brain.load().unwrap();
+        let ids: Vec<u64> = loaded.all_neurons().iter().map(|(_, n)| n.id).collect();
+        for i in 0..5 {
+            assert!(ids.contains(&(200 + i)), "neuron {} not found", 200 + i);
+        }
+
+        std::fs::remove_file(path).ok();
+    }
 }
 
 pub struct BrainStats {
@@ -142,14 +221,12 @@ impl ManasBrain {
         writer::write_to_path(network, &self.path)
     }
 
-    pub fn append_neuron(&self, _layer_id: u32, _neuron: &Neuron) -> Result<(), ManasError> {
-        let network = self.load()?;
-        self.save(&network)
+    pub fn append_neuron(&self, layer_id: u32, neuron: &Neuron) -> Result<(), ManasError> {
+        patcher::append_neuron_to_file(&self.path, layer_id, neuron)
     }
 
-    pub fn update_neuron(&self, _neuron_id: u64, _neuron: &Neuron) -> Result<(), ManasError> {
-        let network = self.load()?;
-        self.save(&network)
+    pub fn update_neuron(&self, neuron_id: u64, neuron: &Neuron) -> Result<(), ManasError> {
+        patcher::update_neuron_in_file(&self.path, neuron_id, neuron)
     }
 
     pub fn save_with_vocab(
