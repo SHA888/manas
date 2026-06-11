@@ -95,7 +95,7 @@ Manas is built from 7 Rust crates, each with a single responsibility:
 ### Crates
 
 | Crate | Purpose |
-|---|---|---|
+|---|---|
 | **manas-core** | Neural network engine — Neuron, Layer, Network structs, forward pass, growth logic |
 | **manas-store** | Custom `.manas` binary format — append-only read/write, CRC32 checksums |
 | **manas-learn** | Online learning — tokenizer, embedder, backpropagation, loss-driven growth, **decoder** |
