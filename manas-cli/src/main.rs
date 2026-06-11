@@ -2,9 +2,10 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use manas_core::{ManasError, Network, Neuron, Source};
 use manas_store::ManasBrain;
-use manas_learn::{Trainer, detect_freshness_category, decode};
+use manas_learn::{Trainer, TrainerSnapshot, detect_freshness_category, decode};
 use manas_ingest::{IngestPipeline, IngestSource};
 use manas_agent::{AgentPipeline, FreshnessChecker};
+use std::collections::HashMap;
 
 #[derive(Parser)]
 #[command(name = "manas", about = "Your personal AI brain", version = "0.1.0")]
@@ -89,6 +90,16 @@ fn main() {
     }
 }
 
+fn snapshot_to_vocab_map(snapshot: &TrainerSnapshot) -> HashMap<u32, (String, Vec<f32>)> {
+    let mut map = HashMap::new();
+    for (&id, token) in &snapshot.id_to_token {
+        if let Some(emb) = snapshot.embed_table.get(&id) {
+            map.insert(id, (token.clone(), emb.clone()));
+        }
+    }
+    map
+}
+
 fn load_or_create_network(brain: &ManasBrain) -> Network {
     if brain.path.exists() {
         brain.load().unwrap_or_else(|_| Network::new())
@@ -97,14 +108,29 @@ fn load_or_create_network(brain: &ManasBrain) -> Network {
     }
 }
 
+fn restore_trainer_from_brain(trainer: &mut Trainer, brain: &ManasBrain) {
+    if let Ok(vocab) = brain.load_vocab() {
+        if !vocab.is_empty() {
+            let embed_dim = vocab.values().next().map(|(_, e)| e.len()).unwrap_or(64);
+            let snapshot = TrainerSnapshot {
+                vocab: vocab.iter().map(|(&id, (t, _))| (t.clone(), id)).collect(),
+                id_to_token: vocab.iter().map(|(&id, (t, _))| (id, t.clone())).collect(),
+                embed_table: vocab.iter().map(|(&id, (_, e))| (id, e.clone())).collect(),
+                embed_dim,
+            };
+            trainer.restore(&snapshot);
+        }
+    }
+}
+
 fn cmd_learn(text: &str, brain_path: &Path) -> Result<(), ManasError> {
     let brain = ManasBrain::new(brain_path);
     let mut network = load_or_create_network(&brain);
     let mut trainer = Trainer::new();
-
+    restore_trainer_from_brain(&mut trainer, &brain);
     let report = trainer.learn(&mut network, text)?;
-    brain.save(&network)?;
-
+    let snap = trainer.snapshot();
+    brain.save_with_vocab(&network, &snapshot_to_vocab_map(&snap))?;
     println!("Learned {} tokens | loss: {:.4}", report.tokens_learned, report.loss);
     if report.growth_occurred {
         println!("New neuron grown");
@@ -169,6 +195,7 @@ fn cmd_ingest(
     let brain = ManasBrain::new(brain_path);
     let mut network = load_or_create_network(&brain);
     let mut trainer = Trainer::new();
+    restore_trainer_from_brain(&mut trainer, &brain);
 
     let mut total_tokens = 0u32;
     let mut total_loss = 0.0f32;
@@ -181,7 +208,8 @@ fn cmd_ingest(
         chunk_count += 1;
     }
 
-    brain.save(&network)?;
+    let snap = trainer.snapshot();
+    brain.save_with_vocab(&network, &snapshot_to_vocab_map(&snap))?;
 
     let avg_loss = if chunk_count > 0 { total_loss / chunk_count as f32 } else { 0.0 };
     println!("Ingested {} chunks | {} tokens | avg loss: {:.4}", chunk_count, total_tokens, avg_loss);
@@ -193,6 +221,7 @@ fn cmd_query(text: &str, brain_path: &Path) -> Result<(), ManasError> {
     let brain = ManasBrain::new(brain_path);
     let mut network = load_or_create_network(&brain);
     let mut trainer = Trainer::new();
+    restore_trainer_from_brain(&mut trainer, &brain);
 
     let freshness_cat = detect_freshness_category(text);
     let results = agent.search(text)?;
@@ -227,7 +256,8 @@ fn cmd_query(text: &str, brain_path: &Path) -> Result<(), ManasError> {
         }
     }
 
-    brain.save(&network)?;
+    let snap = trainer.snapshot();
+    brain.save_with_vocab(&network, &snapshot_to_vocab_map(&snap))?;
 
     let avg_loss = if page_count > 0 { total_loss / page_count as f32 } else { 0.0 };
     println!("Learned from {} pages | {} tokens | avg loss: {:.4}", page_count, total_tokens, avg_loss);
@@ -245,6 +275,7 @@ fn cmd_refresh(category: Option<&str>, brain_path: &Path) -> Result<(), ManasErr
     let checker = FreshnessChecker::new();
     let agent = AgentPipeline::new();
     let mut trainer = Trainer::new();
+    restore_trainer_from_brain(&mut trainer, &brain);
 
     let stale_ids = match category {
         Some(cat) => {
@@ -296,7 +327,8 @@ fn cmd_refresh(category: Option<&str>, brain_path: &Path) -> Result<(), ManasErr
         }
     }
 
-    brain.save(&network)?;
+    let snap = trainer.snapshot();
+    brain.save_with_vocab(&network, &snapshot_to_vocab_map(&snap))?;
     println!("Refreshed {} chunks | {} tokens learned", refreshed_count, total_tokens);
     Ok(())
 }
@@ -379,6 +411,7 @@ fn cmd_trace(text: &str, brain_path: &Path) -> Result<(), ManasError> {
     }
     let network = brain.load()?;
     let mut trainer = Trainer::new();
+    restore_trainer_from_brain(&mut trainer, &brain);
     let tokens = trainer.tokenizer.encode(text);
     if tokens.is_empty() {
         println!("No tokens found in query");

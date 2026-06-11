@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use manas_core::{ManasError, Network};
 use crate::tokenizer::Tokenizer;
 use crate::embedder::Embedder;
@@ -14,6 +15,14 @@ pub struct LearnReport {
     pub growth_occurred: bool,
     pub neurons_updated: usize,
     pub freshness_category: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrainerSnapshot {
+    pub vocab: HashMap<String, u32>,
+    pub id_to_token: HashMap<u32, String>,
+    pub embed_table: HashMap<u32, Vec<f32>>,
+    pub embed_dim: usize,
 }
 
 pub struct Trainer {
@@ -86,6 +95,23 @@ impl Trainer {
             max_update_attempts: DEFAULT_MAX_UPDATE_ATTEMPTS,
             freshness_category: 1,
         }
+    }
+
+    pub fn snapshot(&self) -> TrainerSnapshot {
+        TrainerSnapshot {
+            vocab: self.tokenizer.vocab.clone(),
+            id_to_token: self.tokenizer.id_to_token.clone(),
+            embed_table: self.embedder.table.clone(),
+            embed_dim: self.embedder.dim,
+        }
+    }
+
+    pub fn restore(&mut self, snapshot: &TrainerSnapshot) {
+        self.tokenizer.vocab = snapshot.vocab.clone();
+        self.tokenizer.id_to_token = snapshot.id_to_token.clone();
+        self.tokenizer.vocab_size = snapshot.vocab.len() as u32;
+        self.embedder.table = snapshot.embed_table.clone();
+        self.embedder.dim = snapshot.embed_dim;
     }
 
     pub fn learn(&mut self, network: &mut Network, text: &str) -> Result<LearnReport, ManasError> {

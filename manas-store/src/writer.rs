@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use manas_core::{ManasError, Network, Layer, Activation};
 use crate::format;
 use crate::integrity;
 
 pub fn write_to_path(network: &Network, path: &std::path::Path) -> Result<(), ManasError> {
-    let bytes = build_bytes(network, &[]);
+    let bytes = build_bytes(network, &[], &HashMap::new());
     std::fs::write(path, &bytes).map_err(|e| ManasError::FileReadError {
         path: path.to_path_buf(),
         source: e,
@@ -17,7 +18,7 @@ pub fn write_to_path_with_archive(
     archived: &[manas_core::Neuron],
     path: &std::path::Path,
 ) -> Result<(), ManasError> {
-    let bytes = build_bytes(network, archived);
+    let bytes = build_bytes(network, archived, &HashMap::new());
     std::fs::write(path, &bytes).map_err(|e| ManasError::FileReadError {
         path: path.to_path_buf(),
         source: e,
@@ -25,7 +26,24 @@ pub fn write_to_path_with_archive(
     Ok(())
 }
 
-fn build_bytes(network: &Network, archived: &[manas_core::Neuron]) -> Vec<u8> {
+pub fn write_to_path_with_vocab(
+    network: &Network,
+    vocab: &HashMap<u32, (String, Vec<f32>)>,
+    path: &std::path::Path,
+) -> Result<(), ManasError> {
+    let bytes = build_bytes(network, &[], vocab);
+    std::fs::write(path, &bytes).map_err(|e| ManasError::FileReadError {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    Ok(())
+}
+
+fn build_bytes(
+    network: &Network,
+    archived: &[manas_core::Neuron],
+    vocab: &HashMap<u32, (String, Vec<f32>)>,
+) -> Vec<u8> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -40,14 +58,27 @@ fn build_bytes(network: &Network, archived: &[manas_core::Neuron]) -> Vec<u8> {
         last_modified: now,
         total_neurons: network.total_neurons,
         total_layers: network.layers.len() as u32,
-        vocab_size: 0,
+        vocab_size: vocab.len() as u32,
         total_texts_learned: 0,
         flags: if archived.is_empty() { 0 } else { 1 },
         checksum_offset: 0,
     };
     format::write_header(&mut buf, &header);
 
-    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&(vocab.len() as u32).to_le_bytes());
+    let mut sorted: Vec<(&u32, &(String, Vec<f32>))> = vocab.iter().collect();
+    sorted.sort_by_key(|(id, _)| **id);
+    for (id, (token, embedding)) in &sorted {
+        buf.extend_from_slice(&id.to_le_bytes());
+        let token_bytes = token.as_bytes();
+        buf.push(token_bytes.len() as u8);
+        buf.extend_from_slice(token_bytes);
+        let embed_dim = embedding.len() as u16;
+        buf.extend_from_slice(&embed_dim.to_le_bytes());
+        for v in embedding {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
 
     let layer_index_offset = buf.len() as u64;
 

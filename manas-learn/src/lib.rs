@@ -8,7 +8,7 @@ pub use backprop::{mse_loss, compute_gradients, compute_output_gradient, Forward
 pub use decoder::{decode, DecodeResult};
 pub use embedder::Embedder;
 pub use tokenizer::Tokenizer;
-pub use trainer::{Trainer, LearnReport, detect_freshness_category, DEFAULT_EMBED_DIM, DEFAULT_GROWTH_THRESHOLD, DEFAULT_LEARNING_RATE};
+pub use trainer::{Trainer, LearnReport, TrainerSnapshot, detect_freshness_category, DEFAULT_EMBED_DIM, DEFAULT_GROWTH_THRESHOLD, DEFAULT_LEARNING_RATE};
 
 #[cfg(test)]
 mod tests {

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Read;
 use manas_core::{ManasError, Network, Neuron};
 use crate::format;
@@ -36,8 +37,11 @@ pub fn read_from_bytes(data: &[u8]) -> Result<Network, ManasError> {
     let vocab_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
     offset += 4;
     for _ in 0..vocab_count {
+        offset += 4;
         let token_len = data[offset] as usize;
-        offset += 1 + token_len + 4 + 256;
+        offset += 1 + token_len + 2;
+        let embed_count = u16::from_le_bytes(data[offset - 2..offset].try_into().unwrap()) as usize;
+        offset += embed_count * 4;
     }
 
     let layer_index_size = header.total_layers as usize * 16;
@@ -60,6 +64,38 @@ pub fn read_from_bytes(data: &[u8]) -> Result<Network, ManasError> {
     })
 }
 
+pub fn read_vocab_from_bytes(data: &[u8]) -> Result<HashMap<u32, (String, Vec<f32>)>, ManasError> {
+    let mut offset = format::HEADER_SIZE;
+    let vocab_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+    offset += 4;
+
+    let mut vocab = HashMap::with_capacity(vocab_count as usize);
+    for _ in 0..vocab_count {
+        if offset + 4 > data.len() { break; }
+        let token_id = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        if offset >= data.len() { break; }
+        let token_len = data[offset] as usize;
+        offset += 1;
+        if offset + token_len > data.len() { break; }
+        let token = String::from_utf8_lossy(&data[offset..offset + token_len]).to_string();
+        offset += token_len;
+        if offset + 2 > data.len() { break; }
+        let embed_dim = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+        offset += 2;
+        if offset + embed_dim * 4 > data.len() { break; }
+        let mut embedding = Vec::with_capacity(embed_dim);
+        for _ in 0..embed_dim {
+            let v = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            embedding.push(v);
+            offset += 4;
+        }
+        vocab.insert(token_id, (token, embedding));
+    }
+
+    Ok(vocab)
+}
+
 pub fn read_archived_neurons(data: &[u8]) -> Result<Vec<Neuron>, ManasError> {
     let header = format::read_header(data)
         .ok_or_else(|| ManasError::CorruptFile {
@@ -76,8 +112,11 @@ pub fn read_archived_neurons(data: &[u8]) -> Result<Vec<Neuron>, ManasError> {
     let vocab_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
     offset += 4;
     for _ in 0..vocab_count {
+        offset += 4;
         let token_len = data[offset] as usize;
-        offset += 1 + token_len + 4 + 256;
+        offset += 1 + token_len + 2;
+        let embed_count = u16::from_le_bytes(data[offset - 2..offset].try_into().unwrap()) as usize;
+        offset += embed_count * 4;
     }
 
     let layer_index_size = header.total_layers as usize * 16;

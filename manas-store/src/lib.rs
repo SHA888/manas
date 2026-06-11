@@ -3,6 +3,7 @@ mod integrity;
 mod reader;
 mod writer;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use manas_core::{ManasError, Neuron, Network};
 use std::io::Read;
@@ -149,6 +150,23 @@ impl ManasBrain {
     pub fn update_neuron(&self, _neuron_id: u64, _neuron: &Neuron) -> Result<(), ManasError> {
         let network = self.load()?;
         self.save(&network)
+    }
+
+    pub fn save_with_vocab(
+        &self,
+        network: &Network,
+        vocab: &HashMap<u32, (String, Vec<f32>)>,
+    ) -> Result<(), ManasError> {
+        writer::write_to_path_with_vocab(network, vocab, &self.path)
+    }
+
+    pub fn load_vocab(&self) -> Result<HashMap<u32, (String, Vec<f32>)>, ManasError> {
+        let data = std::fs::read(&self.path)
+            .map_err(|e| ManasError::FileReadError {
+                path: self.path.clone(),
+                source: e,
+            })?;
+        reader::read_vocab_from_bytes(&data)
     }
 
     pub fn verify(&self) -> Result<bool, ManasError> {
