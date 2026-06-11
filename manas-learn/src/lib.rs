@@ -1,9 +1,11 @@
 pub mod backprop;
+pub mod decoder;
 pub mod embedder;
 pub mod tokenizer;
 pub mod trainer;
 
 pub use backprop::{mse_loss, compute_gradients, compute_output_gradient, ForwardCache, NeuronGradients};
+pub use decoder::{decode, DecodeResult};
 pub use embedder::Embedder;
 pub use tokenizer::Tokenizer;
 pub use trainer::{Trainer, LearnReport, detect_freshness_category, DEFAULT_EMBED_DIM, DEFAULT_GROWTH_THRESHOLD, DEFAULT_LEARNING_RATE};

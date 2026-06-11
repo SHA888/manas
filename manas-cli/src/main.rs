@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use manas_core::{ManasError, Network, Neuron, Source};
 use manas_store::ManasBrain;
-use manas_learn::{Trainer, detect_freshness_category};
+use manas_learn::{Trainer, detect_freshness_category, decode};
 use manas_ingest::{IngestPipeline, IngestSource};
 use manas_agent::{AgentPipeline, FreshnessChecker};
 
@@ -413,6 +413,14 @@ fn cmd_trace(text: &str, brain_path: &Path) -> Result<(), ManasError> {
             };
             println!("  n{:<6} L{}  act={:.4}  imp={:.3}  fresh={}  src={}",
                 nid, layer_id, act_val, n.importance_score, n.freshness_category, src_desc);
+        }
+    }
+
+    let result = decode(&network, &trainer.embedder, &trainer.tokenizer, text);
+    if !result.tokens.is_empty() {
+        println!("\nClosest known tokens (decoded):");
+        for (word, sim) in result.tokens.iter().take(10) {
+            println!("  {:<20} sim={:.4}", word, sim);
         }
     }
     Ok(())

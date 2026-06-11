@@ -23,3 +23,6 @@ brain.manas
 
 # Logs
 *.log
+
+# Test / scratch directory
+test/

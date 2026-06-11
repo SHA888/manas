@@ -41,7 +41,7 @@ manas refresh --category fast
 # List all ingested files
 manas files
 
-# Show activated neurons for a topic
+# Show activated neurons + decoded keywords for a topic
 manas trace "Rust ownership"
 
 # Set freshness category
@@ -95,10 +95,10 @@ Manas is built from 7 Rust crates, each with a single responsibility:
 ### Crates
 
 | Crate | Purpose |
-|---|---|
+|---|---|---|
 | **manas-core** | Neural network engine — Neuron, Layer, Network structs, forward pass, growth logic |
 | **manas-store** | Custom `.manas` binary format — append-only read/write, CRC32 checksums |
-| **manas-learn** | Online learning — tokenizer, embedder, backpropagation, loss-driven growth |
+| **manas-learn** | Online learning — tokenizer, embedder, backpropagation, loss-driven growth, **decoder** |
 | **manas-ingest** | Input pipeline — 7 file format parsers, folder walker, text chunking |
 | **manas-memory** | Never-forget system — importance scoring, protection levels, compression |
 | **manas-agent** | Internet connection — DuckDuckGo search, HTML scraping, freshness checker |
@@ -111,10 +111,16 @@ Manas is built from 7 Rust crates, each with a single responsibility:
 ### Learning
 
 ```
-Input text → Tokenize → Embed → Forward pass
+Learning:
+  Input text → Tokenize → Embed → Forward pass
     → Calculate MSE loss → Backpropagate → Update weights
     → If loss > threshold: grow a new neuron
     → Recalculate importance scores → Save to .manas file
+
+Inference (decoding):
+  Query text → Tokenize → Embed → Forward pass
+    → Output vector → Nearest tokens in embedding table
+    → Display closest known tokens with similarity scores
 ```
 
 ### The Neuron
@@ -189,7 +195,7 @@ manas refresh --category cat              Refresh stale knowledge from web
 # Inspection
 manas inspect                             Show brain stats
 manas files                               List ingested files
-manas trace "topic"                       Show activated neurons
+manas trace "topic"                       Show activated neurons + decoded keywords
 manas neurons --all                       List all neurons with metadata
 
 # Management

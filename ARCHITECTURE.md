@@ -243,13 +243,14 @@ manas/
 │       ├── writer.rs
 │       └── integrity.rs
 │
-├── manas-learn/                ← tokenizer, backprop, online learning loop
+├── manas-learn/                ← tokenizer, backprop, online learning loop, decoder
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs
 │       ├── tokenizer.rs
 │       ├── embedder.rs
 │       ├── backprop.rs
+│       ├── decoder.rs
 │       └── trainer.rs
 │
 ├── manas-ingest/               ← unified input pipeline (text, files, folders)
@@ -571,6 +572,38 @@ pub struct Embedder {
 
 New tokens get a randomly initialized embedding vector when first seen.
 The embedder is trained alongside the network via backpropagation.
+
+#### Decoder
+
+Maps the network's output vector back to the closest known tokens — the brain's "answer."
+
+```rust
+pub struct DecodeResult {
+    pub tokens:      Vec<(String, f32)>,  // word + cosine similarity
+    pub output_norm: f32,                 // magnitude of output vector
+}
+```
+
+```
+Query → Tokenize → Embed → Forward pass → Output vector
+    → Cosine similarity with every token embedding
+    → Sort by score → Return top 20 closest tokens
+```
+
+The decoder is used by `manas trace` to show what the brain "thinks" about a query:
+
+```
+$ manas trace "Manas self-growing neural network"
+
+Top 10 activated neurons:
+  n12     L0  act=0.2982  ...
+  ...
+
+Closest known tokens (decoded):
+  network              sim=0.1499
+  neural               sim=0.0818
+  manas                sim=0.0268
+```
 
 ---
 
@@ -1073,27 +1106,28 @@ manas-store:
 
 ```
 manas query "What is ownership in Rust?"
-         │
-         ▼
+          │
+          ▼
 manas-learn:
   tokenize query → embed → forward pass
-         │
-         ▼
+          │
+          ▼
 manas-agent::FreshnessChecker:
   find relevant neurons → check last_verified vs threshold
   any stale? → refresh from internet first
-         │
-         ▼
+          │
+          ▼
 manas-core:
   forward pass with current weights → generate answer vector
-         │
-         ▼
-manas-learn:
-  decode output vector → produce text response
-         │
-         ▼
+          │
+          ▼
+manas-learn::decoder:
+  cosine-similarity between output vector and embedder table
+  → rank by score → return top-20 closest tokens
+          │
+          ▼
 manas-cli:
-  print answer to terminal
+  print decoded keywords + neuron activations to terminal
 ```
 
 ---
@@ -1246,8 +1280,15 @@ manas inspect
 # List all ingested files
 manas files
 
-# Show where a piece of knowledge came from
+# Trace neuron activations + decode the brain's output
 manas trace "Rust ownership"
+# Output:
+#  Top 10 activated neurons:
+#    n12     L0  act=0.2982  ...
+#    ...
+#  Closest known tokens (decoded):
+#    network              sim=0.1499
+#    neural               sim=0.0818
 
 # ── FILE MANAGEMENT ───────────────────────────────────────────────
 
