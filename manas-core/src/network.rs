@@ -8,6 +8,7 @@ pub struct Network {
     pub total_neurons: u64,
     pub created_at: u64,
     pub version: u8,
+    pub total_texts_learned: u64,
 }
 
 impl Network {
@@ -22,6 +23,7 @@ impl Network {
             total_neurons: 0,
             created_at: now,
             version: 1,
+            total_texts_learned: 0,
         }
     }
 

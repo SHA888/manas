@@ -220,6 +220,7 @@ pub fn read_from_bytes(data: &[u8]) -> Result<Network, ManasError> {
         total_neurons: header.total_neurons,
         created_at: header.created_at,
         version: header.version,
+        total_texts_learned: header.total_texts_learned,
     })
 }
 

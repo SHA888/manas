@@ -129,6 +129,7 @@ fn cmd_learn(text: &str, brain_path: &Path) -> Result<(), ManasError> {
     let mut trainer = Trainer::new();
     restore_trainer_from_brain(&mut trainer, &brain);
     let report = trainer.learn(&mut network, text)?;
+    network.total_texts_learned += 1;
     let snap = trainer.snapshot();
     brain.save_with_vocab(&network, &snapshot_to_vocab_map(&snap))?;
     println!("Learned {} tokens | loss: {:.4}", report.tokens_learned, report.loss);
@@ -208,6 +209,7 @@ fn cmd_ingest(
         chunk_count += 1;
     }
 
+    network.total_texts_learned += 1;
     let snap = trainer.snapshot();
     brain.save_with_vocab(&network, &snapshot_to_vocab_map(&snap))?;
 
@@ -257,6 +259,7 @@ fn cmd_query(text: &str, brain_path: &Path) -> Result<(), ManasError> {
     }
 
     let snap = trainer.snapshot();
+    network.total_texts_learned += 1;
     brain.save_with_vocab(&network, &snapshot_to_vocab_map(&snap))?;
 
     let avg_loss = if page_count > 0 { total_loss / page_count as f32 } else { 0.0 };
@@ -327,6 +330,7 @@ fn cmd_refresh(category: Option<&str>, brain_path: &Path) -> Result<(), ManasErr
         }
     }
 
+    network.total_texts_learned += 1;
     let snap = trainer.snapshot();
     brain.save_with_vocab(&network, &snapshot_to_vocab_map(&snap))?;
     println!("Refreshed {} chunks | {} tokens learned", refreshed_count, total_tokens);

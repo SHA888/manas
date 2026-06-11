@@ -59,7 +59,7 @@ fn build_bytes(
         total_neurons: network.total_neurons,
         total_layers: network.layers.len() as u32,
         vocab_size: vocab.len() as u32,
-        total_texts_learned: 0,
+        total_texts_learned: network.total_texts_learned,
         flags: if archived.is_empty() { 0 } else { 1 },
         checksum_offset: 0,
     };
