@@ -1,5 +1,5 @@
+use manas_core::{Activation, Network, Neuron, ProtectionLevel};
 use std::collections::HashMap;
-use manas_core::{Neuron, Network, Activation, ProtectionLevel};
 
 pub struct CompressionReport {
     pub candidates_found: usize,
@@ -60,7 +60,11 @@ fn neuron_by_id_mut<'a>(network: &'a mut Network, id: u64) -> Option<&'a mut Neu
     None
 }
 
-pub fn cluster_candidates(network: &Network, candidates: &[u64], similarity_threshold: f32) -> Vec<Vec<u64>> {
+pub fn cluster_candidates(
+    network: &Network,
+    candidates: &[u64],
+    similarity_threshold: f32,
+) -> Vec<Vec<u64>> {
     let mut visited: HashMap<u64, bool> = HashMap::new();
     for &id in candidates {
         visited.insert(id, false);
@@ -111,7 +115,8 @@ pub fn merge_cluster(network: &Network, cluster: &[u64]) -> Option<Neuron> {
         return None;
     }
 
-    let neurons: Vec<&Neuron> = cluster.iter()
+    let neurons: Vec<&Neuron> = cluster
+        .iter()
         .filter_map(|&id| neuron_by_id(network, id))
         .collect();
 
@@ -162,7 +167,11 @@ pub fn merge_cluster(network: &Network, cluster: &[u64]) -> Option<Neuron> {
     })
 }
 
-pub fn compress(network: &mut Network, threshold: f32, similarity_threshold: f32) -> CompressionReport {
+pub fn compress(
+    network: &mut Network,
+    threshold: f32,
+    similarity_threshold: f32,
+) -> CompressionReport {
     let candidates = find_candidates(network, threshold);
     if candidates.is_empty() {
         return CompressionReport {

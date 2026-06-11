@@ -19,7 +19,11 @@ impl Activation {
     pub fn derivative(&self, x: f32) -> f32 {
         match self {
             Activation::ReLU => {
-                if x > 0.0 { 1.0 } else { 0.0 }
+                if x > 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }
             }
             Activation::Sigmoid => {
                 let s = 1.0 / (1.0 + (-x).exp());

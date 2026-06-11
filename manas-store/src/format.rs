@@ -53,7 +53,22 @@ pub fn write_header(buf: &mut Vec<u8>, header: &BrainHeader) {
 
 pub fn neuron_binary_size(neuron: &Neuron) -> usize {
     let (_stype, sbytes) = neuron.source.to_bytes();
-    8 + 2 + neuron.weights.len() * 4 + 4 + 1 + 4 + 8 + 8 + 8 + 8 + 8 + 1 + 1 + 2 + sbytes.len() + 1 + 1
+    8 + 2
+        + neuron.weights.len() * 4
+        + 4
+        + 1
+        + 4
+        + 8
+        + 8
+        + 8
+        + 8
+        + 8
+        + 1
+        + 1
+        + 2
+        + sbytes.len()
+        + 1
+        + 1
 }
 
 pub fn write_neuron(buf: &mut Vec<u8>, neuron: &Neuron) {
@@ -80,49 +95,71 @@ pub fn write_neuron(buf: &mut Vec<u8>, neuron: &Neuron) {
 }
 
 pub fn read_neuron(data: &[u8], offset: &mut usize) -> Option<Neuron> {
-    if *offset + 8 > data.len() { return None; }
+    if *offset + 8 > data.len() {
+        return None;
+    }
     let id = u64::from_le_bytes(data[*offset..*offset + 8].try_into().ok()?);
     *offset += 8;
 
-    if *offset + 2 > data.len() { return None; }
+    if *offset + 2 > data.len() {
+        return None;
+    }
     let weight_count = u16::from_le_bytes(data[*offset..*offset + 2].try_into().ok()?);
     *offset += 2;
 
     let mut weights = Vec::with_capacity(weight_count as usize);
     for _ in 0..weight_count {
-        if *offset + 4 > data.len() { return None; }
-        weights.push(f32::from_le_bytes(data[*offset..*offset + 4].try_into().ok()?));
+        if *offset + 4 > data.len() {
+            return None;
+        }
+        weights.push(f32::from_le_bytes(
+            data[*offset..*offset + 4].try_into().ok()?,
+        ));
         *offset += 4;
     }
 
-    if *offset + 4 > data.len() { return None; }
+    if *offset + 4 > data.len() {
+        return None;
+    }
     let bias = f32::from_le_bytes(data[*offset..*offset + 4].try_into().ok()?);
     *offset += 4;
 
     let activation = Activation::from_u8(data[*offset])?;
     *offset += 1;
 
-    if *offset + 4 > data.len() { return None; }
+    if *offset + 4 > data.len() {
+        return None;
+    }
     let importance_score = f32::from_le_bytes(data[*offset..*offset + 4].try_into().ok()?);
     *offset += 4;
 
-    if *offset + 8 > data.len() { return None; }
+    if *offset + 8 > data.len() {
+        return None;
+    }
     let born_at = u64::from_le_bytes(data[*offset..*offset + 8].try_into().ok()?);
     *offset += 8;
 
-    if *offset + 8 > data.len() { return None; }
+    if *offset + 8 > data.len() {
+        return None;
+    }
     let last_activated = u64::from_le_bytes(data[*offset..*offset + 8].try_into().ok()?);
     *offset += 8;
 
-    if *offset + 8 > data.len() { return None; }
+    if *offset + 8 > data.len() {
+        return None;
+    }
     let activation_count = u64::from_le_bytes(data[*offset..*offset + 8].try_into().ok()?);
     *offset += 8;
 
-    if *offset + 8 > data.len() { return None; }
+    if *offset + 8 > data.len() {
+        return None;
+    }
     let learned_at = u64::from_le_bytes(data[*offset..*offset + 8].try_into().ok()?);
     *offset += 8;
 
-    if *offset + 8 > data.len() { return None; }
+    if *offset + 8 > data.len() {
+        return None;
+    }
     let last_verified = u64::from_le_bytes(data[*offset..*offset + 8].try_into().ok()?);
     *offset += 8;
 
@@ -132,12 +169,16 @@ pub fn read_neuron(data: &[u8], offset: &mut usize) -> Option<Neuron> {
     let source_type = data[*offset];
     *offset += 1;
 
-    if *offset + 2 > data.len() { return None; }
+    if *offset + 2 > data.len() {
+        return None;
+    }
     let source_len = u16::from_le_bytes(data[*offset..*offset + 2].try_into().ok()?);
     *offset += 2;
 
     let source_data = if source_len > 0 {
-        if *offset + source_len as usize > data.len() { return None; }
+        if *offset + source_len as usize > data.len() {
+            return None;
+        }
         let s = data[*offset..*offset + source_len as usize].to_vec();
         *offset += source_len as usize;
         s
@@ -180,7 +221,9 @@ pub fn write_layer_block(buf: &mut Vec<u8>, layer: &Layer) {
 }
 
 pub fn read_layer_block(data: &[u8], offset: &mut usize) -> Option<Layer> {
-    if *offset + 9 > data.len() { return None; }
+    if *offset + 9 > data.len() {
+        return None;
+    }
     let id = u32::from_le_bytes(data[*offset..*offset + 4].try_into().ok()?);
     *offset += 4;
     let neuron_count = u32::from_le_bytes(data[*offset..*offset + 4].try_into().ok()?);

@@ -1,7 +1,7 @@
-use manas_core::{ManasError, Network};
-use crate::searcher::{Searcher, SearchResult};
-use crate::scraper::Scraper;
 use crate::freshness::{FreshnessChecker, FreshnessReport};
+use crate::scraper::Scraper;
+use crate::searcher::{SearchResult, Searcher};
+use manas_core::{ManasError, Network};
 
 pub struct AgentPipeline {
     pub searcher: Searcher,
@@ -26,17 +26,23 @@ impl AgentPipeline {
         self.scraper.scrape(url)
     }
 
-    pub fn search_and_scrape(&self, query: &str) -> Result<Vec<(SearchResult, String)>, ManasError> {
+    pub fn search_and_scrape(
+        &self,
+        query: &str,
+    ) -> Result<Vec<(SearchResult, String)>, ManasError> {
         let results = self.searcher.search(query)?;
         let mut pages = Vec::new();
         for result in &results {
             match self.scraper.scrape(&result.url) {
                 Ok(text) => {
-                    pages.push((SearchResult {
-                        url: result.url.clone(),
-                        title: result.title.clone(),
-                        snippet: result.snippet.clone(),
-                    }, text));
+                    pages.push((
+                        SearchResult {
+                            url: result.url.clone(),
+                            title: result.title.clone(),
+                            snippet: result.snippet.clone(),
+                        },
+                        text,
+                    ));
                 }
                 Err(_) => continue,
             }
@@ -48,11 +54,9 @@ impl AgentPipeline {
         self.freshness.find_stale(network)
     }
 
-    pub fn refresh_stale(
-        &self,
-        network: &mut Network,
-    ) -> Result<FreshnessReport, ManasError> {
-        self.freshness.refresh_all_stale(network, &self.searcher, &self.scraper)
+    pub fn refresh_stale(&self, network: &mut Network) -> Result<FreshnessReport, ManasError> {
+        self.freshness
+            .refresh_all_stale(network, &self.searcher, &self.scraper)
     }
 }
 

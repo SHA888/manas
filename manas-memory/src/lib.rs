@@ -2,10 +2,12 @@ pub mod compressor;
 pub mod protector;
 pub mod scorer;
 
-use manas_core::{Network, Neuron};
 pub use compressor::{CompressionReport, compress};
-pub use scorer::{importance_for_neuron, recalc_all, recalc_neuron, find_low_importance, score_all_to_map};
+use manas_core::{Network, Neuron};
 pub use protector::{protection_from_importance, update_all, update_neuron};
+pub use scorer::{
+    find_low_importance, importance_for_neuron, recalc_all, recalc_neuron, score_all_to_map,
+};
 
 pub struct MemoryManager;
 
@@ -81,9 +83,18 @@ mod tests {
 
     #[test]
     fn protection_bands() {
-        assert_eq!(protection_from_importance(0.90, 9999999), ProtectionLevel::Frozen);
-        assert_eq!(protection_from_importance(0.70, 0), ProtectionLevel::Guarded);
-        assert_eq!(protection_from_importance(0.30, 9999999), ProtectionLevel::Open);
+        assert_eq!(
+            protection_from_importance(0.90, 9999999),
+            ProtectionLevel::Frozen
+        );
+        assert_eq!(
+            protection_from_importance(0.70, 0),
+            ProtectionLevel::Guarded
+        );
+        assert_eq!(
+            protection_from_importance(0.30, 9999999),
+            ProtectionLevel::Open
+        );
     }
 
     #[test]

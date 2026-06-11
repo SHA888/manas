@@ -1,4 +1,4 @@
-use manas_core::{Neuron, Network};
+use manas_core::{Network, Neuron};
 use std::collections::HashMap;
 
 pub fn importance_for_neuron(neuron: &Neuron, now: u64) -> f32 {
@@ -29,11 +29,7 @@ fn weight_magnitude(neuron: &Neuron) -> f32 {
 
 fn age_grace(born_at: u64, now: u64) -> f32 {
     let age_seconds = now.saturating_sub(born_at);
-    if age_seconds < 7 * 86400 {
-        1.0
-    } else {
-        0.0
-    }
+    if age_seconds < 7 * 86400 { 1.0 } else { 0.0 }
 }
 
 pub fn recalc_neuron(neuron: &mut Neuron) {

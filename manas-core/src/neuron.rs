@@ -80,7 +80,8 @@ impl Neuron {
         let weights: Vec<f32> = (0..input_size)
             .map(|_| {
                 let u: f32 = rng.r#gen();
-                let z = (-2.0 * u.ln()).sqrt() * (2.0 * std::f32::consts::PI * rng.r#gen::<f32>()).cos();
+                let z = (-2.0 * u.ln()).sqrt()
+                    * (2.0 * std::f32::consts::PI * rng.r#gen::<f32>()).cos();
                 z * 0.1
             })
             .collect();
@@ -109,10 +110,13 @@ impl Neuron {
     }
 
     pub fn activate(&self, input: &[f32]) -> f32 {
-        let sum: f32 = self.weights.iter()
+        let sum: f32 = self
+            .weights
+            .iter()
             .zip(input)
             .map(|(w, i)| w * i)
-            .sum::<f32>() + self.bias;
+            .sum::<f32>()
+            + self.bias;
         self.activation.apply(sum)
     }
 }

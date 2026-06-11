@@ -1,11 +1,13 @@
-use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
-use manas_core::{ManasError, Network, Neuron, Source};
-use manas_store::ManasBrain;
-use manas_learn::{Trainer, TrainerSnapshot, detect_freshness_category, decode};
-use manas_ingest::{IngestPipeline, IngestSource};
 use manas_agent::{AgentPipeline, FreshnessChecker};
+use manas_core::{ManasError, Network, Neuron, Source};
+use manas_ingest::{IngestPipeline, IngestSource};
+use manas_learn::{Trainer, TrainerSnapshot, decode, detect_freshness_category};
+use manas_store::ManasBrain;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+// ─── CLI definition ───────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(name = "manas", about = "Your personal AI brain", version = "0.1.0")]
@@ -19,7 +21,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Learn { text: String },
+    Learn {
+        text: String,
+    },
     Ingest {
         #[arg(long)]
         file: Option<String>,
@@ -30,14 +34,18 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    Query { text: String },
+    Query {
+        text: String,
+    },
     Refresh {
         #[arg(long)]
         category: Option<String>,
     },
     Inspect,
     Files,
-    Trace { text: String },
+    Trace {
+        text: String,
+    },
     Export {
         #[arg(long)]
         out: Option<String>,
@@ -62,15 +70,26 @@ enum Commands {
     },
 }
 
+// ─── Entry point ──────────────────────────────────────────────────────────────
+
 fn main() {
     let cli = Cli::parse();
     let brain_path = PathBuf::from(&cli.brain);
 
     let result = match &cli.command {
         Commands::Learn { text } => cmd_learn(text, &brain_path),
-        Commands::Ingest { file, folder, url, dry_run } => {
-            cmd_ingest(file.as_deref(), folder.as_deref(), url.as_deref(), *dry_run, &brain_path)
-        }
+        Commands::Ingest {
+            file,
+            folder,
+            url,
+            dry_run,
+        } => cmd_ingest(
+            file.as_deref(),
+            folder.as_deref(),
+            url.as_deref(),
+            *dry_run,
+            &brain_path,
+        ),
         Commands::Query { text } => cmd_query(text, &brain_path),
         Commands::Refresh { category } => cmd_refresh(category.as_deref(), &brain_path),
         Commands::Inspect => cmd_inspect(&brain_path),
@@ -90,10 +109,12 @@ fn main() {
     }
 }
 
-fn snapshot_to_vocab_map(snapshot: &TrainerSnapshot) -> HashMap<u32, (String, Vec<f32>)> {
+// ─── Shared helpers ───────────────────────────────────────────────────────────
+
+fn snapshot_to_vocab_map(snap: &TrainerSnapshot) -> HashMap<u32, (String, Vec<f32>)> {
     let mut map = HashMap::new();
-    for (&id, token) in &snapshot.id_to_token {
-        if let Some(emb) = snapshot.embed_table.get(&id) {
+    for (&id, token) in &snap.id_to_token {
+        if let Some(emb) = snap.embed_table.get(&id) {
             map.insert(id, (token.clone(), emb.clone()));
         }
     }
@@ -112,33 +133,70 @@ fn restore_trainer_from_brain(trainer: &mut Trainer, brain: &ManasBrain) {
     if let Ok(vocab) = brain.load_vocab() {
         if !vocab.is_empty() {
             let embed_dim = vocab.values().next().map(|(_, e)| e.len()).unwrap_or(64);
-            let snapshot = TrainerSnapshot {
+            let snap = TrainerSnapshot {
                 vocab: vocab.iter().map(|(&id, (t, _))| (t.clone(), id)).collect(),
                 id_to_token: vocab.iter().map(|(&id, (t, _))| (id, t.clone())).collect(),
                 embed_table: vocab.iter().map(|(&id, (_, e))| (id, e.clone())).collect(),
                 embed_dim,
             };
-            trainer.restore(&snapshot);
+            trainer.restore(&snap);
         }
     }
 }
 
+fn save_brain(brain: &ManasBrain, network: &Network, trainer: &Trainer) -> Result<(), ManasError> {
+    let snap = trainer.snapshot();
+    brain.save_with_vocab(network, &snapshot_to_vocab_map(&snap))
+}
+
+fn format_duration(unix_ts: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let diff = now.saturating_sub(unix_ts);
+    if diff < 60 {
+        format!("{} seconds ago", diff)
+    } else if diff < 3600 {
+        format!("{} minutes ago", diff / 60)
+    } else if diff < 86400 {
+        format!("{} hours ago", diff / 3600)
+    } else {
+        format!("{} days ago", diff / 86400)
+    }
+}
+
+// ─── Commands ─────────────────────────────────────────────────────────────────
+
+/// `manas learn "some text"`
 fn cmd_learn(text: &str, brain_path: &Path) -> Result<(), ManasError> {
     let brain = ManasBrain::new(brain_path);
     let mut network = load_or_create_network(&brain);
     let mut trainer = Trainer::new();
     restore_trainer_from_brain(&mut trainer, &brain);
+
+    // FIX 2 — tag neurons as coming from raw user text
+    trainer.source = Source::RawText;
+    trainer.freshness_category = detect_freshness_category(text);
+
     let report = trainer.learn(&mut network, text)?;
     network.total_texts_learned += 1;
-    let snap = trainer.snapshot();
-    brain.save_with_vocab(&network, &snapshot_to_vocab_map(&snap))?;
-    println!("Learned {} tokens | loss: {:.4}", report.tokens_learned, report.loss);
-    if report.growth_occurred {
-        println!("New neuron grown");
-    }
+    save_brain(&brain, &network, &trainer)?;
+
+    println!(
+        "Learned {} tokens | loss: {:.4}{}",
+        report.tokens_learned,
+        report.loss,
+        if report.growth_occurred {
+            " | new neuron grown"
+        } else {
+            ""
+        }
+    );
     Ok(())
 }
 
+/// `manas ingest --file / --folder / --url`
 fn cmd_ingest(
     file: Option<&str>,
     folder: Option<&str>,
@@ -166,24 +224,33 @@ fn cmd_ingest(
                 for (i, chunk) in chunks.into_iter().enumerate() {
                     all_chunks.push(manas_ingest::TextChunk {
                         text: chunk,
-                        source: manas_core::Source::Internet { url: u.to_string() },
+                        source: Source::Internet { url: u.to_string() },
                         chunk_id: i as u64,
                         file_path: None,
                         url: Some(u.to_string()),
                     });
                 }
             }
-            Err(e) => {
-                eprintln!("Warning: failed to scrape URL '{}': {}", u, e);
-            }
+            Err(e) => eprintln!("Warning: failed to scrape '{}': {}", u, e),
         }
     }
 
     if dry_run {
-        println!("[dry-run] Would ingest {} chunks from {} sources", all_chunks.len(),
-            file.map(|_| 1).unwrap_or(0) + folder.map(|_| 1).unwrap_or(0) + url.map(|_| 1).unwrap_or(0));
+        let sources = file.map(|_| 1).unwrap_or(0)
+            + folder.map(|_| 1).unwrap_or(0)
+            + url.map(|_| 1).unwrap_or(0);
+        println!(
+            "[dry-run] Would ingest {} chunks from {} source(s)",
+            all_chunks.len(),
+            sources
+        );
         for chunk in &all_chunks {
-            println!("  chunk {} ({})", chunk.chunk_id, chunk.text.len());
+            println!(
+                "  chunk {} ({} chars)  src={:?}",
+                chunk.chunk_id,
+                chunk.text.len(),
+                chunk.source
+            );
         }
         return Ok(());
     }
@@ -203,6 +270,10 @@ fn cmd_ingest(
     let mut chunk_count = 0u32;
 
     for chunk in &all_chunks {
+        // FIX 2 — stamp the exact file/url source onto neurons for this chunk
+        trainer.source = chunk.source.clone();
+        trainer.freshness_category = detect_freshness_category(&chunk.text);
+
         let report = trainer.learn(&mut network, &chunk.text)?;
         total_tokens += report.tokens_learned;
         total_loss += report.loss;
@@ -210,14 +281,21 @@ fn cmd_ingest(
     }
 
     network.total_texts_learned += 1;
-    let snap = trainer.snapshot();
-    brain.save_with_vocab(&network, &snapshot_to_vocab_map(&snap))?;
+    save_brain(&brain, &network, &trainer)?;
 
-    let avg_loss = if chunk_count > 0 { total_loss / chunk_count as f32 } else { 0.0 };
-    println!("Ingested {} chunks | {} tokens | avg loss: {:.4}", chunk_count, total_tokens, avg_loss);
+    let avg_loss = if chunk_count > 0 {
+        total_loss / chunk_count as f32
+    } else {
+        0.0
+    };
+    println!(
+        "Ingested {} chunks | {} tokens | avg loss: {:.4}",
+        chunk_count, total_tokens, avg_loss
+    );
     Ok(())
 }
 
+/// `manas query "question"`
 fn cmd_query(text: &str, brain_path: &Path) -> Result<(), ManasError> {
     let agent = AgentPipeline::new();
     let brain = ManasBrain::new(brain_path);
@@ -247,7 +325,12 @@ fn cmd_query(text: &str, brain_path: &Path) -> Result<(), ManasError> {
             Ok(scraped) => {
                 let chunks = manas_ingest::chunk_text(&scraped, 512, 64);
                 for chunk in chunks {
+                    // FIX 2 — neurons from web pages carry their URL
+                    trainer.source = Source::Internet {
+                        url: result.url.clone(),
+                    };
                     trainer.freshness_category = freshness_cat;
+
                     let report = trainer.learn(&mut network, &chunk)?;
                     total_tokens += report.tokens_learned;
                     total_loss += report.loss;
@@ -258,15 +341,22 @@ fn cmd_query(text: &str, brain_path: &Path) -> Result<(), ManasError> {
         }
     }
 
-    let snap = trainer.snapshot();
     network.total_texts_learned += 1;
-    brain.save_with_vocab(&network, &snapshot_to_vocab_map(&snap))?;
+    save_brain(&brain, &network, &trainer)?;
 
-    let avg_loss = if page_count > 0 { total_loss / page_count as f32 } else { 0.0 };
-    println!("Learned from {} pages | {} tokens | avg loss: {:.4}", page_count, total_tokens, avg_loss);
+    let avg_loss = if page_count > 0 {
+        total_loss / page_count as f32
+    } else {
+        0.0
+    };
+    println!(
+        "Learned from {} pages | {} tokens | avg loss: {:.4}",
+        page_count, total_tokens, avg_loss
+    );
     Ok(())
 }
 
+/// `manas refresh [--category fast]`
 fn cmd_refresh(category: Option<&str>, brain_path: &Path) -> Result<(), ManasError> {
     let brain = ManasBrain::new(brain_path);
     if !brain.path.exists() {
@@ -282,17 +372,8 @@ fn cmd_refresh(category: Option<&str>, brain_path: &Path) -> Result<(), ManasErr
 
     let stale_ids = match category {
         Some(cat) => {
-            let cat_num = match cat.to_lowercase().as_str() {
-                "timeless" | "0" => 0,
-                "slow" | "1" => 1,
-                "fast" | "2" => 2,
-                "realtime" | "3" => 3,
-                _ => {
-                    println!("Unknown category '{}'. Use: timeless, slow, fast, realtime", cat);
-                    return Ok(());
-                }
-            };
-            checker.find_stale_by_category(&network, cat_num)
+            let n = parse_freshness_category(cat)?;
+            checker.find_stale_by_category(&network, n)
         }
         None => checker.find_stale(&network),
     };
@@ -320,7 +401,12 @@ fn cmd_refresh(category: Option<&str>, brain_path: &Path) -> Result<(), ManasErr
                 let freshness_cat = detect_freshness_category(&scraped);
                 let chunks = manas_ingest::chunk_text(&scraped, 512, 64);
                 for chunk in chunks {
+                    // FIX 2 — refreshed neurons carry the URL they were updated from
+                    trainer.source = Source::Internet {
+                        url: result.url.clone(),
+                    };
                     trainer.freshness_category = freshness_cat;
+
                     let report = trainer.learn(&mut network, &chunk)?;
                     total_tokens += report.tokens_learned;
                     refreshed_count += 1;
@@ -331,12 +417,15 @@ fn cmd_refresh(category: Option<&str>, brain_path: &Path) -> Result<(), ManasErr
     }
 
     network.total_texts_learned += 1;
-    let snap = trainer.snapshot();
-    brain.save_with_vocab(&network, &snapshot_to_vocab_map(&snap))?;
-    println!("Refreshed {} chunks | {} tokens learned", refreshed_count, total_tokens);
+    save_brain(&brain, &network, &trainer)?;
+    println!(
+        "Refreshed {} chunks | {} tokens learned",
+        refreshed_count, total_tokens
+    );
     Ok(())
 }
 
+/// `manas inspect`
 fn cmd_inspect(brain_path: &Path) -> Result<(), ManasError> {
     let brain = ManasBrain::new(brain_path);
     if !brain.path.exists() {
@@ -354,8 +443,7 @@ fn cmd_inspect(brain_path: &Path) -> Result<(), ManasError> {
             println!(" Vocab size    : {}", stats.vocab_size);
             println!(" Brain size    : {} bytes", stats.brain_size);
             println!(" Texts learned : {}", stats.total_texts_learned);
-            let ago = format_duration(stats.last_modified);
-            println!(" Last updated  : {}", ago);
+            println!(" Last updated  : {}", format_duration(stats.last_modified));
             println!("{}", "━".repeat(35));
         }
         Err(ManasError::FileNotFound(_)) => {
@@ -366,56 +454,47 @@ fn cmd_inspect(brain_path: &Path) -> Result<(), ManasError> {
     Ok(())
 }
 
-fn format_duration(unix_ts: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let diff = now.saturating_sub(unix_ts);
-    if diff < 60 {
-        format!("{} seconds ago", diff)
-    } else if diff < 3600 {
-        format!("{} minutes ago", diff / 60)
-    } else if diff < 86400 {
-        format!("{} hours ago", diff / 3600)
-    } else {
-        format!("{} days ago", diff / 86400)
-    }
-}
-
+/// `manas files`
 fn cmd_files(brain_path: &Path) -> Result<(), ManasError> {
     let brain = ManasBrain::new(brain_path);
     if !brain.path.exists() {
         println!("No brain file found at {}", brain.path.display());
         return Ok(());
     }
+
     let network = brain.load()?;
     let mut files: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+
     for (_, n) in network.all_neurons() {
         if let Source::LocalFile { path } = &n.source {
             *files.entry(path.clone()).or_insert(0) += 1;
         }
     }
+
     if files.is_empty() {
         println!("No files have been ingested yet");
         return Ok(());
     }
-    println!("{} ingested files:", files.len());
+
+    println!("{} ingested file(s):", files.len());
     for (path, count) in &files {
         println!("  {} — {} neuron(s)", path, count);
     }
     Ok(())
 }
 
+/// `manas trace "topic"`
 fn cmd_trace(text: &str, brain_path: &Path) -> Result<(), ManasError> {
     let brain = ManasBrain::new(brain_path);
     if !brain.path.exists() {
         println!("No brain file found at {}", brain.path.display());
         return Ok(());
     }
+
     let network = brain.load()?;
     let mut trainer = Trainer::new();
     restore_trainer_from_brain(&mut trainer, &brain);
+
     let tokens = trainer.tokenizer.encode(text);
     if tokens.is_empty() {
         println!("No tokens found in query");
@@ -425,11 +504,14 @@ fn cmd_trace(text: &str, brain_path: &Path) -> Result<(), ManasError> {
         trainer.embedder.embed_or_init(id);
     }
     let input = trainer.embedder.average_embed(&tokens);
+
     if network.layers.is_empty() {
-        println!("Network has no layers yet — nothing to trace");
+        println!("Network has no layers yet");
         return Ok(());
     }
+
     let (_output, layer_acts) = network.forward_with_activations(&input);
+
     let mut all_acts: Vec<(u64, u32, f32)> = Vec::new();
     for (layer_idx, acts) in layer_acts.iter().enumerate() {
         for (nid, val) in acts {
@@ -437,19 +519,24 @@ fn cmd_trace(text: &str, brain_path: &Path) -> Result<(), ManasError> {
         }
     }
     all_acts.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
     let top = &all_acts[..all_acts.len().min(10)];
-    println!("Top {} activated neurons:", top.len());
     let all_neurons: Vec<(u32, &Neuron)> = network.all_neurons();
+
+    println!("Top {} activated neurons:", top.len());
     for (nid, layer_id, act_val) in top {
         if let Some((_, n)) = all_neurons.iter().find(|(_, n)| n.id == *nid) {
+            // FIX 2 — source is now populated so this will show real values
             let src_desc = match &n.source {
-                Source::RawText => "raw text",
-                Source::LocalFile { path } => path,
-                Source::Internet { url } => url,
-                Source::Unknown => "unknown",
+                Source::RawText => "raw text".to_string(),
+                Source::LocalFile { path } => path.clone(),
+                Source::Internet { url } => url.clone(),
+                Source::Unknown => "unknown".to_string(),
             };
-            println!("  n{:<6} L{}  act={:.4}  imp={:.3}  fresh={}  src={}",
-                nid, layer_id, act_val, n.importance_score, n.freshness_category, src_desc);
+            println!(
+                "  n{:<6} L{}  act={:.4}  imp={:.3}  fresh={}  src={}",
+                nid, layer_id, act_val, n.importance_score, n.freshness_category, src_desc
+            );
         }
     }
 
@@ -463,6 +550,7 @@ fn cmd_trace(text: &str, brain_path: &Path) -> Result<(), ManasError> {
     Ok(())
 }
 
+/// `manas export [--out path]`
 fn cmd_export(out: Option<&str>, brain_path: &Path) -> Result<(), ManasError> {
     let dest = out.map(PathBuf::from).unwrap_or_else(|| {
         let mut p = PathBuf::from("brain_export.manas");
@@ -487,6 +575,7 @@ fn cmd_export(out: Option<&str>, brain_path: &Path) -> Result<(), ManasError> {
     Ok(())
 }
 
+/// `manas import --file path`
 fn cmd_import(file: &str, brain_path: &Path) -> Result<(), ManasError> {
     let src = PathBuf::from(file);
     if !src.exists() {
@@ -502,75 +591,108 @@ fn cmd_import(file: &str, brain_path: &Path) -> Result<(), ManasError> {
     Ok(())
 }
 
+/// `manas verify`
 fn cmd_verify(brain_path: &Path) -> Result<(), ManasError> {
     let brain = ManasBrain::new(brain_path);
-
     if !brain.path.exists() {
         println!("No brain file found at {}", brain.path.display());
         return Ok(());
     }
 
     match brain.verify() {
-        Ok(true) => println!("Brain file integrity verified"),
+        Ok(true) => println!("Brain file integrity verified ✓"),
         Ok(false) => println!("Checksum mismatch — file may be corrupt"),
         Err(e) => return Err(e),
     }
     Ok(())
 }
 
+/// `manas neurons [--all]`
 fn cmd_neurons(all: bool, brain_path: &Path) -> Result<(), ManasError> {
     let brain = ManasBrain::new(brain_path);
     if !brain.path.exists() {
         println!("No brain file found at {}", brain.path.display());
         return Ok(());
     }
+
     let network = brain.load()?;
     let neurons = network.all_neurons();
+
     if neurons.is_empty() {
         println!("No neurons in brain");
         return Ok(());
     }
-    let limit = if all { neurons.len() } else { 20.min(neurons.len()) };
+
+    let limit = if all {
+        neurons.len()
+    } else {
+        20.min(neurons.len())
+    };
     println!("{} neuron(s) (showing {}):", neurons.len(), limit);
+
     for (layer_id, n) in neurons.iter().take(limit) {
         let prot = match n.protection_level {
             manas_core::ProtectionLevel::Frozen => "FROZEN",
             manas_core::ProtectionLevel::Guarded => "guarded",
             manas_core::ProtectionLevel::Open => "open",
         };
-        let fresh_cat = match n.freshness_category {
+        let fresh = match n.freshness_category {
             0 => "timeless",
             1 => "slow",
             2 => "fast",
             3 => "realtime",
-            _ => "unknown",
+            _ => "?",
         };
-        println!("  n{:<6} L{}  w={}  imp={:.3}  {} {}  src={:?}",
-            n.id, layer_id, n.weights.len(), n.importance_score, prot, fresh_cat, n.source);
+        // FIX 2 — source now shown correctly after learn/ingest
+        let src = match &n.source {
+            Source::RawText => "raw-text".to_string(),
+            Source::LocalFile { path } => format!("file:{}", path),
+            Source::Internet { url } => format!("web:{}", url),
+            Source::Unknown => "unknown".to_string(),
+        };
+        println!(
+            "  n{:<6} L{}  w={}  imp={:.3}  {} {}  src={}",
+            n.id,
+            layer_id,
+            n.weights.len(),
+            n.importance_score,
+            prot,
+            fresh,
+            src
+        );
     }
+
     if !all && neurons.len() > 20 {
-        println!("  ... and {} more (use --all to show all)", neurons.len() - 20);
+        println!(
+            "  ... and {} more (use --all to show all)",
+            neurons.len() - 20
+        );
     }
     Ok(())
 }
 
+/// `manas restore [--all]`
 fn cmd_restore(all: bool, brain_path: &Path) -> Result<(), ManasError> {
     let brain = ManasBrain::new(brain_path);
     if !brain.path.exists() {
         println!("No brain file found at {}", brain.path.display());
         return Ok(());
     }
+
     let mut network = brain.load()?;
     let archived = brain.load_archive()?;
+
     if archived.is_empty() {
         println!("No archived neurons to restore");
         return Ok(());
     }
+
     let to_restore: Vec<Neuron> = if all {
         archived
     } else {
         archived.into_iter().take(10).collect()
     };
+
     let mut restored = 0u32;
     for neuron in &to_restore {
         if let Some(layer) = network.layers.last_mut() {
@@ -581,41 +703,32 @@ fn cmd_restore(all: bool, brain_path: &Path) -> Result<(), ManasError> {
             restored += 1;
         }
     }
+
     brain.save(&network)?;
     println!("Restored {} neuron(s) to last layer", restored);
-    if !all && !network.layers.is_empty() {
-        let remaining = brain.load_archive()?.len();
-        if remaining > 0 {
-            println!("  {} archived neurons remaining (use --all to restore all)", remaining);
-        }
-    }
     Ok(())
 }
 
+/// `manas tag "topic" --freshness fast`
 fn cmd_tag(text: &str, freshness: &str, brain_path: &Path) -> Result<(), ManasError> {
-    let cat = match freshness.to_lowercase().as_str() {
-        "timeless" | "0" => 0u8,
-        "slow" | "1" => 1,
-        "fast" | "2" => 2,
-        "realtime" | "3" => 3,
-        _ => {
-            println!("Unknown freshness '{}'. Use: timeless, slow, fast, realtime", freshness);
-            return Ok(());
-        }
-    };
+    let cat = parse_freshness_category(freshness)?;
 
     let brain = ManasBrain::new(brain_path);
     if !brain.path.exists() {
         println!("No brain file found at {}", brain.path.display());
         return Ok(());
     }
+
     let mut network = brain.load()?;
     let mut trainer = Trainer::new();
+    restore_trainer_from_brain(&mut trainer, &brain);
+
     let tokens = trainer.tokenizer.encode(text);
     for &id in &tokens {
         trainer.embedder.embed_or_init(id);
     }
     let input = trainer.embedder.average_embed(&tokens);
+
     let (_output, layer_acts) = network.forward_with_activations(&input);
 
     let mut activated_ids: Vec<u64> = Vec::new();
@@ -640,4 +753,25 @@ fn cmd_tag(text: &str, freshness: &str, brain_path: &Path) -> Result<(), ManasEr
     brain.save(&network)?;
     println!("Tagged {} neuron(s) as {}", tagged, freshness);
     Ok(())
+}
+
+// ─── Tiny helper ──────────────────────────────────────────────────────────────
+
+fn parse_freshness_category(s: &str) -> Result<u8, ManasError> {
+    match s.to_lowercase().as_str() {
+        "timeless" | "0" => Ok(0),
+        "slow" | "1" => Ok(1),
+        "fast" | "2" => Ok(2),
+        "realtime" | "3" => Ok(3),
+        other => {
+            println!(
+                "Unknown category '{}'. Use: timeless, slow, fast, realtime",
+                other
+            );
+            Err(ManasError::GrowthFailed(format!(
+                "unknown category: {}",
+                other
+            )))
+        }
+    }
 }

@@ -6,7 +6,7 @@ pub fn parse(text: &str) -> String {
 
     for line in text.lines() {
         let trimmed = line.trim();
-        
+
         if trimmed.starts_with("```") {
             in_code_block = !in_code_block;
             continue;
@@ -29,10 +29,14 @@ pub fn parse(text: &str) -> String {
 
 fn strip_markdown_line(line: &str) -> String {
     let mut s = line.to_string();
-    
-    if s.starts_with("###") { s = s[3..].to_string(); }
-    else if s.starts_with("##") { s = s[2..].to_string(); }
-    else if s.starts_with('#') { s = s[1..].to_string(); }
+
+    if s.starts_with("###") {
+        s = s[3..].to_string();
+    } else if s.starts_with("##") {
+        s = s[2..].to_string();
+    } else if s.starts_with('#') {
+        s = s[1..].to_string();
+    }
 
     s = strip_images(&s);
     s = strip_links(&s);
@@ -43,7 +47,9 @@ fn strip_markdown_line(line: &str) -> String {
     if trimmed.starts_with('-') || trimmed.starts_with('*') || trimmed.starts_with('+') {
         s = trimmed[1..].to_string();
     }
-    if s.trim().starts_with(|c: char| c.is_ascii_digit() && s.trim().contains('.')) {
+    if s.trim()
+        .starts_with(|c: char| c.is_ascii_digit() && s.trim().contains('.'))
+    {
         let rest = s.trim();
         if let Some(pos) = rest.find('.') {
             s = rest[pos + 1..].to_string();
@@ -140,7 +146,7 @@ fn strip_bold_italic(s: &str) -> String {
         match ch {
             '*' => in_star = !in_star,
             '_' => in_underscore = !in_underscore,
-            '~' => {},
+            '~' => {}
             _ => result.push(ch),
         }
     }

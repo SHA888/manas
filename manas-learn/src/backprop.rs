@@ -5,10 +5,12 @@ pub fn mse_loss(prediction: &[f32], target: &[f32]) -> f32 {
         return 0.0;
     }
     let n = prediction.len().min(target.len()) as f32;
-    prediction.iter()
+    prediction
+        .iter()
         .zip(target)
         .map(|(p, t)| (p - t) * (p - t))
-        .sum::<f32>() / n
+        .sum::<f32>()
+        / n
 }
 
 #[derive(Debug, Clone)]
@@ -34,10 +36,13 @@ pub fn forward_with_cache(network: &Network, input: &[f32]) -> ForwardCache {
         let mut outs = Vec::with_capacity(layer.neurons.len());
 
         for neuron in &layer.neurons {
-            let z: f32 = neuron.weights.iter()
+            let z: f32 = neuron
+                .weights
+                .iter()
                 .zip(&current)
                 .map(|(w, i)| w * i)
-                .sum::<f32>() + neuron.bias;
+                .sum::<f32>()
+                + neuron.bias;
             zs.push(z);
             outs.push(neuron.activation.apply(z));
         }
@@ -120,7 +125,13 @@ pub fn compute_gradients(
                 weight_delta.push(g);
             }
             let bias_delta = layer_delta[i];
-            result.push((neuron.id, NeuronGradients { weight_delta, bias_delta }));
+            result.push((
+                neuron.id,
+                NeuronGradients {
+                    weight_delta,
+                    bias_delta,
+                },
+            ));
         }
     }
 
@@ -129,7 +140,8 @@ pub fn compute_gradients(
 
 pub fn compute_output_gradient(output: &[f32], target: &[f32]) -> Vec<f32> {
     let n = output.len().max(1) as f32;
-    output.iter()
+    output
+        .iter()
         .zip(target)
         .map(|(p, t)| 2.0 * (p - t) / n)
         .collect()

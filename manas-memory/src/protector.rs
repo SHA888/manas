@@ -1,4 +1,4 @@
-use manas_core::{Neuron, Network, ProtectionLevel};
+use manas_core::{Network, Neuron, ProtectionLevel};
 
 pub fn protection_from_importance(importance: f32, age_seconds: u64) -> ProtectionLevel {
     if importance >= 0.85 {

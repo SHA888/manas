@@ -63,9 +63,12 @@ pub fn parse(text: &str) -> String {
             }
         } else if trimmed.starts_with("//") {
             continue;
-        } else if trimmed.contains("fn ") || trimmed.contains("struct ")
-            || trimmed.contains("enum ") || trimmed.contains("trait ")
-            || trimmed.contains("impl ") || trimmed.contains("mod ")
+        } else if trimmed.contains("fn ")
+            || trimmed.contains("struct ")
+            || trimmed.contains("enum ")
+            || trimmed.contains("trait ")
+            || trimmed.contains("impl ")
+            || trimmed.contains("mod ")
         {
             result.push_str("declaration: ");
             result.push_str(trimmed);

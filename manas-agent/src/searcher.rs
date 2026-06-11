@@ -1,6 +1,6 @@
-use std::time::Duration;
 use manas_core::ManasError;
 use scraper::{Html, Selector};
+use std::time::Duration;
 
 pub struct SearchResult {
     pub url: String,
@@ -70,12 +70,12 @@ fn url_encode(s: &str) -> String {
 
 fn parse_ddg_results(html: &str, max: usize) -> Result<Vec<SearchResult>, ManasError> {
     let doc = Html::parse_document(html);
-    let result_selector = Selector::parse(".result")
-        .map_err(|e| ManasError::ScraperError(e.to_string()))?;
-    let title_selector = Selector::parse(".result__title a")
-        .map_err(|e| ManasError::ScraperError(e.to_string()))?;
-    let snippet_selector = Selector::parse(".result__snippet")
-        .map_err(|e| ManasError::ScraperError(e.to_string()))?;
+    let result_selector =
+        Selector::parse(".result").map_err(|e| ManasError::ScraperError(e.to_string()))?;
+    let title_selector =
+        Selector::parse(".result__title a").map_err(|e| ManasError::ScraperError(e.to_string()))?;
+    let snippet_selector =
+        Selector::parse(".result__snippet").map_err(|e| ManasError::ScraperError(e.to_string()))?;
 
     let mut results = Vec::new();
 
@@ -105,7 +105,11 @@ fn parse_ddg_results(html: &str, max: usize) -> Result<Vec<SearchResult>, ManasE
             .to_string();
 
         if !url.is_empty() {
-            results.push(SearchResult { url, title, snippet });
+            results.push(SearchResult {
+                url,
+                title,
+                snippet,
+            });
         }
     }
 

@@ -1,16 +1,22 @@
-use std::path::PathBuf;
 use std::fmt;
+use std::path::PathBuf;
 
 #[derive(Debug)]
 pub enum ManasError {
     FileNotFound(PathBuf),
-    CorruptFile { path: PathBuf, reason: String },
+    CorruptFile {
+        path: PathBuf,
+        reason: String,
+    },
     ChecksumMismatch,
     TokenizerError(String),
     EmbeddingError(String),
     BackpropError(String),
     UnsupportedFileType(String),
-    FileReadError { path: PathBuf, source: std::io::Error },
+    FileReadError {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     NetworkError(String),
     ScraperError(String),
     SearchBackendError(String),

@@ -5,8 +5,8 @@ pub mod raw_text;
 
 mod format;
 
-use std::path::PathBuf;
 use manas_core::{ManasError, Source};
+use std::path::PathBuf;
 
 pub const CHUNK_SIZE: usize = 512;
 pub const CHUNK_OVERLAP: usize = 64;
@@ -39,7 +39,11 @@ pub fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> 
 
     while start_char < char_count {
         let end_char = (start_char + chunk_size).min(char_count);
-        let end_byte = if end_char < char_count { byte_positions[end_char] } else { text.len() };
+        let end_byte = if end_char < char_count {
+            byte_positions[end_char]
+        } else {
+            text.len()
+        };
 
         if end_char >= char_count {
             chunks.push(text[byte_positions[start_char]..].to_string());
@@ -60,7 +64,10 @@ pub fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> 
 
         chunks.push(text[slice_start..split_byte].to_string());
 
-        let split_end = byte_positions.iter().position(|&b| b >= split_byte).unwrap_or(char_count);
+        let split_end = byte_positions
+            .iter()
+            .position(|&b| b >= split_byte)
+            .unwrap_or(char_count);
         if split_end >= char_count {
             break;
         }
@@ -84,30 +91,36 @@ impl IngestPipeline {
             IngestSource::Text(text) => {
                 let normalized = normalizer::normalize(&text);
                 let chunks = chunk_text(&normalized, CHUNK_SIZE, CHUNK_OVERLAP);
-                Ok(chunks.into_iter().enumerate().map(|(i, chunk)| {
-                    TextChunk {
+                Ok(chunks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, chunk)| TextChunk {
                         text: chunk,
                         source: Source::RawText,
                         chunk_id: i as u64,
                         file_path: None,
                         url: None,
-                    }
-                }).collect())
+                    })
+                    .collect())
             }
             IngestSource::File(path) => {
                 let content = file_reader::read_file(&path)?;
                 let normalized = normalizer::normalize(&content);
                 let chunks = chunk_text(&normalized, CHUNK_SIZE, CHUNK_OVERLAP);
                 let path_str = path.display().to_string();
-                Ok(chunks.into_iter().enumerate().map(|(i, chunk)| {
-                    TextChunk {
+                Ok(chunks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, chunk)| TextChunk {
                         text: chunk,
-                        source: Source::LocalFile { path: path_str.clone() },
+                        source: Source::LocalFile {
+                            path: path_str.clone(),
+                        },
                         chunk_id: i as u64,
                         file_path: Some(path_str.clone()),
                         url: None,
-                    }
-                }).collect())
+                    })
+                    .collect())
             }
             IngestSource::Folder(path) => {
                 let entries = folder_walker::walk_folder(&path)?;
@@ -118,7 +131,9 @@ impl IngestPipeline {
                     for (i, chunk) in chunks.into_iter().enumerate() {
                         all_chunks.push(TextChunk {
                             text: chunk,
-                            source: Source::LocalFile { path: entry.path.clone() },
+                            source: Source::LocalFile {
+                                path: entry.path.clone(),
+                            },
                             chunk_id: i as u64,
                             file_path: Some(entry.path.clone()),
                             url: None,
@@ -127,15 +142,13 @@ impl IngestPipeline {
                 }
                 Ok(all_chunks)
             }
-            IngestSource::Url(url) => {
-                Ok(vec![TextChunk {
-                    text: String::new(),
-                    source: Source::Internet { url: url.clone() },
-                    chunk_id: 0,
-                    file_path: None,
-                    url: Some(url),
-                }])
-            }
+            IngestSource::Url(url) => Ok(vec![TextChunk {
+                text: String::new(),
+                source: Source::Internet { url: url.clone() },
+                chunk_id: 0,
+                file_path: None,
+                url: Some(url),
+            }]),
         }
     }
 }
@@ -167,7 +180,9 @@ mod tests {
     #[test]
     fn raw_text_pipeline() {
         let pipeline = IngestPipeline::new();
-        let chunks = pipeline.process(IngestSource::Text("hello world".into())).unwrap();
+        let chunks = pipeline
+            .process(IngestSource::Text("hello world".into()))
+            .unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, "hello world");
     }

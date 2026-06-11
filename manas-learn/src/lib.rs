@@ -4,11 +4,16 @@ pub mod embedder;
 pub mod tokenizer;
 pub mod trainer;
 
-pub use backprop::{mse_loss, compute_gradients, compute_output_gradient, ForwardCache, NeuronGradients};
-pub use decoder::{decode, DecodeResult};
+pub use backprop::{
+    ForwardCache, NeuronGradients, compute_gradients, compute_output_gradient, mse_loss,
+};
+pub use decoder::{DecodeResult, decode};
 pub use embedder::Embedder;
 pub use tokenizer::Tokenizer;
-pub use trainer::{Trainer, LearnReport, TrainerSnapshot, detect_freshness_category, DEFAULT_EMBED_DIM, DEFAULT_GROWTH_THRESHOLD, DEFAULT_LEARNING_RATE};
+pub use trainer::{
+    DEFAULT_EMBED_DIM, DEFAULT_GROWTH_THRESHOLD, DEFAULT_LEARNING_RATE, LearnReport, Trainer,
+    TrainerSnapshot, detect_freshness_category,
+};
 
 #[cfg(test)]
 mod tests {
@@ -50,7 +55,9 @@ mod tests {
         let mut network = Network::new();
 
         for _ in 0..5 {
-            let report = trainer.learn(&mut network, "rust is a systems programming language").unwrap();
+            let report = trainer
+                .learn(&mut network, "rust is a systems programming language")
+                .unwrap();
             assert!(report.tokens_learned > 0);
         }
 

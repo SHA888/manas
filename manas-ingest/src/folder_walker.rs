@@ -1,6 +1,6 @@
-use std::path::Path;
-use manas_core::ManasError;
 use crate::file_reader;
+use manas_core::ManasError;
+use std::path::Path;
 
 pub struct FileEntry {
     pub path: String,
@@ -26,7 +26,8 @@ pub fn walk_folder(path: &Path) -> Result<Vec<FileEntry>, ManasError> {
             continue;
         }
 
-        let ext = entry.path()
+        let ext = entry
+            .path()
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")

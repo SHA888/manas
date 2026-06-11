@@ -1,15 +1,14 @@
-use std::io::Read;
-use manas_core::{ManasError, Neuron};
 use crate::format;
 use crate::integrity;
 use crate::reader;
+use manas_core::{ManasError, Neuron};
+use std::io::Read;
 
 fn read_all(path: &std::path::Path) -> Result<Vec<u8>, ManasError> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| ManasError::FileReadError {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
+    let mut file = std::fs::File::open(path).map_err(|e| ManasError::FileReadError {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
     let mut data = Vec::new();
     file.read_to_end(&mut data)
         .map_err(|e| ManasError::FileReadError {
@@ -25,7 +24,11 @@ fn strip_checksum(data: &mut Vec<u8>) {
     }
 }
 
-pub fn append_neuron_to_file(path: &std::path::Path, layer_id: u32, neuron: &Neuron) -> Result<(), ManasError> {
+pub fn append_neuron_to_file(
+    path: &std::path::Path,
+    layer_id: u32,
+    neuron: &Neuron,
+) -> Result<(), ManasError> {
     let mut data = read_all(path)?;
 
     integrity::verify_checksum(&data)?;
@@ -37,9 +40,10 @@ pub fn append_neuron_to_file(path: &std::path::Path, layer_id: u32, neuron: &Neu
     })?;
 
     let layers = reader::find_layer_locations(&data)?;
-    let layer = layers.iter().find(|l| l.id == layer_id).ok_or_else(|| {
-        ManasError::GrowthFailed(format!("layer {} not found", layer_id))
-    })?;
+    let layer = layers
+        .iter()
+        .find(|l| l.id == layer_id)
+        .ok_or_else(|| ManasError::GrowthFailed(format!("layer {} not found", layer_id)))?;
 
     let mut neuron_bytes = Vec::new();
     format::write_neuron(&mut neuron_bytes, neuron);
@@ -71,16 +75,20 @@ pub fn append_neuron_to_file(path: &std::path::Path, layer_id: u32, neuron: &Neu
     let mut found_target = false;
     for i in 0..layer_index_entries {
         let entry_off = layer_index_start + i * 16;
-        if entry_off + 16 > data.len() { break; }
+        if entry_off + 16 > data.len() {
+            break;
+        }
         let lid = u32::from_le_bytes(data[entry_off..entry_off + 4].try_into().unwrap());
         if lid == layer_id {
             // Update this layer's neuron count in the index
-            let old_count = u32::from_le_bytes(data[entry_off + 12..entry_off + 16].try_into().unwrap());
+            let old_count =
+                u32::from_le_bytes(data[entry_off + 12..entry_off + 16].try_into().unwrap());
             data[entry_off + 12..entry_off + 16].copy_from_slice(&(old_count + 1).to_le_bytes());
             found_target = true;
         } else if found_target {
             // Shift block offset for layers after the modified one
-            let mut block_off = u64::from_le_bytes(data[entry_off + 4..entry_off + 12].try_into().unwrap());
+            let mut block_off =
+                u64::from_le_bytes(data[entry_off + 4..entry_off + 12].try_into().unwrap());
             block_off += shift as u64;
             data[entry_off + 4..entry_off + 12].copy_from_slice(&block_off.to_le_bytes());
         }
@@ -111,7 +119,11 @@ pub fn append_neuron_to_file(path: &std::path::Path, layer_id: u32, neuron: &Neu
     Ok(())
 }
 
-pub fn update_neuron_in_file(path: &std::path::Path, neuron_id: u64, neuron: &Neuron) -> Result<(), ManasError> {
+pub fn update_neuron_in_file(
+    path: &std::path::Path,
+    neuron_id: u64,
+    neuron: &Neuron,
+) -> Result<(), ManasError> {
     let mut data = read_all(path)?;
 
     integrity::verify_checksum(&data)?;
@@ -128,7 +140,9 @@ pub fn update_neuron_in_file(path: &std::path::Path, neuron_id: u64, neuron: &Ne
             path: path.to_path_buf(),
             reason: format!(
                 "neuron {} size mismatch: old={} new={}",
-                neuron_id, old_size, new_bytes.len()
+                neuron_id,
+                old_size,
+                new_bytes.len()
             ),
         });
     }

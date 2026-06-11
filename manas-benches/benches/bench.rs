@@ -19,7 +19,10 @@ fn run_benches() -> Vec<(&'static str, Duration)> {
     results.push(("tokenize (short text)", bench_tokenize_short()));
     results.push(("tokenize (long text)", bench_tokenize_long()));
     results.push(("embed average (10 tokens, dim=64)", bench_embed_average()));
-    results.push(("forward pass (2 layers, 16+64 neurons)", bench_forward_small()));
+    results.push((
+        "forward pass (2 layers, 16+64 neurons)",
+        bench_forward_small(),
+    ));
     results.push(("forward pass (3 layers, 256+128+64)", bench_forward_large()));
     results.push(("backprop (2 layers, 16+64)", bench_backprop_small()));
     results.push(("learn (short text, repeat 50x)", bench_learn_short()));

@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use manas_core::{ManasError, Network, Layer, Activation};
 use crate::format;
 use crate::integrity;
+use manas_core::{Activation, Layer, ManasError, Network};
+use std::collections::HashMap;
 
 pub fn write_to_path(network: &Network, path: &std::path::Path) -> Result<(), ManasError> {
     let bytes = build_bytes(network, &[], &HashMap::new());
@@ -88,10 +88,10 @@ fn build_bytes(
     for layer in &network.layers {
         layer_offsets.push(current_offset);
         neuron_counts.push(layer.neurons.len() as u32);
+        current_offset += 9;
         for neuron in &layer.neurons {
-            current_offset += format::neuron_binary_size(neuron) as u64 + 9;
+            current_offset += format::neuron_binary_size(neuron) as u64;
         }
-        current_offset -= 9;
     }
 
     for (i, layer) in network.layers.iter().enumerate() {

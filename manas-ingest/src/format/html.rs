@@ -70,17 +70,37 @@ pub fn parse(text: &str) -> String {
         }
 
         if chars[i] == '&' {
-            if text[i..].starts_with("&amp;") { result.push('&'); i += 5; continue; }
-            if text[i..].starts_with("&lt;") { result.push('<'); i += 4; continue; }
-            if text[i..].starts_with("&gt;") { result.push('>'); i += 4; continue; }
-            if text[i..].starts_with("&quot;") { result.push('"'); i += 6; continue; }
+            if text[i..].starts_with("&amp;") {
+                result.push('&');
+                i += 5;
+                continue;
+            }
+            if text[i..].starts_with("&lt;") {
+                result.push('<');
+                i += 4;
+                continue;
+            }
+            if text[i..].starts_with("&gt;") {
+                result.push('>');
+                i += 4;
+                continue;
+            }
+            if text[i..].starts_with("&quot;") {
+                result.push('"');
+                i += 6;
+                continue;
+            }
             if text[i..].starts_with("&#") {
                 if let Some(semi) = text[i..].find(';') {
                     i += semi + 1;
                     continue;
                 }
             }
-            if text[i..].starts_with("&nbsp;") { result.push(' '); i += 6; continue; }
+            if text[i..].starts_with("&nbsp;") {
+                result.push(' ');
+                i += 6;
+                continue;
+            }
         }
 
         result.push(chars[i]);

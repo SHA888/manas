@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use std::io::Read;
-use manas_core::{ManasError, Network, Neuron, Source, ProtectionLevel, Activation};
 use crate::format;
 use crate::integrity;
+use manas_core::{Activation, ManasError, Network, Neuron, ProtectionLevel, Source};
+use std::collections::HashMap;
+use std::io::Read;
 
 pub struct LayerLocation {
     pub id: u32,
@@ -14,20 +14,27 @@ pub struct LayerLocation {
 }
 
 pub fn find_layer_locations(data: &[u8]) -> Result<Vec<LayerLocation>, ManasError> {
-    let header = format::read_header(data)
-        .ok_or_else(|| ManasError::CorruptFile {
-            path: std::path::PathBuf::new(),
-            reason: "invalid header".into(),
-        })?;
+    let header = format::read_header(data).ok_or_else(|| ManasError::CorruptFile {
+        path: std::path::PathBuf::new(),
+        reason: "invalid header".into(),
+    })?;
 
     let mut offset = format::HEADER_SIZE as u64;
-    let vocab_count = u32::from_le_bytes(data[offset as usize..offset as usize + 4].try_into().unwrap());
+    let vocab_count = u32::from_le_bytes(
+        data[offset as usize..offset as usize + 4]
+            .try_into()
+            .unwrap(),
+    );
     offset += 4;
     for _ in 0..vocab_count {
         offset += 4;
         let token_len = data[offset as usize] as usize;
         offset += 1 + token_len as u64 + 2;
-        let embed_count = u16::from_le_bytes(data[offset as usize - 2..offset as usize].try_into().unwrap()) as usize;
+        let embed_count = u16::from_le_bytes(
+            data[offset as usize - 2..offset as usize]
+                .try_into()
+                .unwrap(),
+        ) as usize;
         offset += (embed_count * 4) as u64;
     }
 
@@ -66,7 +73,8 @@ pub fn find_neuron_offset(data: &[u8], neuron_id: u64) -> Result<u64, ManasError
             if npos as usize + 8 > data.len() {
                 return Err(ManasError::NeuronNotFound(neuron_id));
             }
-            let nid = u64::from_le_bytes(data[npos as usize..npos as usize + 8].try_into().unwrap());
+            let nid =
+                u64::from_le_bytes(data[npos as usize..npos as usize + 8].try_into().unwrap());
             if nid == neuron_id {
                 return Ok(npos);
             }
@@ -93,8 +101,27 @@ pub fn compute_neuron_size_bytes(data: &[u8], offset: u64) -> Result<u64, ManasE
             reason: "truncated neuron (source_len)".into(),
         });
     }
-    let source_len = u16::from_le_bytes(data[off + source_len_off..off + source_len_off + 2].try_into().unwrap());
-    Ok(10 + weight_count as u64 * 4 + 4 + 1 + 4 + 8 + 8 + 8 + 8 + 8 + 1 + 1 + 2 + source_len as u64 + 1 + 1)
+    let source_len = u16::from_le_bytes(
+        data[off + source_len_off..off + source_len_off + 2]
+            .try_into()
+            .unwrap(),
+    );
+    Ok(10
+        + weight_count as u64 * 4
+        + 4
+        + 1
+        + 4
+        + 8
+        + 8
+        + 8
+        + 8
+        + 8
+        + 1
+        + 1
+        + 2
+        + source_len as u64
+        + 1
+        + 1)
 }
 
 #[allow(dead_code)]
@@ -164,11 +191,10 @@ pub fn read_raw_neuron(data: &[u8], offset: u64) -> Result<Neuron, ManasError> {
 }
 
 pub fn read_from_path(path: &std::path::Path) -> Result<Network, ManasError> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| ManasError::FileReadError {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
+    let mut file = std::fs::File::open(path).map_err(|e| ManasError::FileReadError {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
 
     let mut data = Vec::new();
     file.read_to_end(&mut data)
@@ -183,11 +209,10 @@ pub fn read_from_path(path: &std::path::Path) -> Result<Network, ManasError> {
 pub fn read_from_bytes(data: &[u8]) -> Result<Network, ManasError> {
     integrity::verify_checksum(data)?;
 
-    let header = format::read_header(data)
-        .ok_or_else(|| ManasError::CorruptFile {
-            path: std::path::PathBuf::new(),
-            reason: "invalid or missing file header".into(),
-        })?;
+    let header = format::read_header(data).ok_or_else(|| ManasError::CorruptFile {
+        path: std::path::PathBuf::new(),
+        reason: "invalid or missing file header".into(),
+    })?;
 
     let mut layers = Vec::with_capacity(header.total_layers as usize);
 
@@ -207,21 +232,24 @@ pub fn read_from_bytes(data: &[u8]) -> Result<Network, ManasError> {
     offset += layer_index_size;
 
     for _ in 0..header.total_layers {
-        let layer = format::read_layer_block(data, &mut offset)
-            .ok_or_else(|| ManasError::CorruptFile {
+        let layer =
+            format::read_layer_block(data, &mut offset).ok_or_else(|| ManasError::CorruptFile {
                 path: std::path::PathBuf::new(),
                 reason: format!("failed to read layer block at offset {}", offset),
             })?;
         layers.push(layer);
     }
 
-    Ok(Network {
+    let mut network = Network {
         layers,
         total_neurons: header.total_neurons,
         created_at: header.created_at,
         version: header.version,
         total_texts_learned: header.total_texts_learned,
-    })
+        next_id: 0, // ← new field, starts at 0
+    };
+    network.recompute_next_id(); // ← one scan, O(1) alloc_id() forever after
+    Ok(network)
 }
 
 pub fn read_vocab_from_bytes(data: &[u8]) -> Result<HashMap<u32, (String, Vec<f32>)>, ManasError> {
@@ -231,19 +259,29 @@ pub fn read_vocab_from_bytes(data: &[u8]) -> Result<HashMap<u32, (String, Vec<f3
 
     let mut vocab = HashMap::with_capacity(vocab_count as usize);
     for _ in 0..vocab_count {
-        if offset + 4 > data.len() { break; }
+        if offset + 4 > data.len() {
+            break;
+        }
         let token_id = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
         offset += 4;
-        if offset >= data.len() { break; }
+        if offset >= data.len() {
+            break;
+        }
         let token_len = data[offset] as usize;
         offset += 1;
-        if offset + token_len > data.len() { break; }
+        if offset + token_len > data.len() {
+            break;
+        }
         let token = String::from_utf8_lossy(&data[offset..offset + token_len]).to_string();
         offset += token_len;
-        if offset + 2 > data.len() { break; }
+        if offset + 2 > data.len() {
+            break;
+        }
         let embed_dim = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
         offset += 2;
-        if offset + embed_dim * 4 > data.len() { break; }
+        if offset + embed_dim * 4 > data.len() {
+            break;
+        }
         let mut embedding = Vec::with_capacity(embed_dim);
         for _ in 0..embed_dim {
             let v = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
@@ -257,11 +295,10 @@ pub fn read_vocab_from_bytes(data: &[u8]) -> Result<HashMap<u32, (String, Vec<f3
 }
 
 pub fn read_archived_neurons(data: &[u8]) -> Result<Vec<Neuron>, ManasError> {
-    let header = format::read_header(data)
-        .ok_or_else(|| ManasError::CorruptFile {
-            path: std::path::PathBuf::new(),
-            reason: "invalid header".into(),
-        })?;
+    let header = format::read_header(data).ok_or_else(|| ManasError::CorruptFile {
+        path: std::path::PathBuf::new(),
+        reason: "invalid header".into(),
+    })?;
 
     if header.flags & 1 == 0 {
         return Ok(Vec::new());
@@ -283,15 +320,15 @@ pub fn read_archived_neurons(data: &[u8]) -> Result<Vec<Neuron>, ManasError> {
     offset += layer_index_size;
 
     for _ in 0..header.total_layers {
-        let _ = format::read_layer_block(data, &mut offset)
-            .ok_or_else(|| ManasError::CorruptFile {
+        let _ =
+            format::read_layer_block(data, &mut offset).ok_or_else(|| ManasError::CorruptFile {
                 path: std::path::PathBuf::new(),
                 reason: format!("failed to read layer block at offset {}", offset),
             })?;
     }
 
-    let archive_layer = format::read_layer_block(data, &mut offset)
-        .ok_or_else(|| ManasError::CorruptFile {
+    let archive_layer =
+        format::read_layer_block(data, &mut offset).ok_or_else(|| ManasError::CorruptFile {
             path: std::path::PathBuf::new(),
             reason: "failed to read archive block".into(),
         })?;

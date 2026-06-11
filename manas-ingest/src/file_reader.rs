@@ -1,15 +1,15 @@
-use std::path::Path;
-use manas_core::ManasError;
 use crate::format;
+use manas_core::ManasError;
+use std::path::Path;
 
 pub fn read_file(path: &Path) -> Result<String, ManasError> {
-    let contents = std::fs::read_to_string(path)
-        .map_err(|e| ManasError::FileReadError {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
+    let contents = std::fs::read_to_string(path).map_err(|e| ManasError::FileReadError {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
 
-    let ext = path.extension()
+    let ext = path
+        .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
@@ -31,5 +31,8 @@ pub fn parse_by_extension(contents: &str, ext: &str) -> Result<String, ManasErro
 }
 
 pub fn supported_extension(ext: &str) -> bool {
-    matches!(ext, "txt" | "md" | "rs" | "json" | "toml" | "csv" | "html" | "htm")
+    matches!(
+        ext,
+        "txt" | "md" | "rs" | "json" | "toml" | "csv" | "html" | "htm"
+    )
 }

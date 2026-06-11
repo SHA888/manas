@@ -1,6 +1,6 @@
-use std::time::Duration;
 use manas_core::ManasError;
 use scraper::{Html, Selector};
+use std::time::Duration;
 
 pub struct Scraper {
     pub timeout_secs: u64,
@@ -45,13 +45,27 @@ impl Default for Scraper {
 fn extract_readable_text(html: &str) -> Result<String, ManasError> {
     let doc = Html::parse_document(html);
 
-    let body_sel = Selector::parse("body")
-        .map_err(|e| ManasError::ScraperError(e.to_string()))?;
+    let body_sel = Selector::parse("body").map_err(|e| ManasError::ScraperError(e.to_string()))?;
 
     let content_selectors = [
-        "p", "h1", "h2", "h3", "h4", "h5", "h6",
-        "li", "td", "th", "blockquote", "pre", "code",
-        "article", "section", "main", "div.content", "div.main",
+        "p",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "li",
+        "td",
+        "th",
+        "blockquote",
+        "pre",
+        "code",
+        "article",
+        "section",
+        "main",
+        "div.content",
+        "div.main",
     ];
 
     let mut text_parts: Vec<String> = Vec::new();
@@ -74,8 +88,8 @@ fn extract_readable_text(html: &str) -> Result<String, ManasError> {
     }
 
     if text_parts.is_empty() {
-        let all_sel = Selector::parse("body")
-            .map_err(|e| ManasError::ScraperError(e.to_string()))?;
+        let all_sel =
+            Selector::parse("body").map_err(|e| ManasError::ScraperError(e.to_string()))?;
         if let Some(body) = doc.select(&all_sel).next() {
             let text: String = body.text().collect::<Vec<_>>().join(" ");
             let cleaned = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -91,17 +105,22 @@ fn extract_readable_text(html: &str) -> Result<String, ManasError> {
 fn is_excluded(element: &scraper::ElementRef) -> bool {
     if let Some(class) = element.value().attr("class") {
         let class_lower = class.to_lowercase();
-        if class_lower.contains("nav") || class_lower.contains("sidebar")
-            || class_lower.contains("footer") || class_lower.contains("menu")
-            || class_lower.contains("comment") || class_lower.contains("ad-")
+        if class_lower.contains("nav")
+            || class_lower.contains("sidebar")
+            || class_lower.contains("footer")
+            || class_lower.contains("menu")
+            || class_lower.contains("comment")
+            || class_lower.contains("ad-")
         {
             return true;
         }
     }
     if let Some(id) = element.value().attr("id") {
         let id_lower = id.to_lowercase();
-        if id_lower.contains("nav") || id_lower.contains("sidebar")
-            || id_lower.contains("footer") || id_lower.contains("menu")
+        if id_lower.contains("nav")
+            || id_lower.contains("sidebar")
+            || id_lower.contains("footer")
+            || id_lower.contains("menu")
         {
             return true;
         }

@@ -1,6 +1,6 @@
-use manas_core::Network;
 use crate::embedder::Embedder;
 use crate::tokenizer::Tokenizer;
+use manas_core::Network;
 
 pub struct DecodeResult {
     pub tokens: Vec<(String, f32)>,
@@ -49,7 +49,10 @@ pub fn decode(
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(20);
 
-    DecodeResult { tokens: scored, output_norm }
+    DecodeResult {
+        tokens: scored,
+        output_norm,
+    }
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {

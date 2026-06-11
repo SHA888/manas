@@ -4,16 +4,16 @@ mod patcher;
 mod reader;
 mod writer;
 
+use manas_core::{ManasError, Network, Neuron};
 use std::collections::HashMap;
-use std::path::PathBuf;
-use manas_core::{ManasError, Neuron, Network};
 use std::io::Read;
+use std::path::PathBuf;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use manas_core::Activation;
+    use std::path::Path;
 
     fn test_network() -> Network {
         let mut net = Network::new();
@@ -88,9 +88,7 @@ mod tests {
         let brain = ManasBrain::new(path);
 
         let net = test_network();
-        let archived = vec![
-            Neuron::new(999, 4, Activation::ReLU),
-        ];
+        let archived = vec![Neuron::new(999, 4, Activation::ReLU)];
 
         crate::writer::write_to_path_with_archive(&net, &archived, path).unwrap();
 
@@ -158,7 +156,12 @@ mod tests {
 
         assert!(brain.verify().unwrap());
         let loaded = brain.load().unwrap();
-        let found: Vec<&manas_core::Neuron> = loaded.all_neurons().iter().map(|(_, n)| *n).filter(|n| n.id == old.id).collect();
+        let found: Vec<&manas_core::Neuron> = loaded
+            .all_neurons()
+            .iter()
+            .map(|(_, n)| *n)
+            .filter(|n| n.id == old.id)
+            .collect();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].bias.to_bits(), 42.0f32.to_bits());
         assert_eq!(found[0].last_activated, 999999);
@@ -238,20 +241,18 @@ impl ManasBrain {
     }
 
     pub fn load_vocab(&self) -> Result<HashMap<u32, (String, Vec<f32>)>, ManasError> {
-        let data = std::fs::read(&self.path)
-            .map_err(|e| ManasError::FileReadError {
-                path: self.path.clone(),
-                source: e,
-            })?;
+        let data = std::fs::read(&self.path).map_err(|e| ManasError::FileReadError {
+            path: self.path.clone(),
+            source: e,
+        })?;
         reader::read_vocab_from_bytes(&data)
     }
 
     pub fn verify(&self) -> Result<bool, ManasError> {
-        let data = std::fs::read(&self.path)
-            .map_err(|e| ManasError::FileReadError {
-                path: self.path.clone(),
-                source: e,
-            })?;
+        let data = std::fs::read(&self.path).map_err(|e| ManasError::FileReadError {
+            path: self.path.clone(),
+            source: e,
+        })?;
         match integrity::verify_checksum(&data) {
             Ok(_) => Ok(true),
             Err(ManasError::ChecksumMismatch) => Ok(false),
@@ -260,11 +261,10 @@ impl ManasBrain {
     }
 
     pub fn load_archive(&self) -> Result<Vec<Neuron>, ManasError> {
-        let mut file = std::fs::File::open(&self.path)
-            .map_err(|e| ManasError::FileReadError {
-                path: self.path.clone(),
-                source: e,
-            })?;
+        let mut file = std::fs::File::open(&self.path).map_err(|e| ManasError::FileReadError {
+            path: self.path.clone(),
+            source: e,
+        })?;
         let mut data = Vec::new();
         file.read_to_end(&mut data)
             .map_err(|e| ManasError::FileReadError {
@@ -275,11 +275,10 @@ impl ManasBrain {
     }
 
     pub fn inspect(&self) -> Result<BrainStats, ManasError> {
-        let data = std::fs::read(&self.path)
-            .map_err(|e| ManasError::FileReadError {
-                path: self.path.clone(),
-                source: e,
-            })?;
+        let data = std::fs::read(&self.path).map_err(|e| ManasError::FileReadError {
+            path: self.path.clone(),
+            source: e,
+        })?;
 
         let header = format::read_header(&data).ok_or_else(|| ManasError::CorruptFile {
             path: self.path.clone(),

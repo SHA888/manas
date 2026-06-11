@@ -1,6 +1,6 @@
-use manas_core::{ManasError, Network, Neuron};
-use crate::searcher::Searcher;
 use crate::scraper::Scraper;
+use crate::searcher::Searcher;
+use manas_core::{ManasError, Network, Neuron};
 
 pub struct FreshnessReport {
     pub total_stale: usize,
@@ -158,7 +158,9 @@ mod tests {
         let searcher = Searcher::new();
         let scraper = Scraper::new();
 
-        checker.refresh_neuron(nid, &mut net, &searcher, &scraper).unwrap();
+        checker
+            .refresh_neuron(nid, &mut net, &searcher, &scraper)
+            .unwrap();
         assert!(net.layers[0].neurons[0].last_verified > 0);
     }
 }
