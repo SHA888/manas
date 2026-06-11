@@ -485,6 +485,12 @@ impl ManasBrain {
 
     /// Print human-readable stats
     pub fn inspect(&self) -> Result<BrainStats>;
+
+    /// Save network + vocab + embeddings (full trainer state)
+    pub fn save_with_vocab(&self, network: &Network, vocab: &HashMap<u32, (String, Vec<f32>)>) -> Result<()>;
+
+    /// Load just the vocab + embeddings
+    pub fn load_vocab(&self) -> Result<HashMap<u32, (String, Vec<f32>)>>;
 }
 ```
 
@@ -544,6 +550,7 @@ A lightweight tokenizer — no BPE, no external model.
 ```rust
 pub struct Tokenizer {
     pub vocab: HashMap<String, u32>,   // token → id
+    pub id_to_token: HashMap<u32, String>, // id → token (reverse lookup)
     pub vocab_size: u32,               // grows as new words are seen
 }
 
@@ -553,11 +560,14 @@ impl Tokenizer {
 
     /// New token seen → add to vocab, grow vocab_size
     pub fn learn_token(&mut self, token: &str) -> u32;
+
+    /// Reverse lookup: token id → word
+    pub fn decode(&self, id: u32) -> Option<&str>;
 }
 ```
 
-Every new word the model sees is added to the vocab. The vocab itself is stored inside
-the `.manas` file and grows alongside the network.
+Every new word the model sees is added to the vocab. The vocab is persisted in
+the `.manas` file's `[VOCAB BLOCK]` alongside the trained embeddings.
 
 #### Embedder
 
@@ -571,7 +581,35 @@ pub struct Embedder {
 ```
 
 New tokens get a randomly initialized embedding vector when first seen.
-The embedder is trained alongside the network via backpropagation.
+The embedder is trained alongside the network via backpropagation. Embeddings
+are persisted in the `.manas` file and restored on load.
+
+#### TrainerSnapshot
+
+The `TrainerSnapshot` is a serializable snapshot of the trainer's state (vocab +
+embeddings). It bridges the gap between the in-memory trainer and the `.manas` file.
+
+```rust
+pub struct TrainerSnapshot {
+    pub vocab: HashMap<String, u32>,
+    pub id_to_token: HashMap<u32, String>,
+    pub embed_table: HashMap<u32, Vec<f32>>,
+    pub embed_dim: usize,
+}
+
+impl Trainer {
+    /// Export current vocab + embeddings
+    pub fn snapshot(&self) -> TrainerSnapshot;
+
+    /// Restore vocab + embeddings from a snapshot
+    pub fn restore(&mut self, snapshot: &TrainerSnapshot);
+}
+```
+
+On save, `manas-store` writes the snapshot's entries into the `[VOCAB BLOCK]`.
+On load, `manas-store` reads the block back and the CLI restores the trainer
+before any `trace` or `decode` call. This ensures the decoder always uses the
+trained embeddings rather than random initial values.
 
 #### Decoder
 
@@ -775,10 +813,11 @@ Offset    Size     Field
 [VOCAB BLOCK]
 0         4        vocab_entry_count: u32
 per entry:
-  4        token_len: u8
-  N        token bytes (UTF-8)
   4        token_id: u32
-  64×4     embedding: [f32; 64]   (256 bytes)
+  1        token_len: u8
+  N        token bytes (UTF-8)
+  2        embed_dim: u16            (actual embedding dimension, default 64)
+  D×4      embedding: [f32; D]       (embed_dim × 4 bytes)
 
 [LAYER INDEX]
 per layer:
