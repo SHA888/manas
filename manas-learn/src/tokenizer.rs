@@ -23,11 +23,9 @@ impl Tokenizer {
         for ch in text.chars() {
             if ch.is_alphanumeric() || ch == '-' || ch == '\'' {
                 current.push(ch);
-            } else {
-                if !current.is_empty() {
-                    ids.push(self.learn_token(&current));
-                    current.clear();
-                }
+            } else if !current.is_empty() {
+                ids.push(self.learn_token(&current));
+                current.clear();
             }
         }
         if !current.is_empty() {

@@ -70,20 +70,23 @@ fn strip_images(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
     while i < chars.len() {
-        if i + 1 < chars.len() && chars[i] == '!' && chars[i + 1] == '[' {
-            if let Some(close) = s[i + 2..].find(']') {
-                let alt = &s[i + 2..i + 2 + close];
-                result.push_str(alt);
-                let after = i + 2 + close + 1;
-                if after < s.len() && s[after..].starts_with('(') {
-                    if let Some(paren_close) = s[after..].find(')') {
-                        i = after + paren_close + 1;
-                        continue;
-                    }
-                }
-                i = after;
+        if i + 1 < chars.len()
+            && chars[i] == '!'
+            && chars[i + 1] == '['
+            && let Some(close) = s[i + 2..].find(']')
+        {
+            let alt = &s[i + 2..i + 2 + close];
+            result.push_str(alt);
+            let after = i + 2 + close + 1;
+            if after < s.len()
+                && s[after..].starts_with('(')
+                && let Some(paren_close) = s[after..].find(')')
+            {
+                i = after + paren_close + 1;
                 continue;
             }
+            i = after;
+            continue;
         }
         result.push(chars[i]);
         i += 1;
@@ -101,21 +104,22 @@ fn strip_links(s: &str) -> String {
             i += 1;
             continue;
         }
-        if chars[i] == '[' {
-            if let Some(close) = s[i + 1..].find(']') {
-                let text = &s[i + 1..i + 1 + close];
-                let after = i + 1 + close + 1;
-                if after < s.len() && s[after..].starts_with('(') {
-                    result.push_str(text);
-                    if let Some(paren_close) = s[after..].find(')') {
-                        i = after + paren_close + 1;
-                        continue;
-                    }
-                }
+        if chars[i] == '['
+            && let Some(close) = s[i + 1..].find(']')
+        {
+            let text = &s[i + 1..i + 1 + close];
+            let after = i + 1 + close + 1;
+            if after < s.len()
+                && s[after..].starts_with('(')
+                && let Some(paren_close) = s[after..].find(')')
+            {
                 result.push_str(text);
-                i = after;
+                i = after + paren_close + 1;
                 continue;
             }
+            result.push_str(text);
+            i = after;
+            continue;
         }
         result.push(chars[i]);
         i += 1;

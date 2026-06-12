@@ -130,17 +130,17 @@ fn load_or_create_network(brain: &ManasBrain) -> Network {
 }
 
 fn restore_trainer_from_brain(trainer: &mut Trainer, brain: &ManasBrain) {
-    if let Ok(vocab) = brain.load_vocab() {
-        if !vocab.is_empty() {
-            let embed_dim = vocab.values().next().map(|(_, e)| e.len()).unwrap_or(64);
-            let snap = TrainerSnapshot {
-                vocab: vocab.iter().map(|(&id, (t, _))| (t.clone(), id)).collect(),
-                id_to_token: vocab.iter().map(|(&id, (t, _))| (id, t.clone())).collect(),
-                embed_table: vocab.iter().map(|(&id, (_, e))| (id, e.clone())).collect(),
-                embed_dim,
-            };
-            trainer.restore(&snap);
-        }
+    if let Ok(vocab) = brain.load_vocab()
+        && !vocab.is_empty()
+    {
+        let embed_dim = vocab.values().next().map(|(_, e)| e.len()).unwrap_or(64);
+        let snap = TrainerSnapshot {
+            vocab: vocab.iter().map(|(&id, (t, _))| (t.clone(), id)).collect(),
+            id_to_token: vocab.iter().map(|(&id, (t, _))| (id, t.clone())).collect(),
+            embed_table: vocab.iter().map(|(&id, (_, e))| (id, e.clone())).collect(),
+            embed_dim,
+        };
+        trainer.restore(&snap);
     }
 }
 
@@ -278,6 +278,10 @@ fn cmd_ingest(
         total_tokens += report.tokens_learned;
         total_loss += report.loss;
         chunk_count += 1;
+
+        // Source-aware growth: grows at most 1 neuron per unique file/URL source
+        // ensure_source_neuron internally checks duplicates before growing.
+        trainer.ensure_source_neuron(&mut network)?;
     }
 
     network.total_texts_learned += 1;

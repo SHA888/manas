@@ -10,33 +10,27 @@ pub fn parse(text: &str) -> String {
     let mut in_style = false;
 
     while i < chars.len() {
-        if !in_tag && !in_script && !in_style {
-            if i + 6 < chars.len() {
-                let lower: String = chars[i..i + 7].iter().collect::<String>().to_lowercase();
-                if lower.starts_with("<script") || lower.starts_with("<style") {
-                    if lower.starts_with("<script") {
-                        in_script = true;
-                    } else {
-                        in_style = true;
-                    }
-                    while i < chars.len() && chars[i] != '>' {
-                        i += 1;
-                    }
-                    if i < chars.len() {
-                        i += 1;
-                    }
-                    continue;
+        if !in_tag && !in_script && !in_style && i + 6 < chars.len() {
+            let lower: String = chars[i..i + 7].iter().collect::<String>().to_lowercase();
+            if lower.starts_with("<script") || lower.starts_with("<style") {
+                if lower.starts_with("<script") {
+                    in_script = true;
+                } else {
+                    in_style = true;
                 }
+                while i < chars.len() && chars[i] != '>' {
+                    i += 1;
+                }
+                if i < chars.len() {
+                    i += 1;
+                }
+                continue;
             }
         }
 
         if in_script || in_style {
             if i + 8 < chars.len() {
-                let closing: String = if in_script {
-                    chars[i..].iter().collect::<String>().to_lowercase()
-                } else {
-                    chars[i..].iter().collect::<String>().to_lowercase()
-                };
+                let closing: String = chars[i..].iter().collect::<String>().to_lowercase();
                 if in_script && closing.starts_with("</script>") {
                     in_script = false;
                     i += 9;
@@ -90,11 +84,11 @@ pub fn parse(text: &str) -> String {
                 i += 6;
                 continue;
             }
-            if text[i..].starts_with("&#") {
-                if let Some(semi) = text[i..].find(';') {
-                    i += semi + 1;
-                    continue;
-                }
+            if text[i..].starts_with("&#")
+                && let Some(semi) = text[i..].find(';')
+            {
+                i += semi + 1;
+                continue;
             }
             if text[i..].starts_with("&nbsp;") {
                 result.push(' ');

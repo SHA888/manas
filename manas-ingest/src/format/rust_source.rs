@@ -7,55 +7,55 @@ pub fn parse(text: &str) -> String {
     for line in text.lines() {
         let trimmed = line.trim();
 
-        if trimmed.starts_with("/*") {
+        if let Some(rest) = trimmed.strip_prefix("/*") {
             in_block_comment = true;
-            if trimmed.ends_with("*/") {
+            if let Some(inner) = rest.strip_suffix("*/") {
                 in_block_comment = false;
-                let inner = &trimmed[2..trimmed.len() - 2];
+                let inner = inner.trim();
                 if !inner.is_empty() {
                     result.push_str("note: ");
-                    result.push_str(inner.trim());
+                    result.push_str(inner);
                     result.push('\n');
                 }
-            } else if trimmed.len() > 2 {
-                let inner = &trimmed[2..];
+            } else {
+                let inner = rest.trim();
                 if !inner.is_empty() {
                     result.push_str("note: ");
-                    result.push_str(inner.trim());
+                    result.push_str(inner);
                     result.push('\n');
                 }
             }
             continue;
         }
         if in_block_comment {
-            if trimmed.ends_with("*/") {
-                let inner = &trimmed[..trimmed.len() - 2];
+            if let Some(inner) = trimmed.strip_suffix("*/") {
+                let inner = inner.trim();
                 if !inner.is_empty() {
                     result.push_str("note: ");
-                    result.push_str(inner.trim());
+                    result.push_str(inner);
                     result.push('\n');
                 }
                 in_block_comment = false;
             } else {
-                let inner = trimmed;
+                let inner = trimmed.trim();
                 if !inner.is_empty() {
                     result.push_str("note: ");
-                    result.push_str(inner.trim());
+                    result.push_str(inner);
                     result.push('\n');
                 }
             }
             continue;
         }
 
-        if trimmed.starts_with("///") {
-            let doc = &trimmed[3..].trim();
+        if let Some(rest) = trimmed.strip_prefix("///") {
+            let doc = rest.trim();
             if !doc.is_empty() {
                 result.push_str("doc: ");
                 result.push_str(doc);
                 result.push('\n');
             }
-        } else if trimmed.starts_with("//!") {
-            let doc = &trimmed[3..].trim();
+        } else if let Some(rest) = trimmed.strip_prefix("//!") {
+            let doc = rest.trim();
             if !doc.is_empty() {
                 result.push_str("module doc: ");
                 result.push_str(doc);

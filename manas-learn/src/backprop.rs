@@ -94,15 +94,15 @@ pub fn compute_gradients(
         let layer_input = &cache.pre_activations[l];
 
         let mut delta = Vec::with_capacity(num_neurons);
-        for j in 0..num_neurons {
+        for (j, pre_act) in layer_input.iter().enumerate().take(num_neurons) {
             let mut error = 0.0;
-            for k in 0..next_layer.neurons.len() {
+            for (k, delta_val) in current_delta.iter().enumerate() {
                 if j < next_layer.neurons[k].weights.len() {
-                    error += next_layer.neurons[k].weights[j] * current_delta[k];
+                    error += next_layer.neurons[k].weights[j] * delta_val;
                 }
             }
             let act = network.layers[l].neurons[j].activation;
-            delta.push(error * act.derivative(layer_input[j]));
+            delta.push(error * act.derivative(*pre_act));
         }
         deltas.push(delta);
     }

@@ -26,7 +26,7 @@ impl ProtectionLevel {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Source {
     RawText,
     LocalFile { path: String },

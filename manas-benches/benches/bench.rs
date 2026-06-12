@@ -14,24 +14,22 @@ fn main() {
 }
 
 fn run_benches() -> Vec<(&'static str, Duration)> {
-    let mut results = Vec::new();
-
-    results.push(("tokenize (short text)", bench_tokenize_short()));
-    results.push(("tokenize (long text)", bench_tokenize_long()));
-    results.push(("embed average (10 tokens, dim=64)", bench_embed_average()));
-    results.push((
-        "forward pass (2 layers, 16+64 neurons)",
-        bench_forward_small(),
-    ));
-    results.push(("forward pass (3 layers, 256+128+64)", bench_forward_large()));
-    results.push(("backprop (2 layers, 16+64)", bench_backprop_small()));
-    results.push(("learn (short text, repeat 50x)", bench_learn_short()));
-    results.push(("save to .manas", bench_save()));
-    results.push(("load from .manas", bench_load()));
-    results.push(("importance scoring (16 neurons)", bench_importance()));
-    results.push(("compress (16 neurons)", bench_compress()));
-
-    results
+    vec![
+        ("tokenize (short text)", bench_tokenize_short()),
+        ("tokenize (long text)", bench_tokenize_long()),
+        ("embed average (10 tokens, dim=64)", bench_embed_average()),
+        (
+            "forward pass (2 layers, 16+64 neurons)",
+            bench_forward_small(),
+        ),
+        ("forward pass (3 layers, 256+128+64)", bench_forward_large()),
+        ("backprop (2 layers, 16+64)", bench_backprop_small()),
+        ("learn (short text, repeat 50x)", bench_learn_short()),
+        ("save to .manas", bench_save()),
+        ("load from .manas", bench_load()),
+        ("importance scoring (16 neurons)", bench_importance()),
+        ("compress (16 neurons)", bench_compress()),
+    ]
 }
 
 fn bench_tokenize_short() -> Duration {

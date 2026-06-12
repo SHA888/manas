@@ -115,6 +115,7 @@ Learning:
   Input text → Tokenize → Embed → Forward pass
     → Calculate MSE loss → Backpropagate → Update weights
     → If loss > threshold: grow a new neuron
+    → For files/internet: grow 1 source-owned neuron per unique source
     → Recalculate importance scores → Save to .manas file
 
 Inference (decoding):
@@ -130,7 +131,7 @@ Each neuron is the atomic unit of knowledge:
 - **Importance score** — how valuable this knowledge is (0.0–1.0)
 - **Protection level** — Open (learn freely), Guarded (small updates), Frozen (never touch)
 - **Freshness category** — Timeless (never stale), Slow (30d), Fast (7d), Realtime (1d)
-- **Source** — where the knowledge came from (text, file, internet)
+- **Source** — where the knowledge came from (text, file, internet); set once on first touch, never overwritten
 
 ### Never Forgetting
 

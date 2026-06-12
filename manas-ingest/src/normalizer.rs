@@ -16,8 +16,7 @@ pub fn normalize(text: &str) -> String {
             result.push(ch);
         }
     }
-    let trimmed = result.trim().to_string();
-    trimmed
+    result.trim().to_string()
 }
 
 pub fn strip_control(text: &str) -> String {

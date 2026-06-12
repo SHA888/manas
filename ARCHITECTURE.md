@@ -891,7 +891,34 @@ When a new neuron is grown:
 - Importance score: 0.5 (neutral — neither protected nor at risk)
 - Protection: `Guarded` for first 7 days (grace period while it settles)
 - `born_at`: current unix timestamp
-- Source: inherited from the input that triggered growth
+- Source: set to `Source::Unknown` initially; stamped by `tag_neurons()` on first learn
+- For source-aware growth: stamped with the file path or URL immediately
+
+### Source-Aware Growth
+
+When ingesting files or internet pages, Manas also grows **source-owned neurons**
+to ensure each knowledge source has dedicated capacity:
+
+```
+After each chunk is learned:
+
+IF source is LocalFile or Internet
+AND no existing neuron has this exact source path/URL
+THEN
+    grow 1 neuron in layer 0
+    stamp source = chunk.source (file path or URL)
+    stamp freshness_category = detected category
+    recalculate importance and protection
+```
+
+Key properties:
+
+- **Bounded**: at most 1 neuron per unique source (file path or URL)
+- **Non-destructive**: existing neurons keep their original source — old source
+  is never overwritten when a new file is ingested
+- **Per-source identity**: each file/URL gets a dedicated neuron that carries
+  its origin as metadata, visible via `manas neurons --all`
+- **Lightweight**: grows only 1 neuron even for large files (not 1 per chunk)
 
 ### Layer Growth
 
@@ -1034,7 +1061,7 @@ focused pieces of knowledge rather than one massive blob:
 
 ```
 Default chunk size: 512 characters
-Overlap: 64 characters (context continuity between chunks)
+Overlap: 16 characters (context continuity between chunks)
 Split boundary: prefer sentence/paragraph boundaries
 ```
 
@@ -1126,6 +1153,7 @@ manas-ingest:
 manas-learn:
   tokenize chunk → embed tokens → forward pass
   → calculate loss → backprop → check growth
+  → tag updated neurons with chunk.source (only if Unknown)
          │
          ▼
 manas-core:
@@ -1135,6 +1163,11 @@ manas-core:
          ▼
 manas-memory:
   recalculate importance scores for affected neurons
+         │
+         ▼
+manas-learn (source-aware):
+  if source is LocalFile/Internet and no neuron has it → grow 1 source neuron
+  stamp source + freshness on the new neuron
          │
          ▼
 manas-store:

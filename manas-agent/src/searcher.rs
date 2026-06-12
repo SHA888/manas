@@ -95,7 +95,7 @@ fn parse_ddg_results(html: &str, max: usize) -> Result<Vec<SearchResult>, ManasE
 
         let url = title_elem
             .and_then(|e| e.attr("href"))
-            .map(|h| extract_ddg_url(h))
+            .map(extract_ddg_url)
             .unwrap_or_default();
 
         let snippet = snippet_elem

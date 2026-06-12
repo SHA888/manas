@@ -9,7 +9,7 @@ use manas_core::{ManasError, Source};
 use std::path::PathBuf;
 
 pub const CHUNK_SIZE: usize = 512;
-pub const CHUNK_OVERLAP: usize = 64;
+pub const CHUNK_OVERLAP: usize = 16;
 
 pub enum IngestSource {
     Text(String),

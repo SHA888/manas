@@ -157,6 +157,49 @@ impl Trainer {
         self.embedder.dim = snapshot.embed_dim;
     }
 
+    /// Ensure at least one neuron carries the current file/URL source.
+    ///
+    /// Grows one neuron in layer 0 when:
+    /// - `self.source` is `LocalFile` or `Internet`
+    /// - No existing neuron has this exact source
+    ///
+    /// Returns `true` if a new neuron was grown.
+    pub fn ensure_source_neuron(&mut self, network: &mut Network) -> Result<bool, ManasError> {
+        let is_new_source = match &self.source {
+            Source::LocalFile { path } => !network
+                .layers
+                .iter()
+                .flat_map(|l| &l.neurons)
+                .any(|n| matches!(&n.source, Source::LocalFile { path: p } if p == path)),
+            Source::Internet { url } => !network
+                .layers
+                .iter()
+                .flat_map(|l| &l.neurons)
+                .any(|n| matches!(&n.source, Source::Internet { url: u } if u == url)),
+            _ => return Ok(false),
+        };
+
+        if !is_new_source {
+            return Ok(false);
+        }
+
+        let nid = network.grow_neuron(0, self.embedder.dim)?;
+
+        for layer in &mut network.layers {
+            for neuron in &mut layer.neurons {
+                if neuron.id == nid {
+                    neuron.source = self.source.clone();
+                    neuron.freshness_category = self.freshness_category;
+                }
+            }
+        }
+
+        manas_memory::scorer::recalc_all(network);
+        manas_memory::protector::update_all(network);
+
+        Ok(true)
+    }
+
     // ── Core learning loop ────────────────────────────────────────────────────
 
     /// Learn from a text string.
@@ -316,8 +359,9 @@ fn tag_neurons(network: &mut Network, ids: &[u64], source: &Source, freshness_ca
         for neuron in &mut layer.neurons {
             if ids.contains(&neuron.id) {
                 neuron.freshness_category = freshness_category;
-                // FIX 2: clone source onto the neuron
-                neuron.source = source.clone();
+                if matches!(neuron.source, Source::Unknown) {
+                    neuron.source = source.clone();
+                }
             }
         }
     }

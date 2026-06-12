@@ -38,7 +38,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     (dot / (norm_a * norm_b)).clamp(-1.0, 1.0)
 }
 
-fn neuron_by_id<'a>(network: &'a Network, id: u64) -> Option<&'a Neuron> {
+fn neuron_by_id(network: &Network, id: u64) -> Option<&Neuron> {
     for layer in &network.layers {
         for neuron in &layer.neurons {
             if neuron.id == id {
@@ -49,7 +49,7 @@ fn neuron_by_id<'a>(network: &'a Network, id: u64) -> Option<&'a Neuron> {
     None
 }
 
-fn neuron_by_id_mut<'a>(network: &'a mut Network, id: u64) -> Option<&'a mut Neuron> {
+fn neuron_by_id_mut(network: &mut Network, id: u64) -> Option<&mut Neuron> {
     for layer in &mut network.layers {
         for neuron in &mut layer.neurons {
             if neuron.id == id {
