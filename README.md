@@ -130,8 +130,8 @@ Each neuron is the atomic unit of knowledge:
 - **Weights** — learned connection strengths
 - **Importance score** — how valuable this knowledge is (0.0–1.0)
 - **Protection level** — Open (learn freely), Guarded (small updates), Frozen (never touch)
-- **Freshness category** — Timeless (never stale), Slow (30d), Fast (7d), Realtime (1d)
-- **Source** — where the knowledge came from (text, file, internet); set once on first touch, never overwritten
+- **Freshness category** — Timeless (never stale), Slow (30d), Fast (7d), Realtime (1d); set once alongside source, never overwritten
+- **Source** — where the knowledge came from (text, file, internet); set once alongside freshness, never overwritten
 
 ### Never Forgetting
 

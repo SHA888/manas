@@ -357,11 +357,9 @@ impl Default for Trainer {
 fn tag_neurons(network: &mut Network, ids: &[u64], source: &Source, freshness_category: u8) {
     for layer in &mut network.layers {
         for neuron in &mut layer.neurons {
-            if ids.contains(&neuron.id) {
+            if ids.contains(&neuron.id) && matches!(neuron.source, Source::Unknown) {
+                neuron.source = source.clone();
                 neuron.freshness_category = freshness_category;
-                if matches!(neuron.source, Source::Unknown) {
-                    neuron.source = source.clone();
-                }
             }
         }
     }

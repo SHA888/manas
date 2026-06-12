@@ -71,8 +71,9 @@ mod tests {
         let mut trainer = Trainer::new_with_params(16, 0.01, 0.5);
         let mut network = Network::new();
 
-        // First learn: all neurons get src=RawText
+        // First learn: all neurons get src=RawText, fresh=1 (default)
         trainer.source = Source::RawText;
+        trainer.freshness_category = 0;
         trainer
             .learn(&mut network, "rust is safe and fast")
             .unwrap();
@@ -86,10 +87,22 @@ mod tests {
             .count();
         assert_eq!(raw_count, network.total_neurons as usize);
 
-        // Second learn with different source: must NOT overwrite existing neurons
+        // Verify all raw-text neurons have freshness 0
+        assert!(
+            network
+                .layers
+                .iter()
+                .flat_map(|l| &l.neurons)
+                .filter(|n| matches!(n.source, Source::RawText))
+                .all(|n| n.freshness_category == 0)
+        );
+
+        // Second learn with different source + different freshness
+        // Must NOT overwrite existing neurons' source or freshness
         trainer.source = Source::Internet {
             url: "https://example.com".into(),
         };
+        trainer.freshness_category = 3;
         trainer
             .learn(&mut network, "some more content here")
             .unwrap();
@@ -111,6 +124,17 @@ mod tests {
 
         assert_eq!(raw_after, network.total_neurons as usize - url_after);
         assert!(raw_after > 0, "raw-text neurons were overwritten");
+
+        // Raw-text neurons must still have freshness 0
+        assert!(
+            network
+                .layers
+                .iter()
+                .flat_map(|l| &l.neurons)
+                .filter(|n| matches!(n.source, Source::RawText))
+                .all(|n| n.freshness_category == 0),
+            "raw-text neurons must keep their original freshness"
+        );
     }
 
     #[test]
@@ -182,5 +206,72 @@ mod tests {
         let grown = trainer.ensure_source_neuron(&mut network).unwrap();
         assert!(!grown, "RawText should not trigger source-aware growth");
         assert_eq!(network.total_neurons, before);
+    }
+
+    #[test]
+    fn freshness_preserved_alongside_source() {
+        let mut trainer = Trainer::new_with_params(16, 0.01, 0.5);
+        let mut network = Network::new();
+
+        // Learn raw text with freshness_category = 0 (timeless)
+        trainer.source = Source::RawText;
+        trainer.freshness_category = 0;
+        trainer
+            .learn(&mut network, "this is timeless knowledge")
+            .unwrap();
+        let before = network.total_neurons;
+        assert!(before > 0);
+
+        // Capture freshness of all raw-text neurons
+        let raw_freshness: Vec<u8> = network
+            .layers
+            .iter()
+            .flat_map(|l| &l.neurons)
+            .filter(|n| matches!(n.source, Source::RawText))
+            .map(|n| n.freshness_category)
+            .collect();
+        assert!(!raw_freshness.is_empty());
+        assert!(
+            raw_freshness.iter().all(|&f| f == 0),
+            "all raw-text neurons should have freshness 0"
+        );
+
+        // Ingest a file with different source and different freshness
+        trainer.source = Source::LocalFile {
+            path: "/tmp/new.md".into(),
+        };
+        trainer.freshness_category = 3; // realtime
+        trainer
+            .learn(&mut network, "some new file content here")
+            .unwrap();
+
+        // Ensure source neuron grows
+        trainer.ensure_source_neuron(&mut network).unwrap();
+
+        // Raw-text neurons must keep freshness 0 AND src=RawText
+        let raw_neurons: Vec<_> = network
+            .layers
+            .iter()
+            .flat_map(|l| &l.neurons)
+            .filter(|n| matches!(n.source, Source::RawText))
+            .collect();
+        assert!(!raw_neurons.is_empty(), "raw-text neurons should still exist");
+        assert!(
+            raw_neurons.iter().all(|n| n.freshness_category == 0),
+            "raw-text neurons must keep original freshness 0"
+        );
+
+        // New file source neurons must have freshness 3
+        let file_neurons: Vec<_> = network
+            .layers
+            .iter()
+            .flat_map(|l| &l.neurons)
+            .filter(|n| matches!(&n.source, Source::LocalFile { path } if path == "/tmp/new.md"))
+            .collect();
+        assert_eq!(file_neurons.len(), 1);
+        assert_eq!(file_neurons[0].freshness_category, 3);
+
+        // Neuron count increased by exactly 1 (the source neuron)
+        assert_eq!(network.total_neurons, before + 1);
     }
 }

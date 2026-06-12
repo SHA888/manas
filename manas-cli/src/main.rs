@@ -329,7 +329,6 @@ fn cmd_query(text: &str, brain_path: &Path) -> Result<(), ManasError> {
             Ok(scraped) => {
                 let chunks = manas_ingest::chunk_text(&scraped, 512, 64);
                 for chunk in chunks {
-                    // FIX 2 — neurons from web pages carry their URL
                     trainer.source = Source::Internet {
                         url: result.url.clone(),
                     };
@@ -339,6 +338,8 @@ fn cmd_query(text: &str, brain_path: &Path) -> Result<(), ManasError> {
                     total_tokens += report.tokens_learned;
                     total_loss += report.loss;
                     page_count += 1;
+
+                    trainer.ensure_source_neuron(&mut network)?;
                 }
             }
             Err(_) => continue,

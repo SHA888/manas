@@ -891,8 +891,8 @@ When a new neuron is grown:
 - Importance score: 0.5 (neutral — neither protected nor at risk)
 - Protection: `Guarded` for first 7 days (grace period while it settles)
 - `born_at`: current unix timestamp
-- Source: set to `Source::Unknown` initially; stamped by `tag_neurons()` on first learn
-- For source-aware growth: stamped with the file path or URL immediately
+- Source: set to `Source::Unknown` initially; stamped together with `freshness_category` by `tag_neurons()` on first learn — both are set only once and never overwritten
+- For source-aware growth: stamped with the file path or URL and detected freshness immediately
 
 ### Source-Aware Growth
 
@@ -914,8 +914,8 @@ THEN
 Key properties:
 
 - **Bounded**: at most 1 neuron per unique source (file path or URL)
-- **Non-destructive**: existing neurons keep their original source — old source
-  is never overwritten when a new file is ingested
+- **Non-destructive**: existing neurons keep both their original source AND
+  freshness_category — neither is overwritten when a new file is ingested
 - **Per-source identity**: each file/URL gets a dedicated neuron that carries
   its origin as metadata, visible via `manas neurons --all`
 - **Lightweight**: grows only 1 neuron even for large files (not 1 per chunk)
@@ -1153,7 +1153,7 @@ manas-ingest:
 manas-learn:
   tokenize chunk → embed tokens → forward pass
   → calculate loss → backprop → check growth
-  → tag updated neurons with chunk.source (only if Unknown)
+  → tag updated neurons with chunk.source + freshness (only if Unknown)
          │
          ▼
 manas-core:
