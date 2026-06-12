@@ -1,10 +1,10 @@
 # ARCHITECTURE.md — Manas
 
-> **"A self-growing, never-forgetting, always-updated personal AI brain"**
+> **"A self-growing local learning system — designed to preserve learned knowledge"**
 >
-> Manas (Sanskrit: *मनस्* — mind, intellect, the seat of thought) is a self-growing neural
-> network written in Rust that starts with zero knowledge, learns from text, local files,
-> and the internet, never forgets, and stays current automatically.
+> Manas (Sanskrit: *मनस्* — mind, intellect, the seat of thought) is an experimental
+> self-growing local AI system written in Rust that starts with zero knowledge, learns
+> from text, local files, and the internet, and is designed to preserve learned knowledge.
 
 ---
 
@@ -48,25 +48,25 @@ Current AI models are:
 - Forgetful — fine-tuning on new data destroys old knowledge (catastrophic forgetting)
 - Disconnected from the present — their knowledge has a hard cutoff date
 
-**Manas solves all five problems at once:**
+**Manas approaches these challenges as follows:**
 
-| Problem | Manas Solution |
+| Challenge | Manas Approach |
 |---|---|
-| Can't learn after training | Online learning — learns from any input in real time |
+| Learning after training | Online learning — learns from any input in real time |
 | Fixed parameter count | Dynamic growth — adds neurons when needed |
-| Cloud dependent | 100% local — runs on your laptop |
-| Catastrophic forgetting | Importance scoring — protected neurons are never overwritten |
-| Stale knowledge | Freshness system — auto re-searches outdated knowledge |
+| Cloud dependency | 100% local — runs on your laptop |
+| Catastrophic forgetting | Importance scoring — designed to preserve learned knowledge |
+| Stale knowledge | Freshness system — re-searches outdated knowledge |
 
-The end result is a **personal AI brain** that lives on your machine in a single `.manas` file,
-starts at ~1 KB, and grows intelligently as you teach it — forever.
+The end result is a local network that lives on your machine in a single `.manas` file,
+starts at ~1 KB, and grows as you teach it.
 
 ---
 
 ## 2. Core Principles
 
-### Principle 1 — Never Forget
-Every piece of knowledge is permanently saved. No weight is ever silently overwritten.
+### Principle 1 — Preserve Knowledge
+Knowledge is persisted and protected against accidental overwriting.
 If a neuron must change, its old state is archived before updating.
 
 ### Principle 2 — Grow When Needed
@@ -85,7 +85,7 @@ Text comes from three sources and all are treated equally by the learning pipeli
 
 ### Principle 5 — Full Local Ownership
 The model is a single `.manas` file on disk. No cloud, no account, no API key required
-for inference. The user owns their brain completely.
+for inference. The user owns their local network completely.
 
 ---
 
@@ -202,7 +202,7 @@ Input Sources
 │                              │                                    │
 │                         [brain.manas]                             │
 │                    starts: ~1 KB                                  │
-│                    grows:  forever                                 │
+│                    grows:  incrementally                            │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -291,7 +291,7 @@ manas/
 
 ### 6.1 `manas-core`
 
-The neural network engine. The actual brain.
+The neural network engine — the core network runtime.
 
 #### Key Structs
 
@@ -628,7 +628,7 @@ Query → Tokenize → Embed → Average embedding
     → Sort by score → Return top 20 closest tokens
 ```
 
-The decoder is used by `manas trace` to show what the brain "thinks" about a query:
+The decoder is used by `manas trace` to show the network's semantic response to a query:
 
 ```
 $ manas trace "Manas self-growing neural network"
@@ -950,7 +950,7 @@ age_grace(born, now):
 
 | Score | Status | Meaning |
 |---|---|---|
-| 0.85 – 1.00 | 🔒 Frozen | Core knowledge, never touch |
+| 0.85 – 1.00 | 🔒 Frozen | Core knowledge, protected from modification |
 | 0.60 – 0.85 | 🛡 Guarded | Important, small updates only |
 | 0.20 – 0.60 | ✅ Open | Normal learning allowed |
 | 0.00 – 0.20 | 🗜 Compress candidate | Rarely used, may be merged |
@@ -1224,10 +1224,10 @@ SETTLED (day 7+)
  │  normal backprop updates apply
  │  importance_score fully dynamic now
  │
- ├──► HIGH IMPORTANCE (score > 0.85)
- │     → protection = Frozen
- │     → never modified again
- │     → permanent core knowledge
+  ├──► HIGH IMPORTANCE (score > 0.85)
+  │     → protection = Frozen
+  │     → protected from modification
+  │     → preserved core knowledge
  │
  ├──► MEDIUM IMPORTANCE (score 0.20–0.85)
  │     → stays Open
@@ -1286,12 +1286,12 @@ No panics in library code. The CLI converts errors to user-friendly messages.
 | M2 | `.manas` binary format, read/write, append | `manas-store` | Persistent brain file |
 | M3 | Tokenizer, embedder, backprop, online learning loop | `manas-learn` | Model can learn from text |
 | M4 | Raw text + local file + folder ingestion pipeline | `manas-ingest` | Learn from disk |
-| M5 | Importance scoring, protection, compression | `manas-memory` | Never-forget system |
+| M5 | Importance scoring, protection, compression | `manas-memory` | Knowledge preservation system |
 | M6 | Full CLI — learn, ingest, query, inspect | `manas-cli` | Usable from terminal |
 | M7 | Internet search agent, HTML scraper | `manas-agent` | Web learning |
 | M8 | Freshness checker, auto re-search on stale knowledge | `manas-agent` | Always up to date |
 | M9 | Full integration, end-to-end testing | all | Complete working system |
-| M10 | Performance optimization, benchmarks | all | Production ready |
+| M10 | Performance optimization, benchmarks | all | Performance-tuned prototype |
 
 ---
 
@@ -1416,4 +1416,4 @@ Once the core system (M1–M10) is complete, Manas can grow in these directions:
 
 ---
 
-*Built with ❤️ in Rust. This is your brain. It lives on your machine. It grows with you.*
+*Built with ❤️ in Rust. This is your local network. It lives on your machine. It grows with you.*
