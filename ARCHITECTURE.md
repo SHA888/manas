@@ -144,60 +144,60 @@ Input Sources
 ┌────────────────────────────────────────────────────────────────────────┐
 │                         Manas System                                   │
 │                                                                        │
-│  ┌───────────────────────────────────────────────────────────────┐    │
-│  │                       manas-cli                               │    │
-│  │   learn | query | ingest | predict-next | generate | inspect  │    │
-│  └───────────────────────────┬───────────────────────────────────┘    │
-│                               │                                       │
-│          ┌────────────────────┼──────────────────┬─────────────────┐  │
-│          │                    │                  │                 │  │
-│          ▼                    ▼                  ▼                 ▼  │
-│  ┌──────────────┐   ┌──────────────────┐  ┌──────────────┐  ┌─────────┐
-│  │ manas-ingest │   │   manas-agent    │  │ manas-memory │  │manas-   │
-│  │              │   │                  │  │              │  │language │
-│  │ • raw text   │   │ • web search     │  │ • importance │  │• next-  │
-│  │ • .txt .md   │   │ • html scrape    │  │   scoring    │  │  token  │
-│  │ • .rs .toml  │   │ • freshness      │  │ • neuron     │  │  pred.  │
-│  │ • .json .csv │   │   checker        │  │   protection │  │• seq    │
-│  │ • .pdf .html │   │ • feeds ingest   │  │ • compression│  │  memory │
-│  │ • folder     │   │   pipeline       │  │   of cold    │  │• hybrid │
-│  │   recursive  │   │                  │  │   neurons    │  │  predict│
-│  └──────┬───────┘   └────────┬─────────┘  └──────┬───────┘  └────┬────┘
-│         │                    │                    │               │
-│         └────────────────────┼────────────────────┼───────────────┘
-│                              │                    │
-│                              ▼                    ▼
-│                   ┌──────────────────────────────────────┐
-│                   │          manas-learn                  │
-│                   │                                      │
-│                   │ • tokenizer    • embedding            │
-│                   │ • forward pass • loss calculation     │
-│                   │ • backpropagation • growth signal     │
-│                   │ • tag_neurons() — source + freshness  │
-│                   └──────────────────┬───────────────────┘
-│                                      │
-│                                      ▼
-│                   ┌──────────────────────────────────────┐
-│                   │            manas-core                 │
-│                   │                                      │
-│                   │ • Neuron struct  • Layer struct       │
-│                   │ • Network struct • forward()          │
-│                   │ • grow_neuron()  • update_weights()   │
-│                   └──────────────────┬───────────────────┘
-│                                      │
-│                                      ▼
-│                   ┌──────────────────────────────────────┐
-│                   │          manas-store                  │
-│                   │                                      │
-│                   │ • .manas file I/O  • header r/w       │
-│                   │ • neuron append    • full load/save   │
-│                   │ • integrity check  • .manas.seq I/O   │
-│                   └──────────────────────────────────────┘
-│                                      │
-│                         [brain.manas + brain.manas.seq]    │
-│                    starts: ~1 KB                           │
-│                    grows:  incrementally                   │
-└────────────────────────────────────────────────────────────┘
+│  ┌───────────────────────────────────────────────────────────────┐     │
+│  │                       manas-cli                               │     │
+│  │   learn | query | ingest | predict-next | generate | inspect  │     │
+│  └───────────────────────────┬───────────────────────────────────┘     │
+│                               │                                        │
+│          ┌────────────────────┼──────────────────┬─────────────────┐   │
+│          │                    │                  │                 │   │
+│          ▼                    ▼                  ▼                 ▼   │
+│  ┌──────────────┐   ┌──────────────────┐  ┌──────────────┐  ┌─────────┐│
+│  │ manas-ingest │   │   manas-agent    │  │ manas-memory │  │manas-   ││
+│  │              │   │                  │  │              │  │language ││
+│  │ • raw text   │   │ • web search     │  │ • importance │  │• next-  ││
+│  │ • .txt .md   │   │ • html scrape    │  │   scoring    │  │  token  ││
+│  │ • .rs .toml  │   │ • freshness      │  │ • neuron     │  │  pred.  ││
+│  │ • .json .csv │   │   checker        │  │   protection │  │• seq    ││
+│  │ • .pdf .html │   │ • feeds ingest   │  │ • compression│  │  memory ││
+│  │ • folder     │   │   pipeline       │  │   of cold    │  │• hybrid ││
+│  │   recursive  │   │                  │  │   neurons    │  │  predict││
+│  └──────┬───────┘   └────────┬─────────┘  └──────┬───────┘  └────┬────┘│
+│         │                    │                   │               │     │
+│         └────────────────────┼───────────────────┼───────────────┘     │
+│                              │                   │                     │
+│                              ▼                   ▼                     │
+│                   ┌──────────────────────────────────────┐             │
+│                   │          manas-learn                 │             │
+│                   │                                      │             │
+│                   │ • tokenizer    • embedding           │             │
+│                   │ • forward pass • loss calculation    │             │
+│                   │ • backpropagation • growth signal    │             │
+│                   │ • tag_neurons() — source + freshness │             │
+│                   └──────────────────┬───────────────────┘             │
+│                                      │                                 │
+│                                      ▼                                 │
+│                   ┌──────────────────────────────────────┐             │
+│                   │            manas-core                │             │
+│                   │                                      │             │
+│                   │ • Neuron struct  • Layer struct      │             │
+│                   │ • Network struct • forward()         │             │
+│                   │ • grow_neuron()  • update_weights()  │             │
+│                   └──────────────────┬───────────────────┘             │
+│                                      │                                 │   
+│                                      ▼                                 │   
+│                   ┌──────────────────────────────────────┐             │
+│                   │          manas-store                 │             │
+│                   │                                      │             │
+│                   │ • .manas file I/O  • header r/w      │             │
+│                   │ • neuron append    • full load/save  │             │
+│                   │ • integrity check  • .manas.seq I/O  │             │
+│                   └──────────────────────────────────────┘             │
+│                                      │                                 │
+│                         [brain.manas + brain.manas.seq]                │
+│                    starts: ~1 KB                                       │
+│                    grows:  incrementally                               │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
