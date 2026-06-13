@@ -879,7 +879,7 @@ inputs
 → outputs
 ```
 
-`FeedForward` uses a single hidden layer: `w1 @ x + b1 → ReLU → w2 @ hidden + b2`. Weights initialized with the same deterministic random scheme as attention. This block is forward-inference only — no training or integration into `generate` yet.
+`FeedForward` uses a single hidden layer: `w1 @ x + b1 → ReLU → w2 @ hidden + b2`. Weights initialized with the same deterministic random scheme as attention. As of v0.6, this block is experimentally connected to `predict-next --use-transformer` and `generate --use-transformer` via the `TransformerPredictor` in `lib.rs`. The default generation path (v0.3) is unchanged.
 
 #### Single-Head Causal Attention (v0.4)
 
@@ -1406,6 +1406,7 @@ No panics in library code. The CLI converts errors to user-friendly messages.
 | M12 | **Real text generation (v0.3)** — loop prevention, memory-boundary stop, cycle detection | `manas-language` | Stable autoregressive generation |
 | M13 | **Single-head causal attention (v0.4)** — QKV, scaled dot-product, causal mask | `manas-language` | Custom attention module |
 | M14 | **Tiny transformer block (v0.5)** — causal attention + FFN + residual | `manas-language` | Forward-only transformer block |
+| M15 | **Transformer-assisted prediction (v0.6)** — `--use-transformer` flag, hybrid scoring, default path unchanged | `manas-language`, `manas-cli` | Experimental transformer integration |
 
 ---
 
@@ -1437,8 +1438,14 @@ manas train-language "Rust is a systems programming language" --epochs 50
 # Predict the next word (hybrid memory + neural)
 manas predict-next "Rust is a" --top-k 5
 
-# Generate text autoregressively
+# Predict next word with experimental transformer assistance (v0.6)
+manas predict-next "Rust is a" --use-transformer --top-k 5
+
+# Generate text autoregressively (default: stable v0.3)
 manas generate "Rust is a" --max-tokens 10
+
+# Generate text with experimental transformer assistance (v0.6)
+manas generate "Rust is a" --use-transformer --max-tokens 10
 
 # ── QUERYING ──────────────────────────────────────────────────────
 

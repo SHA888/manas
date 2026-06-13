@@ -3,8 +3,8 @@ use manas_agent::{AgentPipeline, FreshnessChecker};
 use manas_core::{ManasError, Network, Neuron, Source};
 use manas_ingest::{IngestPipeline, IngestSource};
 use manas_language::{
-    NextTokenPredictor, SequenceMemory, generate_text_with_memory, seq_memory_path,
-    train_next_token_examples,
+    NextTokenPredictor, SequenceMemory, TransformerPredictor, generate_text_with_memory,
+    generate_text_with_transformer, seq_memory_path, train_next_token_examples,
 };
 use manas_learn::{Trainer, TrainerSnapshot, decode, detect_freshness_category};
 use manas_store::ManasBrain;
@@ -87,6 +87,8 @@ enum Commands {
         max_context: usize,
         #[arg(long, default_value = "10")]
         top_k: usize,
+        #[arg(long)]
+        use_transformer: bool,
     },
     Generate {
         prompt: String,
@@ -98,6 +100,8 @@ enum Commands {
         top_k: usize,
         #[arg(long, default_value = "1.0")]
         temperature: f32,
+        #[arg(long)]
+        use_transformer: bool,
     },
 }
 
@@ -142,19 +146,22 @@ fn main() {
             text,
             max_context,
             top_k,
-        } => cmd_predict_next(text, *max_context, *top_k, &brain_path),
+            use_transformer,
+        } => cmd_predict_next(text, *max_context, *top_k, *use_transformer, &brain_path),
         Commands::Generate {
             prompt,
             max_tokens,
             max_context,
             top_k,
             temperature,
+            use_transformer,
         } => cmd_generate(
             prompt,
             *max_tokens,
             *max_context,
             *top_k,
             *temperature,
+            *use_transformer,
             &brain_path,
         ),
     };
@@ -876,11 +883,12 @@ fn cmd_train_language(
     Ok(())
 }
 
-/// `manas predict-next "context" [--max-context 5] [--top-k 10]`
+/// `manas predict-next "context" [--max-context 5] [--top-k 10] [--use-transformer]`
 fn cmd_predict_next(
     text: &str,
     max_context: usize,
     top_k: usize,
+    use_transformer: bool,
     brain_path: &Path,
 ) -> Result<(), ManasError> {
     let brain = ManasBrain::new(brain_path);
@@ -907,14 +915,27 @@ fn cmd_predict_next(
         SequenceMemory::new()
     };
 
-    let predictor = NextTokenPredictor::new(max_context);
-    let results = predictor.predict_top_k_with_memory(
-        &network,
-        &trainer.embedder,
-        &seq_memory,
-        &tokens,
-        top_k,
-    );
+    let results: Vec<(u32, f32)> = if use_transformer {
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let transformer_predictor = TransformerPredictor::new(embed_dim, hidden_dim, max_context);
+        transformer_predictor.predict_top_k_assisted(
+            &network,
+            &trainer.embedder,
+            &seq_memory,
+            &tokens,
+            top_k,
+        )
+    } else {
+        let predictor = NextTokenPredictor::new(max_context);
+        predictor.predict_top_k_with_memory(
+            &network,
+            &trainer.embedder,
+            &seq_memory,
+            &tokens,
+            top_k,
+        )
+    };
 
     if results.is_empty() {
         println!("No predictions available");
@@ -929,13 +950,14 @@ fn cmd_predict_next(
     Ok(())
 }
 
-/// `manas generate "prompt" [--max-tokens 20] [--max-context 5] [--top-k 1] [--temperature 1.0]`
+/// `manas generate "prompt" [--max-tokens 20] [--max-context 5] [--top-k 1] [--temperature 1.0] [--use-transformer]`
 fn cmd_generate(
     prompt: &str,
     max_tokens: usize,
     max_context: usize,
     top_k: usize,
     temperature: f32,
+    use_transformer: bool,
     brain_path: &Path,
 ) -> Result<(), ManasError> {
     let brain = ManasBrain::new(brain_path);
@@ -961,17 +983,33 @@ fn cmd_generate(
         trainer.embedder.embed_or_init(id);
     }
 
-    let text = generate_text_with_memory(
-        &network,
-        &trainer.embedder,
-        &trainer.tokenizer,
-        &seq_memory,
-        prompt,
-        max_tokens,
-        max_context,
-        top_k,
-        temperature,
-    );
+    let text = if use_transformer {
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let transformer_predictor = TransformerPredictor::new(embed_dim, hidden_dim, max_context);
+        generate_text_with_transformer(
+            &network,
+            &trainer.embedder,
+            &trainer.tokenizer,
+            &seq_memory,
+            &transformer_predictor,
+            prompt,
+            max_tokens,
+            top_k,
+        )
+    } else {
+        generate_text_with_memory(
+            &network,
+            &trainer.embedder,
+            &trainer.tokenizer,
+            &seq_memory,
+            prompt,
+            max_tokens,
+            max_context,
+            top_k,
+            temperature,
+        )
+    };
 
     if text.is_empty() {
         println!("No output could be generated for the given prompt.");

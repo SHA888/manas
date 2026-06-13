@@ -318,6 +318,207 @@ impl NextTokenPredictor {
     }
 }
 
+// ─── Transformer-Assisted Prediction (v0.6) ────────────────────────────────
+
+use crate::transformer::TinyTransformerBlock;
+
+/// Weight given to the (untrained) transformer score in the experimental
+/// hybrid combination. The existing memory+neural score gets `1.0 - WEIGHT`.
+pub const TRANSFORMER_SCORE_WEIGHT: f32 = 0.25;
+
+/// Experimental predictor that combines the existing hybrid memory+neural
+/// scores with scores from the (untrained) `TinyTransformerBlock`.
+///
+/// `final_score = (1 - TRANSFORMER_SCORE_WEIGHT) * hybrid_score
+///                 + TRANSFORMER_SCORE_WEIGHT * transformer_score`
+pub struct TransformerPredictor {
+    pub block: TinyTransformerBlock,
+    pub max_context: usize,
+}
+
+impl TransformerPredictor {
+    pub fn new(embed_dim: usize, hidden_dim: usize, max_context: usize) -> Self {
+        TransformerPredictor {
+            block: TinyTransformerBlock::new(embed_dim, hidden_dim),
+            max_context,
+        }
+    }
+
+    /// Pure transformer scoring:
+    ///   1. get ordered token embeddings (last `max_context` tokens)
+    ///   2. pass through `TinyTransformerBlock::forward`
+    ///   3. take the last output vector
+    ///   4. cosine-similarity against every vocab embedding
+    fn predict_top_k_transformer(
+        &self,
+        embedder: &Embedder,
+        context_tokens: &[u32],
+        k: usize,
+    ) -> Vec<(u32, f32)> {
+        if context_tokens.is_empty() || embedder.table.is_empty() {
+            return Vec::new();
+        }
+
+        // Build ordered sequence of token embeddings (last max_context tokens)
+        let start = context_tokens.len().saturating_sub(self.max_context);
+        let seq_embeddings: Vec<Vec<f32>> = context_tokens[start..]
+            .iter()
+            .filter_map(|id| embedder.embed(*id).map(<[f32]>::to_vec))
+            .collect();
+
+        if seq_embeddings.is_empty() {
+            return Vec::new();
+        }
+
+        // Transformer forward pass
+        let transformer_out = self.block.forward(&seq_embeddings);
+        let last_output = match transformer_out.last() {
+            Some(v) => v,
+            None => return Vec::new(),
+        };
+
+        // Score all vocab tokens
+        let mut scored: Vec<(u32, f32)> = embedder
+            .table
+            .iter()
+            .map(|(&tid, emb)| {
+                let score = cosine_similarity(last_output, emb);
+                (tid, score)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        scored
+    }
+
+    /// Experimental hybrid scoring that mixes the proven memory+neural
+    /// scores with the untrained transformer scores.
+    ///
+    /// The transformer weight is controlled by `TRANSFORMER_SCORE_WEIGHT`
+    /// (currently 0.25).
+    pub fn predict_top_k_assisted(
+        &self,
+        network: &Network,
+        embedder: &Embedder,
+        seq_memory: &SequenceMemory,
+        context_tokens: &[u32],
+        k: usize,
+    ) -> Vec<(u32, f32)> {
+        if context_tokens.is_empty() {
+            return Vec::new();
+        }
+
+        // 1. Existing hybrid scores over the full vocab
+        let hybrid_predictor = NextTokenPredictor::new(self.max_context);
+        let all_vocab = embedder.table.len().max(1);
+        let all_hybrid = hybrid_predictor.predict_top_k_with_memory(
+            network,
+            embedder,
+            seq_memory,
+            context_tokens,
+            all_vocab,
+        );
+        let hybrid_map: HashMap<u32, f32> = all_hybrid.into_iter().collect();
+
+        // 2. Transformer scores over the full vocab
+        let all_transformer = self.predict_top_k_transformer(embedder, context_tokens, all_vocab);
+        let transformer_map: HashMap<u32, f32> = all_transformer.into_iter().collect();
+
+        // 3. Weighted combination over the union of candidates
+        let mut all_ids: HashSet<u32> = hybrid_map
+            .keys()
+            .chain(transformer_map.keys())
+            .copied()
+            .collect();
+        if all_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let mut scored: Vec<(u32, f32)> = all_ids
+            .drain()
+            .map(|tid| {
+                let hybrid = hybrid_map.get(&tid).copied().unwrap_or(0.0);
+                let transformer = transformer_map.get(&tid).copied().unwrap_or(0.0);
+                let final_score = (1.0 - TRANSFORMER_SCORE_WEIGHT) * hybrid
+                    + TRANSFORMER_SCORE_WEIGHT * transformer;
+                (tid, final_score)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        scored
+    }
+}
+
+/// Experimental text generation that uses the transformer-assisted predictor.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_text_with_transformer(
+    network: &Network,
+    embedder: &Embedder,
+    tokenizer: &Tokenizer,
+    seq_memory: &SequenceMemory,
+    transformer_predictor: &TransformerPredictor,
+    prompt: &str,
+    max_tokens: usize,
+    top_k: usize,
+) -> String {
+    let mut tokens = {
+        let mut t = tokenizer.clone();
+        t.encode(prompt)
+    };
+
+    if tokens.is_empty() {
+        return String::new();
+    }
+
+    let prompt_len = tokens.len();
+    let mut consecutive_repeats: u32 = 0;
+    let mut last_id: Option<u32> = None;
+
+    for _ in 0..max_tokens {
+        let gen_count = tokens.len() - prompt_len;
+        if gen_count > 2 && seq_memory.lookup_suffix(&tokens).is_empty() {
+            break;
+        }
+
+        let next = transformer_predictor
+            .predict_top_k_assisted(network, embedder, seq_memory, &tokens, top_k);
+        let (id, _score) = match next.first() {
+            Some((id, score)) => (*id, *score),
+            None => break,
+        };
+
+        if Some(id) == last_id {
+            consecutive_repeats += 1;
+        } else {
+            consecutive_repeats = 0;
+        }
+        if consecutive_repeats >= 2 {
+            break;
+        }
+        last_id = Some(id);
+
+        tokens.push(id);
+
+        // Cycle detection
+        let generated = &tokens[prompt_len..];
+        let gen_len = generated.len();
+        for window in 2..=8 {
+            if gen_len >= window * 2 {
+                let first = &generated[gen_len - window * 2..gen_len - window];
+                let second = &generated[gen_len - window..];
+                if first == second {
+                    return decode_tokens(tokenizer, &tokens);
+                }
+            }
+        }
+    }
+
+    decode_tokens(tokenizer, &tokens)
+}
+
 // ─── Training ─────────────────────────────────────────────────────────────────
 
 pub struct LanguageTrainReport {
@@ -980,6 +1181,143 @@ mod tests {
             5,
             1,
             1.0,
+        );
+
+        // Should not panic; empty or best-effort is acceptable
+        let _ = output;
+    }
+
+    // ── v0.6 Transformer-assisted tests ──────────────────────────────
+
+    /// Test C: transformer-assisted predict-next does not panic and
+    /// returns top-k tokens.
+    #[test]
+    fn transformer_predict_next_no_panic() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            15,
+            0.05,
+        )
+        .unwrap();
+
+        let tokens = {
+            let mut t = trainer.tokenizer.clone();
+            t.encode("Rust is a")
+        };
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let transformer_predictor = TransformerPredictor::new(embed_dim, hidden_dim, 5);
+
+        let results = transformer_predictor.predict_top_k_assisted(
+            &network,
+            &trainer.embedder,
+            &seq_memory,
+            &tokens,
+            5,
+        );
+
+        // Should not panic and should return some results
+        assert!(
+            !results.is_empty(),
+            "transformer-assisted predict should return results"
+        );
+        for (id, score) in &results {
+            assert!(
+                score.is_finite(),
+                "score for token {} is not finite: {}",
+                id,
+                score
+            );
+        }
+    }
+
+    /// Test D: transformer-assisted generate does not panic and produces
+    /// non-empty output.
+    #[test]
+    fn transformer_generate_no_panic() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            20,
+            0.05,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let transformer_predictor = TransformerPredictor::new(embed_dim, hidden_dim, 5);
+
+        let output = generate_text_with_transformer(
+            &network,
+            &trainer.embedder,
+            &trainer.tokenizer,
+            &seq_memory,
+            &transformer_predictor,
+            "Rust is",
+            10,
+            1,
+        );
+
+        // Should not panic; non-empty output is expected
+        assert!(
+            !output.is_empty(),
+            "transformer-assisted generate should produce output"
+        );
+        assert!(
+            output.contains("rust"),
+            "output should contain 'rust', got: '{}'",
+            output
+        );
+    }
+
+    /// Test E: transformer-assisted generate on unknown prompt should
+    /// not panic; empty or best-effort output is acceptable.
+    #[test]
+    fn transformer_generate_unknown_prompt_no_panic() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            5,
+            0.05,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let transformer_predictor = TransformerPredictor::new(embed_dim, hidden_dim, 5);
+
+        let output = generate_text_with_transformer(
+            &network,
+            &trainer.embedder,
+            &trainer.tokenizer,
+            &seq_memory,
+            &transformer_predictor,
+            "Unknown topic",
+            10,
+            1,
         );
 
         // Should not panic; empty or best-effort is acceptable
