@@ -1,4 +1,5 @@
 pub mod attention;
+pub mod transformer;
 
 use manas_core::{ManasError, Network};
 use manas_learn::Embedder;

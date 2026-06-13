@@ -251,7 +251,8 @@ manas/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs
-│       └── attention.rs    ← single-head causal self-attention (v0.4)
+│       ├── attention.rs    ← single-head causal self-attention (v0.4)
+│       └── transformer.rs  ← tiny transformer block (v0.5)
 │
 ├── manas-ingest/               ← unified input pipeline (text, files, folders)
 │   ├── Cargo.toml
@@ -865,6 +866,21 @@ manas generate "prompt"      --max-tokens 20  --max-context 5  --top-k 1  --temp
 
 Language-trained neurons are stamped with `Source::RawText` and a detected freshness category. The `tag_neurons()` method (public on `Trainer`) stamps only neurons with `Source::Unknown`, preserving provenance from previous `learn`/`ingest` calls.
 
+#### Tiny Transformer Block (v0.5)
+
+`TinyTransformerBlock` stacks `CausalSelfAttention` + `FeedForward` with residual connections:
+
+```txt
+inputs
+→ causal self-attention
+→ residual add: x + attention_output
+→ feed-forward per token (ReLU)
+→ residual add: x + feed_forward_output
+→ outputs
+```
+
+`FeedForward` uses a single hidden layer: `w1 @ x + b1 → ReLU → w2 @ hidden + b2`. Weights initialized with the same deterministic random scheme as attention. This block is forward-inference only — no training or integration into `generate` yet.
+
 #### Single-Head Causal Attention (v0.4)
 
 `CausalSelfAttention` is a standalone module in `attention.rs` with QKV projections, scaled dot-product scores, causal masking, and an output projection. It is implemented as custom Rust with no external dependencies. Not yet integrated into the default prediction path.
@@ -1389,6 +1405,7 @@ No panics in library code. The CLI converts errors to user-friendly messages.
 | M11 | **Next-token prediction (v0.2)** — sequence memory, hybrid predictor, source metadata | `manas-language` | Local next-token prediction |
 | M12 | **Real text generation (v0.3)** — loop prevention, memory-boundary stop, cycle detection | `manas-language` | Stable autoregressive generation |
 | M13 | **Single-head causal attention (v0.4)** — QKV, scaled dot-product, causal mask | `manas-language` | Custom attention module |
+| M14 | **Tiny transformer block (v0.5)** — causal attention + FFN + residual | `manas-language` | Forward-only transformer block |
 
 ---
 

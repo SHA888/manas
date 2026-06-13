@@ -1,6 +1,6 @@
 // ─── Helpers ────────────────────────────────────────────────────
 
-fn mat_vec_mul(matrix: &[f32], rows: usize, cols: usize, input: &[f32]) -> Vec<f32> {
+pub(crate) fn mat_vec_mul(matrix: &[f32], rows: usize, cols: usize, input: &[f32]) -> Vec<f32> {
     let mut out = vec![0.0; rows];
     for r in 0..rows {
         let mut sum = 0.0;
@@ -12,11 +12,11 @@ fn mat_vec_mul(matrix: &[f32], rows: usize, cols: usize, input: &[f32]) -> Vec<f
     out
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-fn softmax(scores: &[f32]) -> Vec<f32> {
+pub(crate) fn softmax(scores: &[f32]) -> Vec<f32> {
     if scores.is_empty() {
         return Vec::new();
     }
@@ -150,16 +150,16 @@ impl CausalSelfAttention {
 
 // ─── Deterministic pseudo-random helpers ─────────────────────────
 
-struct SimpleRng {
+pub(crate) struct SimpleRng {
     seed: u64,
 }
 
 impl SimpleRng {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         SimpleRng { seed }
     }
 
-    fn next_f32(&mut self) -> f32 {
+    pub(crate) fn next_f32(&mut self) -> f32 {
         self.seed = self
             .seed
             .wrapping_mul(6364136223846793005)
@@ -169,7 +169,7 @@ impl SimpleRng {
     }
 }
 
-fn random_vec(rng: &mut SimpleRng, n: usize, scale: f32) -> Vec<f32> {
+pub(crate) fn random_vec(rng: &mut SimpleRng, n: usize, scale: f32) -> Vec<f32> {
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
         let u1 = rng.next_f32();
