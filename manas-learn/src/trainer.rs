@@ -157,6 +157,21 @@ impl Trainer {
         self.embedder.dim = snapshot.embed_dim;
     }
 
+    /// Tag the given list of neuron IDs with the trainer's source and freshness.
+    ///
+    /// Only overwrites neurons whose current source is `Source::Unknown`,
+    /// preserving provenance from previous `learn`/`ingest` calls.
+    pub fn tag_neurons(&self, network: &mut Network, ids: &[u64]) {
+        for layer in &mut network.layers {
+            for neuron in &mut layer.neurons {
+                if ids.contains(&neuron.id) && matches!(neuron.source, Source::Unknown) {
+                    neuron.source = self.source.clone();
+                    neuron.freshness_category = self.freshness_category;
+                }
+            }
+        }
+    }
+
     /// Ensure at least one neuron carries the current file/URL source.
     ///
     /// Grows one neuron in layer 0 when:
@@ -267,7 +282,7 @@ impl Trainer {
                     .update(&tokens, &output_grad, self.learning_rate);
 
                 // Tag neurons with source + freshness
-                tag_neurons(network, &updated_ids, &self.source, self.freshness_category);
+                self.tag_neurons(network, &updated_ids);
 
                 // ── FIX 1 — recalculate importance + protection ───────────────
                 manas_memory::scorer::recalc_all(network);
@@ -328,7 +343,7 @@ impl Trainer {
         }
 
         // Tag neurons with source + freshness
-        tag_neurons(network, &updated_ids, &self.source, self.freshness_category);
+        self.tag_neurons(network, &updated_ids);
 
         // ── FIX 1 — recalculate importance + protection ───────────────────────
         manas_memory::scorer::recalc_all(network);
@@ -351,19 +366,6 @@ impl Default for Trainer {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/// Tag a set of neurons with their knowledge origin and freshness category.
-/// FIX 2 — source is now stamped onto every neuron that participated in learning.
-fn tag_neurons(network: &mut Network, ids: &[u64], source: &Source, freshness_category: u8) {
-    for layer in &mut network.layers {
-        for neuron in &mut layer.neurons {
-            if ids.contains(&neuron.id) && matches!(neuron.source, Source::Unknown) {
-                neuron.source = source.clone();
-                neuron.freshness_category = freshness_category;
-            }
-        }
-    }
-}
 
 /// Find the layer whose output has the highest MSE loss against the target.
 /// Used to decide where to grow a new neuron.

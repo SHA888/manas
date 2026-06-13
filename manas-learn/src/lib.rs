@@ -255,7 +255,10 @@ mod tests {
             .flat_map(|l| &l.neurons)
             .filter(|n| matches!(n.source, Source::RawText))
             .collect();
-        assert!(!raw_neurons.is_empty(), "raw-text neurons should still exist");
+        assert!(
+            !raw_neurons.is_empty(),
+            "raw-text neurons should still exist"
+        );
         assert!(
             raw_neurons.iter().all(|n| n.freshness_category == 0),
             "raw-text neurons must keep original freshness 0"

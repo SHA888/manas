@@ -28,6 +28,15 @@
 # Learn from text
 manas learn "Rust is a systems programming language with zero-cost abstractions"
 
+# Train next-token prediction (v0.2)
+manas train-language "Rust is a systems programming language" --epochs 50
+
+# Predict the next word
+manas predict-next "Rust is a" --top-k 5
+
+# Generate text (autoregressive)
+manas generate "Rust is a" --max-tokens 10
+
 # Learn from files and folders
 manas ingest --folder ./my-notes/
 manas ingest --file ./article.md
@@ -50,6 +59,9 @@ manas files
 # Show activated neurons + decoded keywords for a topic
 manas trace "Rust ownership"
 
+# Show neurons with their source metadata
+manas neurons --all
+
 # Set freshness category
 manas tag "Rust version" --freshness fast
 ```
@@ -63,52 +75,50 @@ Manas is built from 7 Rust crates, each with a single responsibility:
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                         manas-cli                            │
-│   learn | query | ingest | refresh | inspect | export ...    │
+│   learn | query | ingest | predict-next | generate | ...    │
 └───────────────────────────┬─────────────────────────────────┘
                             │
-          ┌─────────────────┼─────────────────┐
-          ▼                 ▼                  ▼
-  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-  │ manas-ingest │  │ manas-agent  │  │ manas-memory │
-  │ text/files/  │  │ web search   │  │ importance   │
-  │ folders/urls │  │ html scrape  │  │ protection   │
-  │ 7 parsers    │  │ freshness    │  │ compression  │
-  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
-         └─────────────────┼─────────────────┘
-                           ▼
-                  ┌──────────────────┐
-                  │   manas-learn    │
-                  │ tokenizer → embed│
-                  │ → forward → loss │
-                  │ → backprop → grow│
-                  └────────┬─────────┘
-                           ▼
-                  ┌──────────────────┐
-                  │   manas-core     │
-                  │ neurons, layers  │
-                  │ forward pass     │
-                  │ weight updates   │
-                  └────────┬─────────┘
-                           ▼
-                  ┌──────────────────┐
-                  │  manas-store     │
-                  │ .manas binary    │
-                  │ append-only I/O  │
-                  │ CRC32 integrity  │
-                  └──────────────────┘
+          ┌─────────────────┼─────────────────┬───────────────┐
+          ▼                 ▼                  ▼               ▼
+  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+  │ manas-ingest │  │ manas-agent  │  │ manas-memory │  │manas-language│
+  │ text/files/  │  │ web search   │  │ importance   │  │ next-token   │
+  │ folders/urls │  │ html scrape  │  │ protection   │  │ prediction   │
+  │ 7 parsers    │  │ freshness    │  │ compression  │  │ seq memory   │
+  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+         └─────────────────┼─────────────────┼─────────────────┘
+                           ▼                 ▼
+                  ┌──────────────────────────────────┐
+                  │           manas-learn             │
+                  │ tokenizer → embed → forward → loss│
+                  │ → backprop → grow → tag_neurons() │
+                  └────────────────┬─────────────────┘
+                                   ▼
+                  ┌──────────────────────────────────┐
+                  │           manas-core              │
+                  │ neurons, layers, forward pass     │
+                  │ weight updates, growth logic      │
+                  └────────────────┬─────────────────┘
+                                   ▼
+                  ┌──────────────────────────────────┐
+                  │          manas-store              │
+                  │ .manas binary, append-only I/O    │
+                  │ CRC32 integrity, brain.manas.seq  │
+                  └──────────────────────────────────┘
 ```
 
 ### Crates
 
 | Crate | Purpose |
-|---|---|
+|---|---|---|
 | **manas-core** | Neural network engine — Neuron, Layer, Network structs, forward pass, growth logic |
 | **manas-store** | Custom `.manas` binary format — append-only read/write, CRC32 checksums |
 | **manas-learn** | Online learning — tokenizer, embedder, backpropagation, loss-driven growth, **decoder** |
 | **manas-ingest** | Input pipeline — 7 file format parsers, folder walker, text chunking |
 | **manas-memory** | Knowledge preservation — importance scoring, protection levels, compression |
 | **manas-agent** | Internet connection — DuckDuckGo search, HTML scraping, freshness checker |
-| **manas-cli** | Command-line interface — 13 commands for all operations |
+| **manas-language** | Next-token prediction — sequence memory, hybrid memory+neural predictor, autoregressive generation |
+| **manas-cli** | Command-line interface — 16 commands for all operations |
 
 ---
 
@@ -122,12 +132,23 @@ Learning:
     → Calculate MSE loss → Backpropagate → Update weights
     → If loss > threshold: grow a new neuron
     → For files/internet: grow 1 source-owned neuron per unique source
+    → Tag neurons with source + freshness (only if Unknown)
     → Recalculate importance scores → Save to .manas file
 
 Inference (decoding):
   Query text → Tokenize → Embed → Forward pass
     → Output vector → Nearest tokens in embedding table
     → Display closest known tokens with similarity scores
+
+Next-token prediction (v0.2):
+  Input text → Tokenize → Build sequence examples (sliding window)
+    → For each (context, target):
+      → Embed context → Forward pass → Loss → Backprop
+      → Record transition in SequenceMemory (including suffix contexts)
+    → After training: hybrid prediction
+      → 0.8 × memory_score + 0.2 × neural_score
+      → Context-token penalization
+      → Predict next token or generate autoregressively
 ```
 
 ### The Neuron
@@ -174,15 +195,18 @@ Auto-detected from keywords in the text. Stale neurons trigger automatic interne
 - **Ingest local files** — 7 format parsers (txt, md, json, html, csv, yaml, toml), folder walker, text chunking
 - **Persist state** — stores vocab, embeddings, neurons, and metadata in a single `.manas` file
 - **Source-aware growth** — grows a dedicated neuron per unique file or URL, retaining provenance
+- **Source metadata on all neurons** — every neuron (including language-trained ones) is stamped with `src=raw text`, `src=file:...`, or `src=url:...`; never overwritten once set
 - **Parameter tracking** — reports network params, embedding params, and total params
 - **Inspection commands** — `inspect`, `trace`, `neurons`, `files` give visibility into the network's state
 - **Freshness system** — categorizes knowledge (timeless/slow/fast/realtime) and flags stale neurons
 - **Web search & scrape** — queries DuckDuckGo, scrapes HTML, and ingests results
+- **Next-token prediction (v0.2)** — `train-language`, `predict-next`, `generate` commands with hybrid sequence memory + neural predictor
 
 ## Current Limitations
 
 - **Query output is not local-first yet** — currently relies on web search rather than answering from the local network alone
 - **Answer generation is basic** — there is no generative text output; decoded tokens show the closest embeddings
+- **Next-token prediction is experimental** — v0.2 works for short contexts but is not trained on large corpora; generation quality is limited
 - **File/chunk learning is experimental** — chunking heuristics and per-chunk learning are still being refined
 - **One neuron per source is an anchor** — the source neuron acts as a pointer, not a full document understanding
 - **Not production-ready** — this is a research prototype; APIs, storage, and behavior may change
@@ -215,6 +239,20 @@ manas ingest --file path                  Learn from a file
 manas ingest --folder path                Learn from a folder (recursive)
 manas ingest --url URL                    Learn from a web page
 manas ingest --dry-run                    Preview without learning
+
+# Language (v0.2)
+manas train-language "text"              Train next-token prediction
+  --epochs 50                            Training epochs
+  --learning-rate 0.05                   Learning rate
+  --max-context 5                        Sliding context window size
+
+manas predict-next "context"             Predict next token(s)
+  --top-k 5                              Number of candidates
+  --max-context 5                        Context window
+
+manas generate "prompt"                  Generate text autoregressively
+  --max-tokens 20                        Tokens to generate
+  --max-context 5                        Context window
 
 # Querying
 manas query "question"                    Search web + learn + display results
@@ -269,6 +307,7 @@ manas/
 ├── manas-memory/               Importance & protection system
 ├── manas-store/                .manas file format
 ├── manas-learn/                Online learning engine
+├── manas-language/             Next-token prediction & sequence memory
 ├── manas-ingest/               Input pipeline
 ├── manas-agent/                Internet agent
 ├── manas-cli/                  Command-line interface

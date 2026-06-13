@@ -2,6 +2,10 @@ use clap::{Parser, Subcommand};
 use manas_agent::{AgentPipeline, FreshnessChecker};
 use manas_core::{ManasError, Network, Neuron, Source};
 use manas_ingest::{IngestPipeline, IngestSource};
+use manas_language::{
+    NextTokenPredictor, SequenceMemory, generate_text_with_memory, seq_memory_path,
+    train_next_token_examples,
+};
 use manas_learn::{Trainer, TrainerSnapshot, decode, detect_freshness_category};
 use manas_store::ManasBrain;
 use std::collections::HashMap;
@@ -68,6 +72,29 @@ enum Commands {
         #[arg(long)]
         freshness: String,
     },
+    TrainLanguage {
+        text: String,
+        #[arg(long, default_value = "5")]
+        max_context: usize,
+        #[arg(long, default_value = "10")]
+        epochs: usize,
+        #[arg(long, default_value = "0.05")]
+        learning_rate: f32,
+    },
+    PredictNext {
+        text: String,
+        #[arg(long, default_value = "5")]
+        max_context: usize,
+        #[arg(long, default_value = "10")]
+        top_k: usize,
+    },
+    Generate {
+        prompt: String,
+        #[arg(long, default_value = "20")]
+        max_tokens: usize,
+        #[arg(long, default_value = "5")]
+        max_context: usize,
+    },
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -101,6 +128,22 @@ fn main() {
         Commands::Neurons { all } => cmd_neurons(*all, &brain_path),
         Commands::Restore { all } => cmd_restore(*all, &brain_path),
         Commands::Tag { text, freshness } => cmd_tag(text, freshness, &brain_path),
+        Commands::TrainLanguage {
+            text,
+            max_context,
+            epochs,
+            learning_rate,
+        } => cmd_train_language(text, *max_context, *epochs, *learning_rate, &brain_path),
+        Commands::PredictNext {
+            text,
+            max_context,
+            top_k,
+        } => cmd_predict_next(text, *max_context, *top_k, &brain_path),
+        Commands::Generate {
+            prompt,
+            max_tokens,
+            max_context,
+        } => cmd_generate(prompt, *max_tokens, *max_context, &brain_path),
     };
 
     if let Err(e) = result {
@@ -769,6 +812,151 @@ fn cmd_tag(text: &str, freshness: &str, brain_path: &Path) -> Result<(), ManasEr
 
     brain.save(&network)?;
     println!("Tagged {} neuron(s) as {}", tagged, freshness);
+    Ok(())
+}
+
+// ─── Language commands ─────────────────────────────────────────────────────────
+
+/// `manas train-language "text" [--max-context 5]`
+fn cmd_train_language(
+    text: &str,
+    max_context: usize,
+    epochs: usize,
+    learning_rate: f32,
+    brain_path: &Path,
+) -> Result<(), ManasError> {
+    let brain = ManasBrain::new(brain_path);
+    let mut network = load_or_create_network(&brain);
+    let mut trainer = Trainer::new();
+    restore_trainer_from_brain(&mut trainer, &brain);
+
+    trainer.source = Source::RawText;
+    trainer.freshness_category = detect_freshness_category(text);
+
+    // Load existing sequence memory or create fresh
+    let seq_path = seq_memory_path(brain_path);
+    let mut seq_memory = if seq_path.exists() {
+        SequenceMemory::load_from_file(&seq_path)?
+    } else {
+        SequenceMemory::new()
+    };
+
+    let report = train_next_token_examples(
+        &mut network,
+        &mut trainer,
+        &mut seq_memory,
+        text,
+        max_context,
+        epochs,
+        learning_rate,
+    )?;
+    network.total_texts_learned += 1;
+    save_brain(&brain, &network, &trainer)?;
+
+    // Save sequence memory alongside the brain
+    seq_memory.save_to_file(&seq_path)?;
+
+    println!(
+        "Trained {} epochs on {} examples | avg loss: {:.4} | tokens: {}",
+        epochs, report.examples_count, report.average_loss, report.tokens_learned
+    );
+    Ok(())
+}
+
+/// `manas predict-next "context" [--max-context 5] [--top-k 10]`
+fn cmd_predict_next(
+    text: &str,
+    max_context: usize,
+    top_k: usize,
+    brain_path: &Path,
+) -> Result<(), ManasError> {
+    let brain = ManasBrain::new(brain_path);
+    if !brain.path.exists() {
+        println!("No brain file found at {}", brain.path.display());
+        return Ok(());
+    }
+
+    let network = brain.load()?;
+    let mut trainer = Trainer::new();
+    restore_trainer_from_brain(&mut trainer, &brain);
+
+    let mut tok = trainer.tokenizer.clone();
+    let tokens = tok.encode(text);
+    for &id in &tokens {
+        trainer.embedder.embed_or_init(id);
+    }
+
+    // Load sequence memory for hybrid prediction
+    let seq_path = seq_memory_path(brain_path);
+    let seq_memory = if seq_path.exists() {
+        SequenceMemory::load_from_file(&seq_path)?
+    } else {
+        SequenceMemory::new()
+    };
+
+    let predictor = NextTokenPredictor::new(max_context);
+    let results = predictor.predict_top_k_with_memory(
+        &network,
+        &trainer.embedder,
+        &seq_memory,
+        &tokens,
+        top_k,
+    );
+
+    if results.is_empty() {
+        println!("No predictions available");
+        return Ok(());
+    }
+
+    println!("Top predictions:");
+    for (id, score) in &results {
+        let word = trainer.tokenizer.decode(*id).unwrap_or("?");
+        println!("  {:<20} score={:.4}", word, score);
+    }
+    Ok(())
+}
+
+/// `manas generate "prompt" [--max-tokens 20] [--max-context 5]`
+fn cmd_generate(
+    prompt: &str,
+    max_tokens: usize,
+    max_context: usize,
+    brain_path: &Path,
+) -> Result<(), ManasError> {
+    let brain = ManasBrain::new(brain_path);
+    if !brain.path.exists() {
+        println!("No brain file found at {}", brain.path.display());
+        return Ok(());
+    }
+
+    let network = brain.load()?;
+    let mut trainer = Trainer::new();
+    restore_trainer_from_brain(&mut trainer, &brain);
+
+    let seq_path = seq_memory_path(brain_path);
+    let seq_memory = if seq_path.exists() {
+        SequenceMemory::load_from_file(&seq_path)?
+    } else {
+        SequenceMemory::new()
+    };
+
+    let mut tok = trainer.tokenizer.clone();
+    let _tokens = tok.encode(prompt);
+    for &id in &_tokens {
+        trainer.embedder.embed_or_init(id);
+    }
+
+    let text = generate_text_with_memory(
+        &network,
+        &trainer.embedder,
+        &trainer.tokenizer,
+        &seq_memory,
+        prompt,
+        max_tokens,
+        max_context,
+    );
+
+    println!("{}", text);
     Ok(())
 }
 

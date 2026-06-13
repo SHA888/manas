@@ -15,4 +15,5 @@ manas-store = { workspace = true }
 manas-learn = { workspace = true }
 manas-ingest = { workspace = true }
 manas-agent = { workspace = true }
+manas-language = { workspace = true }
 clap = { version = "4", features = ["derive"] }

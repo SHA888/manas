@@ -8,6 +8,7 @@ members = [
     "manas-ingest",
     "manas-agent",
     "manas-cli",
+    "manas-language",
     "manas-benches",
 ]
 
@@ -27,3 +28,4 @@ manas-store = { path = "manas-store" }
 manas-learn = { path = "manas-learn" }
 manas-ingest = { path = "manas-ingest" }
 manas-agent = { path = "manas-agent" }
+manas-language = { path = "manas-language" }

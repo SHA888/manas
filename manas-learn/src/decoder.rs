@@ -6,11 +6,7 @@ pub struct DecodeResult {
     pub output_norm: f32,
 }
 
-pub fn decode(
-    embedder: &Embedder,
-    tokenizer: &Tokenizer,
-    text: &str,
-) -> DecodeResult {
+pub fn decode(embedder: &Embedder, tokenizer: &Tokenizer, text: &str) -> DecodeResult {
     let mut temp_tokenizer = tokenizer.clone();
     let tokens = temp_tokenizer.encode(text);
     if tokens.is_empty() {

@@ -1,0 +1,15 @@
+[package]
+name = "manas-language"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Manas language — next-token prediction, sequence examples, text generation"
+
+[dependencies]
+manas-core = { workspace = true }
+manas-learn = { workspace = true }
+manas-memory = { workspace = true }
+rand = "0.8"
