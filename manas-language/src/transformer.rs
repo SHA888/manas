@@ -37,7 +37,8 @@ impl FeedForward {
         add_vectors(&out, &self.b2)
     }
 
-    pub fn train_step(&mut self, input: &[f32], grad_output: &[f32], learning_rate: f32) {
+    /// Returns `true` if the update was applied, `false` if skipped (NaN/inf).
+    pub fn train_step(&mut self, input: &[f32], grad_output: &[f32], learning_rate: f32) -> bool {
         // Forward with caching
         let hidden_pre = mat_vec_mul(&self.w1, self.hidden_dim, self.embed_dim, input);
         let hidden_pre_bias = add_vectors(&hidden_pre, &self.b1);
@@ -106,7 +107,7 @@ impl FeedForward {
             .chain(&grad_b2)
             .any(|&g| !g.is_finite());
         if has_nan {
-            return;
+            return false;
         }
 
         // Update weights
@@ -122,6 +123,7 @@ impl FeedForward {
         for (i, &g) in grad_b2.iter().enumerate() {
             self.b2[i] -= learning_rate * g;
         }
+        true
     }
 }
 

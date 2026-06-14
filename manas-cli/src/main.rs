@@ -87,6 +87,8 @@ enum Commands {
         learning_rate: f32,
         #[arg(long)]
         train_transformer: bool,
+        #[arg(long, default_value = "0.01")]
+        transformer_learning_rate: f32,
         #[arg(long, default_value = "10")]
         max_new_neurons: usize,
         #[arg(long)]
@@ -100,6 +102,8 @@ enum Commands {
         top_k: usize,
         #[arg(long)]
         use_transformer: bool,
+        #[arg(long)]
+        transformer_only: bool,
     },
     Generate {
         prompt: String,
@@ -153,6 +157,7 @@ fn main() {
             epochs,
             learning_rate,
             train_transformer,
+            transformer_learning_rate,
             max_new_neurons,
             no_grow,
         } => cmd_train_language(
@@ -161,6 +166,7 @@ fn main() {
             *epochs,
             *learning_rate,
             *train_transformer,
+            *transformer_learning_rate,
             *max_new_neurons,
             *no_grow,
             &brain_path,
@@ -170,7 +176,15 @@ fn main() {
             max_context,
             top_k,
             use_transformer,
-        } => cmd_predict_next(text, *max_context, *top_k, *use_transformer, &brain_path),
+            transformer_only,
+        } => cmd_predict_next(
+            text,
+            *max_context,
+            *top_k,
+            *use_transformer,
+            *transformer_only,
+            &brain_path,
+        ),
         Commands::Generate {
             prompt,
             max_tokens,
@@ -1069,6 +1083,7 @@ fn cmd_train_language(
     epochs: usize,
     learning_rate: f32,
     train_transformer: bool,
+    transformer_learning_rate: f32,
     max_new_neurons: usize,
     no_grow: bool,
     brain_path: &Path,
@@ -1148,22 +1163,67 @@ fn cmd_train_language(
         let tokens = trainer.tokenizer.encode(text);
         let examples = build_sequence_examples(&tokens, max_context);
 
-        let transformer_lr = learning_rate * 0.2;
         let tf_epochs = epochs.max(10);
-        let tf_loss = train_transformer_output_head(
+        let tf_report = train_transformer_output_head(
             &mut model,
             &trainer.embedder,
             &examples,
             max_context,
             tf_epochs,
-            transformer_lr,
+            transformer_learning_rate,
+            learning_rate,
         );
 
         model.save_to_file(&transformer_path)?;
 
         println!(
-            "Trained transformer output head: {} epochs, avg loss: {:.4}",
-            tf_epochs, tf_loss
+            "Transformer training\n\
+             \x20 epochs                           : {}\n\
+             \x20 examples                         : {}\n\
+             \x20 language lr                      : {:.4}\n\
+             \x20 transformer lr                   : {:.4}\n\
+             \x20 avg train loss                   : {:.4}\n\
+             \x20 first epoch loss                 : {}\n\
+             \x20 final epoch loss                 : {}\n\
+             \x20 improvement                      : {}\n\
+             \x20 pure transformer top-1 accuracy  : {:.2}%\n\
+             \x20 pure transformer top-3 accuracy  : {:.2}%\n\
+             \x20 output head                      : {}\n\
+             \x20 feed-forward                     : {}\n\
+             \x20 attention                        : {}\n\
+             \x20 invalid updates                  : {}",
+            tf_report.epochs,
+            tf_report.examples,
+            tf_report.language_lr,
+            tf_report.transformer_lr,
+            tf_report.avg_loss,
+            tf_report
+                .first_loss
+                .map_or("N/A".to_string(), |v| format!("{:.4}", v)),
+            tf_report
+                .final_loss
+                .map_or("N/A".to_string(), |v| format!("{:.4}", v)),
+            tf_report
+                .improvement_pct
+                .map_or("N/A".to_string(), |v| format!("{:.2}%", v)),
+            tf_report.top1_accuracy,
+            tf_report.top3_accuracy,
+            if tf_report.output_head_trained {
+                "trained"
+            } else {
+                "untrained"
+            },
+            if tf_report.ffn_trained {
+                "trained"
+            } else {
+                "untrained"
+            },
+            if tf_report.attention_frozen {
+                "frozen"
+            } else {
+                "trainable"
+            },
+            tf_report.invalid_updates,
         );
     }
 
@@ -1180,6 +1240,7 @@ fn cmd_predict_next(
     max_context: usize,
     top_k: usize,
     use_transformer: bool,
+    transformer_only: bool,
     brain_path: &Path,
 ) -> Result<(), ManasError> {
     let brain = ManasBrain::new(brain_path);
@@ -1216,13 +1277,17 @@ fn cmd_predict_next(
             let hidden_dim = (embed_dim * 2).max(8);
             TransformerPredictor::new(embed_dim, hidden_dim, max_context)
         };
-        transformer_predictor.predict_top_k_assisted(
-            &network,
-            &trainer.embedder,
-            &seq_memory,
-            &tokens,
-            top_k,
-        )
+        if transformer_only {
+            transformer_predictor.predict_top_k_transformer(&trainer.embedder, &tokens, top_k)
+        } else {
+            transformer_predictor.predict_top_k_assisted(
+                &network,
+                &trainer.embedder,
+                &seq_memory,
+                &tokens,
+                top_k,
+            )
+        }
     } else {
         let predictor = NextTokenPredictor::new(max_context);
         predictor.predict_top_k_with_memory(

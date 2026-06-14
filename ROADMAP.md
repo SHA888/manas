@@ -20,6 +20,7 @@ Manas is **not** trying to replace large hosted LLMs. It is a learning and resea
 | v0.7.1 | Controlled neuron growth during language training | Done |
 | v0.7.2 | Better inspect for language and transformer state | Done |
 | v0.8 | Train transformer FeedForward layer | Done |
+| v0.8.1 | Transformer training metrics | Done |
 
 ## Completed Milestones
 
@@ -249,38 +250,50 @@ Goal achieved:
 
 ---
 
-## Next Milestones
+---
 
-## v0.8.1 — Transformer Training Metrics
+### v0.8.1 — Transformer Training Metrics
 
-Add better reporting for transformer training quality.
+Transformer training now reports detailed metrics instead of a single loss number.
 
-### Planned Metrics
+Completed:
 
-- Average transformer loss
-- Top-1 accuracy
-- Top-3 accuracy
-- Examples count
-- Epochs
-- Learning rate
-- Transformer score contribution
+- `TransformerTrainReport` struct with epochs, examples, loss, accuracy, and status fields
+- Per-epoch loss tracking (first, final, average)
+- Loss improvement percentage (safe with zero first-loss)
+- Top-1 and top-3 accuracy computed after training via transformer logits
+- Invalid/NaN update counting for gradient safety
+- Output head, FFN, and attention status in report
+- Formatted CLI output with all metrics
+- 5 new tests (A: report populated, B: accuracy math, C: improvement calc, D: zero-loss safe, E: format labels)
 
-### Example Output
+Example CLI output:
 
 ```text
-Trained transformer:
-  epochs        : 100
-  examples      : 10
-  avg loss      : 0.1234
-  top-1 accuracy: 80.00%
-  top-3 accuracy: 100.00%
+Transformer training
+  epochs                         : 100
+  examples                       : 10
+  language lr                    : 0.0500
+  transformer lr                 : 0.0100
+  avg train loss                   : 0.1234
+  first epoch loss                 : 0.4567
+  final epoch loss                 : 0.0234
+  improvement                      : 94.88%
+  pure transformer top-1 accuracy  : 80.00%
+  pure transformer top-3 accuracy  : 100.00%
+  output head                    : trained
+  feed-forward                   : trained
+  attention                      : frozen
+  invalid updates                : 0
 ```
 
-### Goal
+Goal achieved:
 
-> Make transformer training measurable instead of guessing from manual output.
+> Transformer training is now measurable with per-epoch loss, accuracy, improvement, and status reporting.
 
 ---
+
+## Next Milestones
 
 ## v0.8.2 — Safer Transformer Training
 
@@ -524,5 +537,5 @@ Manas should continue following these principles:
 The next coding milestone is:
 
 ```text
-v0.8.1 — Transformer Training Metrics
+v0.8.2 — Safer Transformer Training
 ```

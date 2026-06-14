@@ -892,6 +892,8 @@ inputs
 
 **v0.8** — transformer training now includes the `FeedForward` layer. `FeedForward::train_step()` performs forward-pass caching, full backprop through w1/b1/w2/b2 with ReLU derivative, gradient clipping to [-1, 1], and NaN/inf skip. `train_transformer_output_head()` now trains both the output head and the FFN: it computes dL/d(block output) by backpropagating through the output head, then calls `feed_forward.train_step()` on the last token's FFN input. The `TransformerLanguageModel` persists FFN weights in the sidecar (version 2 format) and tracks an `ffn_trained` flag. `TransformerPredictor::from_model()` copies the trained block. Attention Q/K/V/O remain frozen. `manas inspect` reports `FFN trained : yes/no`.
 
+**v0.8.1** — transformer training now returns a `TransformerTrainReport` with detailed metrics: per-epoch loss tracking, first/final/avg loss, improvement percentage, pure transformer top-1/top-3 accuracy, invalid/NaN update count, and output-head/FFN/attention status. Added `evaluate_transformer_on_examples()` which computes both loss and accuracy from the same pure-transformer forward pass, skipping examples whose target is not in `vocab_order` (consistent with training). Added `TransformerEvalReport` struct. CLI features: `--transformer-learning-rate` (default 0.01) separates transformer LR from language LR; `--transformer-only` on `predict-next` shows pure transformer scores without hybrid mixing.
+
 **v0.7.1** — neural growth optimization for `train-language`. Growth is now capped by `max_new_neurons` (default 10) and only attempted during the **first epoch** of training, preventing repeated per-epoch explosion. A `LanguageMeta` struct persisted as `brain.manas.langmeta` tracks text hashes for **duplicate-text detection** — repeated training of the same text automatically sets the growth cap to 0. CLI flags `--max-new-neurons <N>` and `--no-grow` give the user direct control. The `LanguageTrainReport` now reports `neurons_grown`.
 
 #### Single-Head Causal Attention (v0.4)
@@ -1442,6 +1444,7 @@ No panics in library code. The CLI converts errors to user-friendly messages.
 | M17 | **Neural growth optimization (v0.7.1)** — `max_new_neurons` cap, first-epoch-only growth, `LanguageMeta` sidecar for duplicate-text detection, `--max-new-neurons`/`--no-grow` CLI flags | `manas-language`, `manas-cli` | Controlled network growth |
 | M18 | **Enhanced system inspect (v0.7.2)** — `manas inspect` shows Core Network, Language System, Transformer, Storage, and Total sections; reports sidecar file sizes, transformer param counts, sequence memory status, language metadata; `--verbose` flag | `manas-cli` | Full inspect visibility |
 | M19 | **FFN training (v0.8)** — `FeedForward::train_step()`, `forward_with_ffn_inputs()`, FFN weight persistence (v2 sidecar), `ffn_trained` flag, gradients clipped to [-1, 1], NaN/inf safety, attention frozen | `manas-language`, `manas-cli` | Transformer FFN learns next-token signal |
+| M20 | **Training metrics (v0.8.1)** — `TransformerTrainReport`, per-epoch loss, top-1/top-3 accuracy, improvement %, invalid update tracking, formatted CLI output | `manas-language`, `manas-cli` | Measurable transformer training |
 
 ---
 

@@ -221,6 +221,7 @@ Auto-detected from keywords in the text. Stale neurons trigger automatic interne
 - **Neural growth optimization (v0.7.1)** — `--max-new-neurons` / `--no-grow` flags; growth capped per call and restricted to first epoch only; duplicate-text detection via `LanguageMeta` sidecar (`brain.manas.langmeta`) prevents re-growth on repeated training
 - **Enhanced system inspect (v0.7.2)** — `manas inspect` now shows separate sections for Core Network, Language System, Transformer, Storage, and Total; reports sidecar file sizes, transformer param counts, sequence memory status, and language metadata; `--verbose` flag for extended output
 - **Transformer FFN training (v0.8)** — `--train-transformer` now trains both the output head and the FeedForward layer inside the transformer block; gradient clipping to [-1, 1], NaN/inf safety; attention Q/K/V/O remain frozen; `manas inspect` reports `FFN trained : yes/no`
+- **Transformer training metrics (v0.8.1)** — `--train-transformer` now prints detailed metrics: per-epoch loss, pure transformer top-1/top-3 accuracy, loss improvement %, invalid update count, output head/FFN/attention status. Separate `--transformer-learning-rate` flag (default 0.01). `--transformer-only` flag on `predict-next` for pure-transformer debug predictions.
 
 ## Current Limitations
 

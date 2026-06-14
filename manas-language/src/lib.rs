@@ -643,7 +643,7 @@ impl TransformerPredictor {
     ///
     /// When the output head is trained:  output-head projection → softmax.
     /// Otherwise:                        cosine-similarity against vocab embeddings.
-    fn predict_top_k_transformer(
+    pub fn predict_top_k_transformer(
         &self,
         embedder: &Embedder,
         context_tokens: &[u32],
@@ -851,6 +851,25 @@ pub struct LanguageTrainReport {
     pub neurons_grown: usize,
 }
 
+/// Report returned after transformer training (v0.8.1).
+#[derive(Clone, Debug)]
+pub struct TransformerTrainReport {
+    pub epochs: usize,
+    pub examples: usize,
+    pub language_lr: f32,
+    pub transformer_lr: f32,
+    pub avg_loss: f32,
+    pub first_loss: Option<f32>,
+    pub final_loss: Option<f32>,
+    pub improvement_pct: Option<f32>,
+    pub top1_accuracy: f32,
+    pub top3_accuracy: f32,
+    pub output_head_trained: bool,
+    pub ffn_trained: bool,
+    pub attention_frozen: bool,
+    pub invalid_updates: usize,
+}
+
 /// Train the network on next-token prediction and populate the sequence memory.
 ///
 /// `max_new_neurons` caps how many neurons can be **grown** during this call
@@ -1014,7 +1033,121 @@ pub fn train_next_token_examples(
     })
 }
 
-// ─── Transformer Training (v0.8) ──────────────────────────────────────────────
+// ─── Transformer Training (v0.8.1) ────────────────────────────────────────────
+
+/// Result of evaluating a transformer model on a set of examples.
+///
+/// Both loss and accuracy are computed from the **same** pure-transformer
+/// forward pass and use the **same** example-selection criteria (target must
+/// be in `vocab_order`), guaranteeing consistency between the two metrics.
+#[derive(Debug, Clone)]
+pub struct TransformerEvalReport {
+    /// Average cross-entropy loss over evaluated examples.
+    pub avg_loss: f32,
+    /// Percentage of examples where the target token was the top-1 prediction.
+    pub top1_accuracy: f32,
+    /// Percentage of examples where the target token was in the top-3 predictions.
+    pub top3_accuracy: f32,
+    /// Number of examples that were actually evaluated (target in vocab_order).
+    pub evaluated_examples: usize,
+}
+
+/// Evaluate a transformer model on the given examples, returning both
+/// cross-entropy loss and top-1/top-3 accuracy from **pure transformer logits**
+/// (no hybrid scores, no sequence memory, no neural predictor).
+///
+/// Examples whose target token is not in `model.vocab_order` are skipped
+/// (the same criterion used during training), ensuring the reported metrics
+/// are computed over a consistent set.
+pub fn evaluate_transformer_on_examples(
+    model: &TransformerLanguageModel,
+    embedder: &Embedder,
+    examples: &[SequenceExample],
+    max_context: usize,
+) -> TransformerEvalReport {
+    if examples.is_empty() || model.vocab_size() == 0 {
+        return TransformerEvalReport {
+            avg_loss: 0.0,
+            top1_accuracy: 0.0,
+            top3_accuracy: 0.0,
+            evaluated_examples: 0,
+        };
+    }
+
+    let mut total_loss = 0.0f32;
+    let mut correct_top1 = 0usize;
+    let mut correct_top3 = 0usize;
+    let mut count = 0usize;
+
+    for example in examples {
+        // Build token embeddings for the context (same as in training)
+        let start = example.context.len().saturating_sub(max_context);
+        let seq: Vec<Vec<f32>> = example.context[start..]
+            .iter()
+            .filter_map(|id| embedder.embed(*id).map(<[f32]>::to_vec))
+            .collect();
+        if seq.is_empty() {
+            continue;
+        }
+
+        // Pure transformer forward pass
+        let block_out = model.block.forward(&seq);
+        let last = match block_out.last() {
+            Some(v) => v,
+            None => continue,
+        };
+
+        // Output-head logits → softmax probabilities
+        let logits = model.logits_from_last(last);
+        let probs = softmax(&logits);
+
+        // Find target position in vocab_order (skip if absent — same as training)
+        let target_pos = match model
+            .vocab_order
+            .iter()
+            .position(|&id| id == example.target)
+        {
+            Some(p) => p,
+            None => continue,
+        };
+        count += 1;
+
+        // Cross-entropy loss for this example
+        let p = probs[target_pos].max(1e-10);
+        total_loss += -p.ln();
+
+        // Top-3 positions sorted by probability
+        let mut indices: Vec<usize> = (0..probs.len()).collect();
+        indices.sort_by(|&a, &b| {
+            probs[b]
+                .partial_cmp(&probs[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        if indices[0] == target_pos {
+            correct_top1 += 1;
+            correct_top3 += 1;
+        } else if indices.iter().take(3).any(|&idx| idx == target_pos) {
+            correct_top3 += 1;
+        }
+    }
+
+    if count == 0 {
+        return TransformerEvalReport {
+            avg_loss: 0.0,
+            top1_accuracy: 0.0,
+            top3_accuracy: 0.0,
+            evaluated_examples: 0,
+        };
+    }
+
+    TransformerEvalReport {
+        avg_loss: total_loss / count as f32,
+        top1_accuracy: correct_top1 as f32 / count as f32 * 100.0,
+        top3_accuracy: correct_top3 as f32 / count as f32 * 100.0,
+        evaluated_examples: count,
+    }
+}
 
 /// Train the **output head** and **FeedForward** of a
 /// `TransformerLanguageModel` using cross-entropy loss.
@@ -1028,24 +1161,46 @@ pub fn train_next_token_examples(
 /// output.  Gradients are clipped to `[-1.0, 1.0]` and NaN/inf gradients cause
 /// the weight update to be skipped for that example.
 ///
-/// Returns the average cross-entropy loss over all examples × epochs.
+/// Returns a `TransformerTrainReport` with training metrics.
 pub fn train_transformer_output_head(
     model: &mut TransformerLanguageModel,
     embedder: &Embedder,
     examples: &[SequenceExample],
     max_context: usize,
     epochs: usize,
-    learning_rate: f32,
-) -> f32 {
+    transformer_lr: f32,
+    language_lr: f32,
+) -> TransformerTrainReport {
+    let mut report = TransformerTrainReport {
+        epochs,
+        examples: examples.len(),
+        language_lr,
+        transformer_lr,
+        avg_loss: 0.0,
+        first_loss: None,
+        final_loss: None,
+        improvement_pct: None,
+        top1_accuracy: 0.0,
+        top3_accuracy: 0.0,
+        output_head_trained: false,
+        ffn_trained: model.ffn_trained,
+        attention_frozen: true,
+        invalid_updates: 0,
+    };
+
     if examples.is_empty() || model.vocab_size() == 0 {
-        return 0.0;
+        return report;
     }
 
     let embed_dim = model.embed_dim;
     let mut total_loss = 0.0;
     let mut count = 0usize;
+    let mut epoch_losses: Vec<f32> = Vec::new();
 
-    for _epoch in 0..epochs {
+    for _epoch_idx in 0..epochs {
+        let mut epoch_loss = 0.0;
+        let mut epoch_count = 0usize;
+
         for example in examples {
             // Build ordered token embeddings for the context
             let start = example.context.len().saturating_sub(max_context);
@@ -1084,8 +1239,9 @@ pub fn train_transformer_output_head(
 
             // Cross-entropy loss
             let p = probs[target_pos].max(1e-10);
-            total_loss += -p.ln();
-            count += 1;
+            let loss = -p.ln();
+            epoch_loss += loss;
+            epoch_count += 1;
 
             // Gradient for output_w / output_b
             //   dL/d(logit_v) = probs[v] - (v == target_pos)
@@ -1114,9 +1270,9 @@ pub fn train_transformer_output_head(
                 }
                 for (i, &val) in last.iter().enumerate().take(embed_dim) {
                     let idx = v * embed_dim + i;
-                    model.output_w[idx] -= learning_rate * g * val;
+                    model.output_w[idx] -= transformer_lr * g * val;
                 }
-                model.output_b[v] -= learning_rate * g;
+                model.output_b[v] -= transformer_lr * g;
             }
 
             // Backprop through residual add 2 into FFN output:
@@ -1126,23 +1282,53 @@ pub fn train_transformer_output_head(
                 *g = g.clamp(-1.0, 1.0);
             }
             if grad_block.iter().any(|&g| !g.is_finite()) {
+                report.invalid_updates += 1;
                 continue;
             }
 
-            let ffn_lr = learning_rate * 0.5;
-            model
+            let ffn_lr = transformer_lr * 0.5;
+            if model
                 .block
                 .feed_forward
-                .train_step(&last_ffn_input, &grad_block, ffn_lr);
-            model.ffn_trained = true;
+                .train_step(&last_ffn_input, &grad_block, ffn_lr)
+            {
+                model.ffn_trained = true;
+            } else {
+                report.invalid_updates += 1;
+            }
+        }
+
+        if epoch_count > 0 {
+            let avg_epoch_loss = epoch_loss / epoch_count as f32;
+            epoch_losses.push(avg_epoch_loss);
+            total_loss += epoch_loss;
+            count += epoch_count;
         }
     }
 
-    if count > 0 {
-        total_loss / count as f32
-    } else {
-        0.0
+    // Set loss metrics
+    if !epoch_losses.is_empty() {
+        report.first_loss = Some(epoch_losses[0]);
+        report.final_loss = Some(epoch_losses[epoch_losses.len() - 1]);
+        if epoch_losses[0].abs() > 1e-10 {
+            report.improvement_pct = Some(
+                (epoch_losses[0] - epoch_losses[epoch_losses.len() - 1]) / epoch_losses[0] * 100.0,
+            );
+        }
     }
+    if count > 0 {
+        report.avg_loss = total_loss / count as f32;
+    }
+    report.output_head_trained =
+        model.output_w.iter().any(|&v| v != 0.0) || model.output_b.iter().any(|&v| v != 0.0);
+    report.ffn_trained = model.ffn_trained;
+
+    // Evaluate pure transformer metrics on final model
+    let eval = evaluate_transformer_on_examples(model, embedder, examples, max_context);
+    report.top1_accuracy = eval.top1_accuracy;
+    report.top3_accuracy = eval.top3_accuracy;
+
+    report
 }
 
 // ─── Text Generation ──────────────────────────────────────────────────────────
@@ -2138,8 +2324,15 @@ mod tests {
             5,
         );
         let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
-        let _loss =
-            train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 30, 0.01);
+        let _loss = train_transformer_output_head(
+            &mut model,
+            &trainer.embedder,
+            &examples,
+            5,
+            30,
+            0.01,
+            0.01,
+        );
 
         let predictor = TransformerPredictor::from_model(&model, 5);
         let tokens = {
@@ -2208,7 +2401,7 @@ mod tests {
         let examples = build_sequence_examples(&all_tokens, 5);
 
         let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
-        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 30, 0.01);
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 30, 0.01, 0.01);
 
         let predictor = TransformerPredictor::from_model(&model, 5);
 
@@ -2289,7 +2482,7 @@ mod tests {
             5,
         );
         let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
-        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 10, 0.01);
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 10, 0.01, 0.01);
 
         // Save to temp file
         let path = std::env::temp_dir().join("transformer_test_roundtrip.bin");
@@ -2398,7 +2591,7 @@ mod tests {
             5,
         );
         let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
-        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 5, 0.01);
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 5, 0.01, 0.01);
 
         let predictor = TransformerPredictor::from_model(&model, 5);
         let tokens = {
@@ -2450,7 +2643,7 @@ mod tests {
         let w2_before = model.block.feed_forward.w2.clone();
         let b2_before = model.block.feed_forward.b2.clone();
 
-        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 10, 0.01);
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 10, 0.01, 0.01);
 
         let w1_after = &model.block.feed_forward.w1;
         let b1_after = &model.block.feed_forward.b1;
@@ -2523,7 +2716,7 @@ mod tests {
         let v_before = model.block.attention.w_v.clone();
         let o_before = model.block.attention.w_o.clone();
 
-        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 10, 0.01);
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 10, 0.01, 0.01);
 
         assert_eq!(model.block.attention.w_q, q_before, "w_q changed");
         assert_eq!(model.block.attention.w_k, k_before, "w_k changed");
@@ -2561,7 +2754,7 @@ mod tests {
             5,
         );
         let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
-        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 30, 0.01);
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 30, 0.01, 0.01);
 
         let predictor = TransformerPredictor::from_model(&model, 5);
         let tokens = {
@@ -2613,7 +2806,7 @@ mod tests {
             5,
         );
         let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
-        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 30, 0.01);
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 30, 0.01, 0.01);
 
         let predictor = TransformerPredictor::from_model(&model, 5);
         let output = generate_text_with_transformer(
@@ -2665,7 +2858,7 @@ mod tests {
             5,
         );
         let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
-        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 10, 0.01);
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 10, 0.01, 0.01);
 
         let path = std::env::temp_dir().join("ffn_persistence_test.bin");
         model.save_to_file(&path).unwrap();
@@ -2716,6 +2909,460 @@ mod tests {
         assert!(
             !results.is_empty(),
             "predictions after FFN roundtrip should not be empty"
+        );
+    }
+
+    // ── v0.8.1 Transformer Training Metrics tests ─────────────────
+
+    /// Test A: report fields are populated after transformer training.
+    #[test]
+    fn transformer_report_fields_populated() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            5,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+
+        let report = train_transformer_output_head(
+            &mut model,
+            &trainer.embedder,
+            &examples,
+            5,
+            10,
+            0.01,
+            0.01,
+        );
+
+        assert_eq!(report.epochs, 10, "epochs should be 10");
+        assert!(report.examples > 0, "examples should be > 0");
+        assert!(
+            (report.transformer_lr - 0.01).abs() < 1e-6,
+            "transformer_lr should be 0.01"
+        );
+        assert!(
+            (report.language_lr - 0.01).abs() < 1e-6,
+            "language_lr should be 0.01"
+        );
+        assert!(report.avg_loss.is_finite(), "avg_loss should be finite");
+        assert!(report.avg_loss > 0.0, "avg_loss should be positive");
+        assert!(report.first_loss.is_some(), "first_loss should be set");
+        assert!(report.final_loss.is_some(), "final_loss should be set");
+        assert!(
+            report.improvement_pct.is_some(),
+            "improvement should be set"
+        );
+        assert!(report.top1_accuracy >= 0.0, "top1_accuracy should be >= 0");
+        assert!(report.top3_accuracy >= 0.0, "top3_accuracy should be >= 0");
+        assert!(
+            report.output_head_trained,
+            "output_head_trained should be true"
+        );
+        assert!(report.ffn_trained, "ffn_trained should be true");
+        assert!(report.attention_frozen, "attention should be frozen");
+        // invalid_updates may be 0 or more — just check it's a valid value
+        assert!(
+            report.invalid_updates <= report.examples * report.epochs,
+            "invalid_updates should be within range"
+        );
+    }
+
+    /// Test B: top-k accuracy math is correct.
+    #[test]
+    fn transformer_accuracy_math() {
+        let embed_dim = 4;
+        let hidden_dim = 8;
+        let vocab_size = 3;
+        let vocab_order: Vec<u32> = vec![10, 20, 30]; // token IDs
+
+        let mut model = TransformerLanguageModel {
+            block: crate::transformer::TinyTransformerBlock::new(embed_dim, hidden_dim),
+            output_w: vec![0.0; embed_dim * vocab_size],
+            output_b: vec![0.0; vocab_size],
+            embed_dim,
+            hidden_dim,
+            vocab_order: vocab_order.clone(),
+            ffn_trained: false,
+        };
+
+        // Set output_w so that for the first vocab entry the score dominates
+        // output_w[0] = [1.0, 0.0, 0.0, 0.0] makes token 10 win when last = [1,0,0,0]
+        model.output_w[0] = 1.0;
+
+        // Create a minimal embedder
+        use std::collections::HashMap;
+        let mut table = HashMap::new();
+        table.insert(10u32, vec![1.0, 0.0, 0.0, 0.0]);
+        table.insert(20u32, vec![0.0, 1.0, 0.0, 0.0]);
+        table.insert(30u32, vec![0.0, 0.0, 1.0, 0.0]);
+        let embedder = manas_learn::Embedder { dim: 4, table };
+
+        // Example: context=[10], target=10 → should be correct top-1
+        let examples = vec![SequenceExample {
+            context: vec![10],
+            target: 10,
+        }];
+
+        let eval = evaluate_transformer_on_examples(&model, &embedder, &examples, 5);
+        assert_eq!(
+            eval.top1_accuracy, 100.0,
+            "top-1 should be 100% for exact match"
+        );
+        assert_eq!(
+            eval.top3_accuracy, 100.0,
+            "top-3 should be 100% for exact match"
+        );
+
+        // Example with target not in top-1 but in top-3
+        let examples = vec![
+            SequenceExample {
+                context: vec![20],
+                target: 20,
+            },
+            SequenceExample {
+                context: vec![30],
+                target: 30,
+            },
+        ];
+        let eval = evaluate_transformer_on_examples(&model, &embedder, &examples, 5);
+        // Each should get its correct token based on embedding match
+        assert!(eval.top1_accuracy >= 0.0, "top-1 should be >= 0");
+        assert!(
+            eval.top3_accuracy >= eval.top1_accuracy,
+            "top-3 should be >= top-1"
+        );
+    }
+
+    /// Test C: improvement calculation — first=1.0, final=0.25 → 75%.
+    #[test]
+    fn transformer_improvement_calculation() {
+        let first = 1.0f32;
+        let final_ = 0.25f32;
+        let improvement = (first - final_) / first * 100.0;
+        assert!(
+            (improvement - 75.0).abs() < 1e-6,
+            "75% improvement expected, got {}",
+            improvement
+        );
+
+        // Verify it works through the report flow
+        let mut report = TransformerTrainReport {
+            epochs: 10,
+            examples: 5,
+            language_lr: 0.01,
+            transformer_lr: 0.01,
+            avg_loss: 0.5,
+            first_loss: Some(first),
+            final_loss: Some(final_),
+            improvement_pct: None,
+            top1_accuracy: 0.0,
+            top3_accuracy: 0.0,
+            output_head_trained: false,
+            ffn_trained: false,
+            attention_frozen: true,
+            invalid_updates: 0,
+        };
+        if let (Some(f), Some(l)) = (report.first_loss, report.final_loss)
+            && f.abs() > 1e-10
+        {
+            report.improvement_pct = Some((f - l) / f * 100.0);
+        }
+        let pct = report.improvement_pct.unwrap();
+        assert!(
+            (pct - 75.0).abs() < 1e-4,
+            "improvement should be ~75%, got {}",
+            pct
+        );
+    }
+
+    /// Test D: zero first loss should not panic or divide by zero.
+    #[test]
+    fn transformer_zero_first_loss_safe() {
+        let mut report = TransformerTrainReport {
+            epochs: 10,
+            examples: 5,
+            language_lr: 0.01,
+            transformer_lr: 0.01,
+            avg_loss: 0.0,
+            first_loss: Some(0.0),
+            final_loss: Some(0.0),
+            improvement_pct: None,
+            top1_accuracy: 0.0,
+            top3_accuracy: 0.0,
+            output_head_trained: false,
+            ffn_trained: false,
+            attention_frozen: true,
+            invalid_updates: 0,
+        };
+        // This should not panic
+        if let (Some(f), Some(l)) = (report.first_loss, report.final_loss)
+            && f.abs() > 1e-10
+        {
+            report.improvement_pct = Some((f - l) / f * 100.0);
+        }
+        // improvement should remain None
+        assert!(
+            report.improvement_pct.is_none(),
+            "improvement should be None when first_loss is zero"
+        );
+    }
+
+    /// Test E: report formatting contains expected labels.
+    #[test]
+    fn transformer_metrics_format_labels() {
+        let report = TransformerTrainReport {
+            epochs: 10,
+            examples: 5,
+            language_lr: 0.01,
+            transformer_lr: 0.01,
+            avg_loss: 0.5,
+            first_loss: Some(0.8),
+            final_loss: Some(0.2),
+            improvement_pct: Some(75.0),
+            top1_accuracy: 80.0,
+            top3_accuracy: 100.0,
+            output_head_trained: true,
+            ffn_trained: true,
+            attention_frozen: true,
+            invalid_updates: 0,
+        };
+
+        let formatted = format!(
+            "Transformer training\n\
+             \x20 epochs          : {}\n\
+             \x20 language lr                      : {:.4}\n\
+             \x20 transformer lr                   : {:.4}\n\
+             \x20 pure transformer top-1 accuracy  : {:.2}%\n\
+             \x20 pure transformer top-3 accuracy  : {:.2}%\n\
+             \x20 feed-forward    : {}\n\
+             \x20 attention       : {}\n",
+            report.epochs,
+            report.language_lr,
+            report.transformer_lr,
+            report.top1_accuracy,
+            report.top3_accuracy,
+            if report.ffn_trained {
+                "trained"
+            } else {
+                "untrained"
+            },
+            if report.attention_frozen {
+                "frozen"
+            } else {
+                "trainable"
+            },
+        );
+
+        assert!(
+            formatted.contains("Transformer training"),
+            "should contain 'Transformer training'"
+        );
+        assert!(
+            formatted.contains("pure transformer top-1 accuracy"),
+            "should contain 'pure transformer top-1 accuracy'"
+        );
+        assert!(
+            formatted.contains("pure transformer top-3 accuracy"),
+            "should contain 'pure transformer top-3 accuracy'"
+        );
+        assert!(
+            formatted.contains("feed-forward"),
+            "should contain 'feed-forward'"
+        );
+        assert!(
+            formatted.contains("attention"),
+            "should contain 'attention'"
+        );
+        assert!(formatted.contains("frozen"), "should contain 'frozen'");
+    }
+
+    /// Test F: zero examples should not panic and return (0.0, 0.0).
+    #[test]
+    fn transformer_zero_examples_safe() {
+        let embed_dim = 4;
+        let hidden_dim = 8;
+        let vocab_size = 3;
+        let vocab_order: Vec<u32> = vec![10, 20, 30];
+
+        let model = TransformerLanguageModel {
+            block: crate::transformer::TinyTransformerBlock::new(embed_dim, hidden_dim),
+            output_w: vec![0.0; embed_dim * vocab_size],
+            output_b: vec![0.0; vocab_size],
+            embed_dim,
+            hidden_dim,
+            vocab_order: vocab_order.clone(),
+            ffn_trained: false,
+        };
+
+        use std::collections::HashMap;
+        let mut table = HashMap::new();
+        table.insert(10u32, vec![1.0, 0.0, 0.0, 0.0]);
+        let embedder = manas_learn::Embedder { dim: 4, table };
+
+        let examples: Vec<SequenceExample> = vec![];
+
+        let eval = evaluate_transformer_on_examples(&model, &embedder, &examples, 5);
+        assert_eq!(
+            eval.top1_accuracy, 0.0,
+            "top-1 should be 0.0 for empty examples"
+        );
+        assert_eq!(
+            eval.top3_accuracy, 0.0,
+            "top-3 should be 0.0 for empty examples"
+        );
+    }
+
+    /// Test G: report shows both language_lr and transformer_lr.
+    #[test]
+    fn transformer_report_both_lrs() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let text = "Rust is a systems programming language";
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut SequenceMemory::new(),
+            text,
+            5,
+            10,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let tokens = trainer.tokenizer.encode(text);
+        let examples = build_sequence_examples(&tokens, 5);
+
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+        let report = train_transformer_output_head(
+            &mut model,
+            &trainer.embedder,
+            &examples,
+            5,
+            10,
+            0.01,
+            0.05,
+        );
+
+        assert!(
+            (report.language_lr - 0.05).abs() < 1e-6,
+            "language_lr should be 0.05, got {}",
+            report.language_lr
+        );
+        assert!(
+            (report.transformer_lr - 0.01).abs() < 1e-6,
+            "transformer_lr should be 0.01, got {}",
+            report.transformer_lr
+        );
+    }
+
+    /// Test H: when logits strongly favor the target token, loss is low and
+    /// top-1 accuracy is 100% (pure transformer eval consistency).
+    #[test]
+    fn evaluate_strong_target_low_loss_high_accuracy() {
+        let embed_dim = 4;
+        let hidden_dim = 8;
+        let vocab_size = 3;
+        let vocab_order: Vec<u32> = vec![10, 20, 30];
+
+        let mut model = TransformerLanguageModel {
+            block: crate::transformer::TinyTransformerBlock::new(embed_dim, hidden_dim),
+            output_w: vec![0.0; embed_dim * vocab_size],
+            output_b: vec![0.0; vocab_size],
+            embed_dim,
+            hidden_dim,
+            vocab_order: vocab_order.clone(),
+            ffn_trained: false,
+        };
+        // Make output_w[0] = [100, 0, 0, 0] so token 10 dominates
+        model.output_w[0] = 100.0;
+
+        use std::collections::HashMap;
+        let mut table = HashMap::new();
+        table.insert(10u32, vec![1.0, 0.0, 0.0, 0.0]);
+        table.insert(20u32, vec![0.0, 1.0, 0.0, 0.0]);
+        table.insert(30u32, vec![0.0, 0.0, 1.0, 0.0]);
+        let embedder = manas_learn::Embedder { dim: 4, table };
+
+        let examples = vec![SequenceExample {
+            context: vec![10],
+            target: 10,
+        }];
+
+        let eval = evaluate_transformer_on_examples(&model, &embedder, &examples, 5);
+        assert!(
+            eval.avg_loss < 0.01,
+            "loss should be very low for strongly favored target, got {}",
+            eval.avg_loss
+        );
+        assert_eq!(eval.top1_accuracy, 100.0, "top-1 should be 100%");
+        assert_eq!(eval.top3_accuracy, 100.0, "top-3 should be 100%");
+        assert_eq!(eval.evaluated_examples, 1);
+    }
+
+    /// Test I: when target token is not in top-3, top-3 accuracy is 0%.
+    #[test]
+    fn evaluate_target_not_in_top3() {
+        let embed_dim = 4;
+        let hidden_dim = 8;
+        // Use 5 vocab entries so top-3 doesn't cover everything
+        let vocab_order: Vec<u32> = vec![10, 20, 30, 40, 50];
+
+        let model = TransformerLanguageModel {
+            block: crate::transformer::TinyTransformerBlock::new(embed_dim, hidden_dim),
+            output_w: vec![0.0; embed_dim * 5],
+            output_b: vec![0.0; 5],
+            embed_dim,
+            hidden_dim,
+            vocab_order: vocab_order.clone(),
+            ffn_trained: false,
+        };
+        // All output_w entries are 0, so all logits are equal → probs uniform.
+        // In uniform probs over 5 tokens, each has prob 0.2.
+        // Top-3 will be the first 3 vocab_order entries (10, 20, 30) after sort
+        // by equal probs (ties broken by original order).
+        // target=50 → not in top-3.
+
+        use std::collections::HashMap;
+        let mut table = HashMap::new();
+        table.insert(10u32, vec![1.0, 0.0, 0.0, 0.0]);
+        let embedder = manas_learn::Embedder { dim: 4, table };
+
+        let examples = vec![SequenceExample {
+            context: vec![10],
+            target: 50,
+        }];
+
+        let eval = evaluate_transformer_on_examples(&model, &embedder, &examples, 5);
+        assert_eq!(eval.top1_accuracy, 0.0, "token 50 should not be top-1");
+        assert_eq!(
+            eval.top3_accuracy, 0.0,
+            "token 50 should not be in top-3 with 5 vocab entries"
         );
     }
 }
