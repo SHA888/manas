@@ -5,6 +5,14 @@ Cargo.lock
 # Manas brain file
 *.manas
 brain.manas
+*.manas.langmeta
+brain.manas.langmeta
+*.manas.seq
+brain.manas.seq
+*.manas.transformer
+brain.manas.transformer
+
+
 
 # Editor and OS files
 *.swp

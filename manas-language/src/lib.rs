@@ -984,6 +984,8 @@ pub struct TransformerTrainReport {
     pub output_head_trained: bool,
     pub ffn_trained: bool,
     pub attention_frozen: bool,
+    pub attention_trained: bool,
+    pub attention_projection_o_trained: bool,
     pub invalid_updates: usize,
     // v0.8.2 safety fields
     pub max_gradient_norm_seen: f32,
@@ -1341,7 +1343,9 @@ pub fn train_transformer_output_head_with_safety(
         top3_accuracy: 0.0,
         output_head_trained: false,
         ffn_trained: model.ffn_trained,
-        attention_frozen: true,
+        attention_frozen: !model.attention_trained,
+        attention_trained: model.attention_trained,
+        attention_projection_o_trained: model.attention_trained,
         invalid_updates: 0,
         max_gradient_norm_seen: 0.0,
         avg_gradient_norm: 0.0,
@@ -1383,13 +1387,18 @@ pub fn train_transformer_output_head_with_safety(
                 continue;
             }
 
-            // Forward through transformer block (attention frozen, FFN cached)
-            let (block_out, ffn_inputs) = model.block.forward_with_ffn_inputs(&seq);
+            // Forward through transformer block (attention cached for w_o training)
+            let (block_out, ffn_inputs, attention_cache) =
+                model.block.forward_with_training_cache(&seq);
             let last = match block_out.last() {
                 Some(v) => v.clone(),
                 None => continue,
             };
             let last_ffn_input = match ffn_inputs.last() {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            let last_attention_context = match attention_cache.weighted_values.last() {
                 Some(v) => v.clone(),
                 None => continue,
             };
@@ -1497,15 +1506,56 @@ pub fn train_transformer_output_head_with_safety(
             if clip_by_norm(&mut grad_block, safety.max_gradient_norm) {
                 report.clipped_updates += 1;
             }
+            let grad_residual = grad_block.clone();
 
             let ffn_lr = transformer_lr * 0.5;
-            if model
-                .block
-                .feed_forward
-                .train_step(&last_ffn_input, &grad_block, ffn_lr)
-            {
+            let ffn_report = model.block.feed_forward.train_step_with_input_gradient(
+                &last_ffn_input,
+                &grad_block,
+                ffn_lr,
+            );
+            if ffn_report.applied {
                 model.ffn_trained = true;
             } else {
+                report.invalid_updates += 1;
+                continue;
+            }
+
+            let mut grad_attention_output = grad_residual;
+            for (g, ffn_g) in grad_attention_output
+                .iter_mut()
+                .zip(ffn_report.grad_input.iter())
+            {
+                *g += ffn_g;
+            }
+            if grad_attention_output.iter().any(|&g| !g.is_finite()) {
+                report.invalid_updates += 1;
+                continue;
+            }
+
+            let attention_lr = transformer_lr * 0.5;
+            let attention_report = model.block.attention.train_output_projection_step(
+                &last_attention_context,
+                &grad_attention_output,
+                attention_lr,
+                safety.max_gradient_norm,
+            );
+            if attention_report.grad_norm.is_finite() {
+                if attention_report.grad_norm > report.max_gradient_norm_seen {
+                    report.max_gradient_norm_seen = attention_report.grad_norm;
+                }
+                grad_norm_sum += attention_report.grad_norm;
+                grad_norm_count += 1;
+            }
+            if attention_report.clipped {
+                report.clipped_updates += 1;
+            }
+            if attention_report.applied {
+                model.attention_trained = true;
+                report.attention_frozen = false;
+                report.attention_trained = true;
+                report.attention_projection_o_trained = true;
+            } else if attention_report.invalid {
                 report.invalid_updates += 1;
             }
         }
@@ -1567,6 +1617,9 @@ pub fn train_transformer_output_head_with_safety(
     report.output_head_trained =
         model.output_w.iter().any(|&v| v != 0.0) || model.output_b.iter().any(|&v| v != 0.0);
     report.ffn_trained = model.ffn_trained;
+    report.attention_trained = model.attention_trained;
+    report.attention_projection_o_trained = model.attention_trained;
+    report.attention_frozen = !model.attention_trained;
 
     report
 }
@@ -3064,9 +3117,9 @@ mod tests {
         assert!(model.ffn_trained, "ffn_trained flag should be set");
     }
 
-    /// Test B: Attention Q/K/V/O stay frozen after training.
+    /// Test B: Attention Q/K/V stay frozen and w_o changes after training.
     #[test]
-    fn attention_stays_frozen() {
+    fn qkv_remain_frozen_when_training_w_o() {
         let mut network = Network::new();
         let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
         let mut seq_memory = SequenceMemory::new();
@@ -3105,7 +3158,163 @@ mod tests {
         assert_eq!(model.block.attention.w_q, q_before, "w_q changed");
         assert_eq!(model.block.attention.w_k, k_before, "w_k changed");
         assert_eq!(model.block.attention.w_v, v_before, "w_v changed");
-        assert_eq!(model.block.attention.w_o, o_before, "w_o changed");
+        assert_ne!(model.block.attention.w_o, o_before, "w_o did not change");
+        assert!(
+            model.attention_trained,
+            "attention_trained should be set after w_o update"
+        );
+        assert!(is_finite_model(&model), "model should remain finite");
+    }
+
+    #[test]
+    fn w_o_changes_after_transformer_training() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            5,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+        let o_before = model.block.attention.w_o.clone();
+
+        let report = train_transformer_output_head(
+            &mut model,
+            &trainer.embedder,
+            &examples,
+            5,
+            10,
+            0.01,
+            0.01,
+        );
+
+        assert_ne!(model.block.attention.w_o, o_before, "w_o should change");
+        assert!(
+            report.attention_projection_o_trained,
+            "report should mark projection o as trained"
+        );
+        assert!(
+            model.attention_trained,
+            "model should mark attention as partially trained"
+        );
+    }
+
+    #[test]
+    fn finite_model_after_w_o_training() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            5,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 10, 0.01, 0.01);
+
+        assert!(is_finite_model(&model), "model should remain finite");
+    }
+
+    #[test]
+    fn w_o_persistence_roundtrip() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            5,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+        let q_before = model.block.attention.w_q.clone();
+        let k_before = model.block.attention.w_k.clone();
+        let v_before = model.block.attention.w_v.clone();
+        let o_before = model.block.attention.w_o.clone();
+
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 10, 0.01, 0.01);
+
+        let path = temp_test_path("w_o_persistence_roundtrip.bin");
+        model.save_to_file(&path).unwrap();
+        let loaded = TransformerLanguageModel::load_from_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_ne!(
+            loaded.block.attention.w_o, o_before,
+            "w_o should persist changed values"
+        );
+        assert_eq!(loaded.block.attention.w_o, model.block.attention.w_o);
+        assert_eq!(
+            loaded.block.attention.w_q, q_before,
+            "w_q should remain frozen"
+        );
+        assert_eq!(
+            loaded.block.attention.w_k, k_before,
+            "w_k should remain frozen"
+        );
+        assert_eq!(
+            loaded.block.attention.w_v, v_before,
+            "w_v should remain frozen"
+        );
+        assert!(
+            loaded.attention_trained,
+            "partial attention training flag should persist"
+        );
     }
 
     /// Test C: Prediction still works after FFN training.
@@ -3364,7 +3573,15 @@ mod tests {
             "output_head_trained should be true"
         );
         assert!(report.ffn_trained, "ffn_trained should be true");
-        assert!(report.attention_frozen, "attention should be frozen");
+        assert!(
+            !report.attention_frozen,
+            "attention should be partially trained"
+        );
+        assert!(report.attention_trained, "attention_trained should be true");
+        assert!(
+            report.attention_projection_o_trained,
+            "w_o should be marked trained"
+        );
         // invalid_updates may be 0 or more — just check it's a valid value
         assert!(
             report.invalid_updates <= report.examples * report.epochs,
@@ -3466,6 +3683,8 @@ mod tests {
             output_head_trained: false,
             ffn_trained: false,
             attention_frozen: true,
+            attention_trained: false,
+            attention_projection_o_trained: false,
             invalid_updates: 0,
             max_gradient_norm_seen: 0.0,
             avg_gradient_norm: 0.0,
@@ -3503,6 +3722,8 @@ mod tests {
             output_head_trained: false,
             ffn_trained: false,
             attention_frozen: true,
+            attention_trained: false,
+            attention_projection_o_trained: false,
             invalid_updates: 0,
             max_gradient_norm_seen: 0.0,
             avg_gradient_norm: 0.0,
@@ -3540,7 +3761,9 @@ mod tests {
             top3_accuracy: 100.0,
             output_head_trained: true,
             ffn_trained: true,
-            attention_frozen: true,
+            attention_frozen: false,
+            attention_trained: true,
+            attention_projection_o_trained: true,
             invalid_updates: 0,
             max_gradient_norm_seen: 0.0,
             avg_gradient_norm: 0.0,
@@ -3557,7 +3780,8 @@ mod tests {
              \x20 pure transformer top-1 accuracy  : {:.2}%\n\
              \x20 pure transformer top-3 accuracy  : {:.2}%\n\
              \x20 feed-forward    : {}\n\
-             \x20 attention       : {}\n",
+             \x20 attention       : {}\n\
+             \x20 attention projections : {}\n",
             report.epochs,
             report.language_lr,
             report.transformer_lr,
@@ -3570,8 +3794,15 @@ mod tests {
             },
             if report.attention_frozen {
                 "frozen"
+            } else if report.attention_projection_o_trained {
+                "partially trained"
             } else {
                 "trainable"
+            },
+            if report.attention_projection_o_trained {
+                "o"
+            } else {
+                "none"
             },
         );
 
@@ -3595,7 +3826,15 @@ mod tests {
             formatted.contains("attention"),
             "should contain 'attention'"
         );
-        assert!(formatted.contains("frozen"), "should contain 'frozen'");
+        assert!(
+            formatted.contains("partially trained"),
+            "should contain 'partially trained'"
+        );
+        assert!(
+            formatted.contains("attention projections"),
+            "should contain 'attention projections'"
+        );
+        assert!(formatted.contains("o"), "should contain projection 'o'");
     }
 
     /// Test F: zero examples should not panic and return (0.0, 0.0).
@@ -3842,6 +4081,7 @@ mod tests {
         // Simulate corruption
         let last = model.output_w.len() - 1;
         model.output_w[last] = f32::INFINITY;
+        model.block.attention.w_o[0] = f32::NAN;
         assert!(
             !is_finite_model(&model),
             "should be non-finite after corruption"
@@ -3852,6 +4092,15 @@ mod tests {
         // Verify weights are identical
         for (a, b) in model.output_w.iter().zip(snapshot.output_w.iter()) {
             assert!((a - b).abs() < 1e-6, "weights should match after rollback");
+        }
+        for (a, b) in model
+            .block
+            .attention
+            .w_o
+            .iter()
+            .zip(snapshot.block.attention.w_o.iter())
+        {
+            assert!((a - b).abs() < 1e-6, "w_o should match after rollback");
         }
     }
 

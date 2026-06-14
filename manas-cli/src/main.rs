@@ -721,8 +721,12 @@ fn cmd_inspect(verbose: bool, brain_path: &Path) -> Result<(), ManasError> {
             if tf_ffn_trained { "yes" } else { "no" }
         );
         println!(
-            "  Attention trained   : {}",
-            if tf_attention_trained { "yes" } else { "no" }
+            "  Attention trained     : {}",
+            format_inspect_attention_status(tf_attention_trained)
+        );
+        println!(
+            "  Attention projections : {}",
+            format_attention_projections(tf_attention_trained)
         );
         println!("  Attention params    : {}", attn_params);
         println!("  FFN params          : {}", ffn_params);
@@ -793,6 +797,31 @@ fn format_file_size(bytes: u64) -> String {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+fn format_inspect_attention_status(attention_trained: bool) -> &'static str {
+    if attention_trained { "partial" } else { "no" }
+}
+
+fn format_training_attention_status(
+    attention_frozen: bool,
+    attention_projection_o_trained: bool,
+) -> &'static str {
+    if attention_frozen {
+        "frozen"
+    } else if attention_projection_o_trained {
+        "partially trained"
+    } else {
+        "trainable"
+    }
+}
+
+fn format_attention_projections(attention_projection_o_trained: bool) -> &'static str {
+    if attention_projection_o_trained {
+        "o"
+    } else {
+        "none"
     }
 }
 
@@ -1230,6 +1259,7 @@ fn cmd_train_language(
              \x20 output head                      : {}\n\
              \x20 feed-forward                     : {}\n\
              \x20 attention                        : {}\n\
+             \x20 attention projections            : {}\n\
              \n\
              Training safety\n\
              \x20 max grad norm before clipping    : {:.4}\n\
@@ -1264,11 +1294,11 @@ fn cmd_train_language(
             } else {
                 "untrained"
             },
-            if tf_report.attention_frozen {
-                "frozen"
-            } else {
-                "trainable"
-            },
+            format_training_attention_status(
+                tf_report.attention_frozen,
+                tf_report.attention_projection_o_trained,
+            ),
+            format_attention_projections(tf_report.attention_projection_o_trained),
             tf_report.max_gradient_norm_seen,
             tf_report.avg_gradient_norm,
             tf_report.clipped_updates,
@@ -1488,6 +1518,25 @@ mod tests {
         let s = format_file_size(1048576);
         assert!(s.contains("1.00"), "expected 1.00 MB, got {}", s);
         assert!(s.contains("MB"), "expected MB, got {}", s);
+    }
+
+    #[test]
+    fn inspect_attention_formatting_shows_partial_o() {
+        assert_eq!(format_inspect_attention_status(false), "no");
+        assert_eq!(format_attention_projections(false), "none");
+        assert_eq!(format_inspect_attention_status(true), "partial");
+        assert_eq!(format_attention_projections(true), "o");
+    }
+
+    #[test]
+    fn training_attention_formatting_shows_partial_o() {
+        assert_eq!(format_training_attention_status(true, false), "frozen");
+        assert_eq!(format_training_attention_status(false, false), "trainable");
+        assert_eq!(
+            format_training_attention_status(false, true),
+            "partially trained"
+        );
+        assert_eq!(format_attention_projections(true), "o");
     }
 
     #[test]

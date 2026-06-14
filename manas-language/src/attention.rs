@@ -62,6 +62,15 @@ pub struct AttentionForwardCache {
     pub weighted_values: Vec<Vec<f32>>,
 }
 
+/// Result of one attention output-projection training step.
+#[derive(Clone, Debug)]
+pub struct AttentionTrainStepReport {
+    pub applied: bool,
+    pub clipped: bool,
+    pub invalid: bool,
+    pub grad_norm: f32,
+}
+
 impl CausalSelfAttention {
     /// Create a new attention module with small random weights.
     ///
@@ -196,6 +205,95 @@ impl CausalSelfAttention {
             full[j] = *w;
         }
         full
+    }
+
+    /// Train only the output projection `w_o`.
+    ///
+    /// `context` is the cached weighted value vector before `w_o`, and
+    /// `grad_output` is the gradient flowing into the attention output.
+    pub fn train_output_projection_step(
+        &mut self,
+        context: &[f32],
+        grad_output: &[f32],
+        learning_rate: f32,
+        max_grad_norm: f32,
+    ) -> AttentionTrainStepReport {
+        let d = self.embed_dim;
+        if d == 0
+            || context.len() != d
+            || grad_output.len() != d
+            || self.w_o.len() != d * d
+            || !learning_rate.is_finite()
+            || context.iter().any(|&v| !v.is_finite())
+            || grad_output.iter().any(|&v| !v.is_finite())
+        {
+            return AttentionTrainStepReport {
+                applied: false,
+                clipped: false,
+                invalid: true,
+                grad_norm: f32::NAN,
+            };
+        }
+
+        let mut grad_w_o = vec![0.0; d * d];
+        for (r, &go) in grad_output.iter().enumerate() {
+            let base = r * d;
+            for (c, &ctx) in context.iter().enumerate() {
+                grad_w_o[base + c] = go * ctx;
+            }
+        }
+
+        let grad_norm = vector_norm(&grad_w_o);
+        if !grad_norm.is_finite() || grad_w_o.iter().any(|&g| !g.is_finite()) {
+            return AttentionTrainStepReport {
+                applied: false,
+                clipped: false,
+                invalid: true,
+                grad_norm,
+            };
+        }
+
+        let clipped = clip_vector_by_norm(&mut grad_w_o, max_grad_norm);
+        let mut next_w_o = self.w_o.clone();
+        for (w, &g) in next_w_o.iter_mut().zip(grad_w_o.iter()) {
+            *w -= learning_rate * g;
+        }
+        if next_w_o.iter().any(|&w| !w.is_finite()) {
+            return AttentionTrainStepReport {
+                applied: false,
+                clipped,
+                invalid: true,
+                grad_norm,
+            };
+        }
+
+        self.w_o = next_w_o;
+        AttentionTrainStepReport {
+            applied: true,
+            clipped,
+            invalid: false,
+            grad_norm,
+        }
+    }
+}
+
+fn vector_norm(values: &[f32]) -> f32 {
+    values.iter().map(|&v| v * v).sum::<f32>().sqrt()
+}
+
+fn clip_vector_by_norm(values: &mut [f32], max_norm: f32) -> bool {
+    if max_norm <= 0.0 || values.is_empty() {
+        return false;
+    }
+    let norm = vector_norm(values);
+    if norm.is_finite() && norm > max_norm {
+        let scale = max_norm / norm;
+        for value in values {
+            *value *= scale;
+        }
+        true
+    } else {
+        false
     }
 }
 
@@ -410,5 +508,53 @@ mod tests {
                 assert_eq!(future_weight, 0.0, "future positions must stay masked");
             }
         }
+    }
+
+    #[test]
+    fn output_projection_step_updates_only_w_o() {
+        let mut attn = CausalSelfAttention::new(4);
+        let q_before = attn.w_q.clone();
+        let k_before = attn.w_k.clone();
+        let v_before = attn.w_v.clone();
+        let o_before = attn.w_o.clone();
+
+        let report = attn.train_output_projection_step(
+            &[1.0, 0.5, -0.25, 0.75],
+            &[0.2, -0.1, 0.3, 0.4],
+            0.05,
+            10.0,
+        );
+
+        assert!(report.applied, "w_o update should be applied");
+        assert!(!report.invalid, "w_o update should be valid");
+        assert_eq!(attn.w_q, q_before, "w_q must remain frozen");
+        assert_eq!(attn.w_k, k_before, "w_k must remain frozen");
+        assert_eq!(attn.w_v, v_before, "w_v must remain frozen");
+        assert_ne!(attn.w_o, o_before, "w_o should change");
+    }
+
+    #[test]
+    fn output_projection_step_reports_clipping() {
+        let mut attn = CausalSelfAttention::new(2);
+        let before = attn.w_o.clone();
+
+        let report = attn.train_output_projection_step(&[10.0, 10.0], &[10.0, -10.0], 0.01, 1.0);
+
+        assert!(report.applied, "clipped update should still apply");
+        assert!(report.clipped, "large gradient should be clipped");
+        assert!(report.grad_norm > 1.0, "pre-clip norm should be tracked");
+        assert_ne!(attn.w_o, before, "w_o should change after clipped update");
+    }
+
+    #[test]
+    fn output_projection_step_rejects_non_finite_gradient() {
+        let mut attn = CausalSelfAttention::new(2);
+        let before = attn.w_o.clone();
+
+        let report = attn.train_output_projection_step(&[1.0, 0.0], &[f32::NAN, 1.0], 0.01, 1.0);
+
+        assert!(!report.applied, "invalid update should not apply");
+        assert!(report.invalid, "non-finite gradient should be invalid");
+        assert_eq!(attn.w_o, before, "w_o must not change on invalid update");
     }
 }
