@@ -326,6 +326,9 @@ use crate::transformer::TinyTransformerBlock;
 // Magic constants for the transformer model sidecar file.
 const TRANSFORMER_FILE_MAGIC: u32 = 0x5452464C; // "TRFL"
 const TRANSFORMER_FILE_VERSION: u32 = 3;
+const ATTENTION_PROJECTION_O: u8 = 0b0000_0001;
+const ATTENTION_PROJECTION_V: u8 = 0b0000_0010;
+const ATTENTION_PROJECTION_KNOWN_MASK: u8 = ATTENTION_PROJECTION_O | ATTENTION_PROJECTION_V;
 
 /// Weight given to the transformer score when the output head is **untrained**
 /// (cosine-similarity fallback).
@@ -357,6 +360,8 @@ pub struct TransformerLanguageModel {
     pub ffn_trained: bool,
     /// Tracks whether attention projections have been trained.
     pub attention_trained: bool,
+    /// Bitmask of trained attention projections. v0.9.1 legacy files imply `o`.
+    pub attention_projection_mask: u8,
 }
 
 impl TransformerLanguageModel {
@@ -378,7 +383,26 @@ impl TransformerLanguageModel {
             vocab_order,
             ffn_trained: false,
             attention_trained: false,
+            attention_projection_mask: 0,
         }
+    }
+
+    pub fn attention_projection_o_trained(&self) -> bool {
+        self.attention_projection_mask & ATTENTION_PROJECTION_O != 0
+    }
+
+    pub fn attention_projection_v_trained(&self) -> bool {
+        self.attention_projection_mask & ATTENTION_PROJECTION_V != 0
+    }
+
+    fn mark_attention_projection_o_trained(&mut self) {
+        self.attention_projection_mask |= ATTENTION_PROJECTION_O;
+        self.attention_trained = true;
+    }
+
+    fn mark_attention_projection_v_trained(&mut self) {
+        self.attention_projection_mask |= ATTENTION_PROJECTION_V;
+        self.attention_trained = true;
     }
 
     /// Number of vocabulary entries in the output head.
@@ -493,6 +517,14 @@ impl TransformerLanguageModel {
         for &v in &attn.w_o {
             buf.extend_from_slice(&v.to_le_bytes());
         }
+        let projection_mask = if self.attention_projection_mask != 0 {
+            self.attention_projection_mask & ATTENTION_PROJECTION_KNOWN_MASK
+        } else if self.attention_trained {
+            ATTENTION_PROJECTION_O
+        } else {
+            0
+        };
+        buf.push(projection_mask);
 
         std::fs::write(path, &buf).map_err(|e| ManasError::FileReadError {
             path: path.to_path_buf(),
@@ -600,7 +632,7 @@ impl TransformerLanguageModel {
 
         // Attention weights (v0.9.0+). Older sidecars keep deterministic
         // freshly rebuilt attention weights.
-        let attention_trained = if version >= 3 {
+        let (attention_trained, attention_projection_mask) = if version >= 3 {
             let attention_trained = if cursor.first().copied().unwrap_or(0) != 0 {
                 cursor = &cursor[1..];
                 true
@@ -613,9 +645,16 @@ impl TransformerLanguageModel {
             block.attention.w_k = read_f32_vec(&mut cursor);
             block.attention.w_v = read_f32_vec(&mut cursor);
             block.attention.w_o = read_f32_vec(&mut cursor);
-            attention_trained
+            let projection_mask = if let Some(&mask) = cursor.first() {
+                mask & ATTENTION_PROJECTION_KNOWN_MASK
+            } else if attention_trained {
+                ATTENTION_PROJECTION_O
+            } else {
+                0
+            };
+            (attention_trained || projection_mask != 0, projection_mask)
         } else {
-            false
+            (false, 0)
         };
 
         Ok(TransformerLanguageModel {
@@ -627,6 +666,7 @@ impl TransformerLanguageModel {
             vocab_order,
             ffn_trained,
             attention_trained,
+            attention_projection_mask,
         })
     }
 }
@@ -986,6 +1026,7 @@ pub struct TransformerTrainReport {
     pub attention_frozen: bool,
     pub attention_trained: bool,
     pub attention_projection_o_trained: bool,
+    pub attention_projection_v_trained: bool,
     pub invalid_updates: usize,
     // v0.8.2 safety fields
     pub max_gradient_norm_seen: f32,
@@ -1318,6 +1359,42 @@ fn restore_model(model: &mut TransformerLanguageModel, snapshot: &TransformerLan
     *model = snapshot.clone();
 }
 
+fn transpose_mat_vec_mul(matrix: &[f32], rows: usize, cols: usize, input: &[f32]) -> Vec<f32> {
+    let mut out = vec![0.0; cols];
+    for r in 0..rows {
+        let input_value = input.get(r).copied().unwrap_or(0.0);
+        if input_value.abs() < 1e-10 {
+            continue;
+        }
+        let base = r * cols;
+        for c in 0..cols {
+            out[c] += matrix[base + c] * input_value;
+        }
+    }
+    out
+}
+
+fn record_attention_train_step(
+    report: &mut TransformerTrainReport,
+    grad_norm_sum: &mut f32,
+    grad_norm_count: &mut usize,
+    step: &crate::attention::AttentionTrainStepReport,
+) {
+    if step.grad_norm.is_finite() {
+        if step.grad_norm > report.max_gradient_norm_seen {
+            report.max_gradient_norm_seen = step.grad_norm;
+        }
+        *grad_norm_sum += step.grad_norm;
+        *grad_norm_count += 1;
+    }
+    if step.clipped {
+        report.clipped_updates += 1;
+    }
+    if step.invalid {
+        report.invalid_updates += 1;
+    }
+}
+
 /// Full training function with safety configuration.
 #[allow(clippy::too_many_arguments)]
 pub fn train_transformer_output_head_with_safety(
@@ -1345,7 +1422,8 @@ pub fn train_transformer_output_head_with_safety(
         ffn_trained: model.ffn_trained,
         attention_frozen: !model.attention_trained,
         attention_trained: model.attention_trained,
-        attention_projection_o_trained: model.attention_trained,
+        attention_projection_o_trained: model.attention_projection_o_trained(),
+        attention_projection_v_trained: model.attention_projection_v_trained(),
         invalid_updates: 0,
         max_gradient_norm_seen: 0.0,
         avg_gradient_norm: 0.0,
@@ -1399,6 +1477,10 @@ pub fn train_transformer_output_head_with_safety(
                 None => continue,
             };
             let last_attention_context = match attention_cache.weighted_values.last() {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            let last_attention_weights = match attention_cache.attention_weights.last() {
                 Some(v) => v.clone(),
                 None => continue,
             };
@@ -1534,29 +1616,56 @@ pub fn train_transformer_output_head_with_safety(
             }
 
             let attention_lr = transformer_lr * 0.5;
-            let attention_report = model.block.attention.train_output_projection_step(
+            let grad_context_last = transpose_mat_vec_mul(
+                &model.block.attention.w_o,
+                embed_dim,
+                embed_dim,
+                &grad_attention_output,
+            );
+            if grad_context_last.iter().any(|&g| !g.is_finite()) {
+                report.invalid_updates += 1;
+                continue;
+            }
+
+            let attention_o_report = model.block.attention.train_output_projection_step(
                 &last_attention_context,
                 &grad_attention_output,
                 attention_lr,
                 safety.max_gradient_norm,
             );
-            if attention_report.grad_norm.is_finite() {
-                if attention_report.grad_norm > report.max_gradient_norm_seen {
-                    report.max_gradient_norm_seen = attention_report.grad_norm;
-                }
-                grad_norm_sum += attention_report.grad_norm;
-                grad_norm_count += 1;
-            }
-            if attention_report.clipped {
-                report.clipped_updates += 1;
-            }
-            if attention_report.applied {
-                model.attention_trained = true;
+            record_attention_train_step(
+                &mut report,
+                &mut grad_norm_sum,
+                &mut grad_norm_count,
+                &attention_o_report,
+            );
+            if attention_o_report.applied {
+                model.mark_attention_projection_o_trained();
                 report.attention_frozen = false;
                 report.attention_trained = true;
                 report.attention_projection_o_trained = true;
-            } else if attention_report.invalid {
-                report.invalid_updates += 1;
+            } else if attention_o_report.invalid {
+                continue;
+            }
+
+            let attention_v_report = model.block.attention.train_value_projection_step(
+                &seq,
+                &last_attention_weights,
+                &grad_context_last,
+                attention_lr,
+                safety.max_gradient_norm,
+            );
+            record_attention_train_step(
+                &mut report,
+                &mut grad_norm_sum,
+                &mut grad_norm_count,
+                &attention_v_report,
+            );
+            if attention_v_report.applied {
+                model.mark_attention_projection_v_trained();
+                report.attention_frozen = false;
+                report.attention_trained = true;
+                report.attention_projection_v_trained = true;
             }
         }
 
@@ -1618,7 +1727,8 @@ pub fn train_transformer_output_head_with_safety(
         model.output_w.iter().any(|&v| v != 0.0) || model.output_b.iter().any(|&v| v != 0.0);
     report.ffn_trained = model.ffn_trained;
     report.attention_trained = model.attention_trained;
-    report.attention_projection_o_trained = model.attention_trained;
+    report.attention_projection_o_trained = model.attention_projection_o_trained();
+    report.attention_projection_v_trained = model.attention_projection_v_trained();
     report.attention_frozen = !model.attention_trained;
 
     report
@@ -2840,6 +2950,18 @@ mod tests {
         assert_eq!(loaded.output_b.len(), model.output_b.len());
         assert_eq!(loaded.ffn_trained, model.ffn_trained);
         assert_eq!(loaded.attention_trained, model.attention_trained);
+        assert_eq!(
+            loaded.attention_projection_mask, model.attention_projection_mask,
+            "attention projection mask should round-trip"
+        );
+        assert!(
+            loaded.attention_projection_o_trained(),
+            "projection o should be marked trained after reload"
+        );
+        assert!(
+            loaded.attention_projection_v_trained(),
+            "projection v should be marked trained after reload"
+        );
 
         // FFN weights should match
         let ffn_a = &loaded.block.feed_forward;
@@ -2904,7 +3026,8 @@ mod tests {
     #[test]
     fn transformer_v3_attention_persistence_roundtrip() {
         let mut model = TransformerLanguageModel::new(4, 8, vec![10, 20, 30]);
-        model.attention_trained = true;
+        model.mark_attention_projection_o_trained();
+        model.mark_attention_projection_v_trained();
         model.block.attention.w_q[0] = 0.123;
         model.block.attention.w_k[1] = -0.234;
         model.block.attention.w_v[2] = 0.345;
@@ -2918,6 +3041,14 @@ mod tests {
         assert!(
             loaded.attention_trained,
             "attention_trained should round-trip"
+        );
+        assert!(
+            loaded.attention_projection_o_trained(),
+            "projection o should round-trip"
+        );
+        assert!(
+            loaded.attention_projection_v_trained(),
+            "projection v should round-trip"
         );
         assert_eq!(
             loaded.block.attention.w_q.len(),
@@ -2974,6 +3105,39 @@ mod tests {
     }
 
     #[test]
+    fn transformer_v3_legacy_attention_file_without_projection_mask_loads_as_o_only() {
+        let mut model = TransformerLanguageModel::new(4, 8, vec![10, 20, 30]);
+        model.attention_trained = true;
+        model.block.attention.w_o[3] = -0.456;
+
+        let path = temp_test_path("transformer_v3_legacy_attention_no_mask.bin");
+        model.save_to_file(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.pop();
+        std::fs::write(&path, bytes).unwrap();
+
+        let loaded = TransformerLanguageModel::load_from_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            loaded.attention_trained,
+            "legacy v3 attention flag should still load"
+        );
+        assert!(
+            loaded.attention_projection_o_trained(),
+            "legacy trained attention should be interpreted as projection o"
+        );
+        assert!(
+            !loaded.attention_projection_v_trained(),
+            "legacy v3 without bitmask should not claim projection v"
+        );
+        assert!(
+            (loaded.block.attention.w_o[3] - model.block.attention.w_o[3]).abs() < 1e-6,
+            "legacy v3 should still preserve attention weights"
+        );
+    }
+
+    #[test]
     fn transformer_v2_file_still_loads_with_untrained_attention() {
         let mut model = TransformerLanguageModel::new(4, 8, vec![10, 20, 30]);
         model.ffn_trained = true;
@@ -2990,6 +3154,10 @@ mod tests {
         assert!(
             !loaded.attention_trained,
             "v2 files do not contain trained attention state"
+        );
+        assert!(
+            !loaded.attention_projection_o_trained() && !loaded.attention_projection_v_trained(),
+            "v2 files should not claim trained attention projections"
         );
         assert!(
             (loaded.block.attention.w_q[0] - fresh.block.attention.w_q[0]).abs() < 1e-6,
@@ -3117,9 +3285,9 @@ mod tests {
         assert!(model.ffn_trained, "ffn_trained flag should be set");
     }
 
-    /// Test B: Attention Q/K/V stay frozen and w_o changes after training.
+    /// Test B: Attention Q/K stay frozen and w_o/w_v change after training.
     #[test]
-    fn qkv_remain_frozen_when_training_w_o() {
+    fn qk_remain_frozen_when_training_w_o_and_w_v() {
         let mut network = Network::new();
         let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
         let mut seq_memory = SequenceMemory::new();
@@ -3157,11 +3325,19 @@ mod tests {
 
         assert_eq!(model.block.attention.w_q, q_before, "w_q changed");
         assert_eq!(model.block.attention.w_k, k_before, "w_k changed");
-        assert_eq!(model.block.attention.w_v, v_before, "w_v changed");
+        assert_ne!(model.block.attention.w_v, v_before, "w_v did not change");
         assert_ne!(model.block.attention.w_o, o_before, "w_o did not change");
         assert!(
             model.attention_trained,
             "attention_trained should be set after w_o update"
+        );
+        assert!(
+            model.attention_projection_o_trained(),
+            "projection o should be marked trained"
+        );
+        assert!(
+            model.attention_projection_v_trained(),
+            "projection v should be marked trained"
         );
         assert!(is_finite_model(&model), "model should remain finite");
     }
@@ -3213,8 +3389,60 @@ mod tests {
             "report should mark projection o as trained"
         );
         assert!(
+            report.attention_projection_v_trained,
+            "report should mark projection v as trained"
+        );
+        assert!(
             model.attention_trained,
             "model should mark attention as partially trained"
+        );
+    }
+
+    #[test]
+    fn w_v_changes_after_transformer_training() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            5,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+        let v_before = model.block.attention.w_v.clone();
+
+        let report = train_transformer_output_head(
+            &mut model,
+            &trainer.embedder,
+            &examples,
+            5,
+            10,
+            0.01,
+            0.01,
+        );
+
+        assert_ne!(model.block.attention.w_v, v_before, "w_v should change");
+        assert!(
+            report.attention_projection_v_trained,
+            "report should mark projection v as trained"
         );
     }
 
@@ -3254,7 +3482,7 @@ mod tests {
     }
 
     #[test]
-    fn w_o_persistence_roundtrip() {
+    fn attention_ov_persistence_roundtrip() {
         let mut network = Network::new();
         let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
         let mut seq_memory = SequenceMemory::new();
@@ -3289,7 +3517,7 @@ mod tests {
 
         train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 10, 0.01, 0.01);
 
-        let path = temp_test_path("w_o_persistence_roundtrip.bin");
+        let path = temp_test_path("attention_ov_persistence_roundtrip.bin");
         model.save_to_file(&path).unwrap();
         let loaded = TransformerLanguageModel::load_from_file(&path).unwrap();
         std::fs::remove_file(&path).ok();
@@ -3307,13 +3535,22 @@ mod tests {
             loaded.block.attention.w_k, k_before,
             "w_k should remain frozen"
         );
-        assert_eq!(
+        assert_ne!(
             loaded.block.attention.w_v, v_before,
-            "w_v should remain frozen"
+            "w_v should persist changed values"
         );
+        assert_eq!(loaded.block.attention.w_v, model.block.attention.w_v);
         assert!(
             loaded.attention_trained,
             "partial attention training flag should persist"
+        );
+        assert!(
+            loaded.attention_projection_o_trained(),
+            "projection o flag should persist"
+        );
+        assert!(
+            loaded.attention_projection_v_trained(),
+            "projection v flag should persist"
         );
     }
 
@@ -3606,6 +3843,7 @@ mod tests {
             vocab_order: vocab_order.clone(),
             ffn_trained: false,
             attention_trained: false,
+            attention_projection_mask: 0,
         };
 
         // Set output_w so that for the first vocab entry the score dominates
@@ -3685,6 +3923,7 @@ mod tests {
             attention_frozen: true,
             attention_trained: false,
             attention_projection_o_trained: false,
+            attention_projection_v_trained: false,
             invalid_updates: 0,
             max_gradient_norm_seen: 0.0,
             avg_gradient_norm: 0.0,
@@ -3724,6 +3963,7 @@ mod tests {
             attention_frozen: true,
             attention_trained: false,
             attention_projection_o_trained: false,
+            attention_projection_v_trained: false,
             invalid_updates: 0,
             max_gradient_norm_seen: 0.0,
             avg_gradient_norm: 0.0,
@@ -3764,6 +4004,7 @@ mod tests {
             attention_frozen: false,
             attention_trained: true,
             attention_projection_o_trained: true,
+            attention_projection_v_trained: true,
             invalid_updates: 0,
             max_gradient_norm_seen: 0.0,
             avg_gradient_norm: 0.0,
@@ -3794,13 +4035,18 @@ mod tests {
             },
             if report.attention_frozen {
                 "frozen"
-            } else if report.attention_projection_o_trained {
+            } else if report.attention_projection_o_trained || report.attention_projection_v_trained
+            {
                 "partially trained"
             } else {
                 "trainable"
             },
-            if report.attention_projection_o_trained {
+            if report.attention_projection_o_trained && report.attention_projection_v_trained {
+                "o,v"
+            } else if report.attention_projection_o_trained {
                 "o"
+            } else if report.attention_projection_v_trained {
+                "v"
             } else {
                 "none"
             },
@@ -3834,7 +4080,10 @@ mod tests {
             formatted.contains("attention projections"),
             "should contain 'attention projections'"
         );
-        assert!(formatted.contains("o"), "should contain projection 'o'");
+        assert!(
+            formatted.contains("o,v"),
+            "should contain projections 'o,v'"
+        );
     }
 
     /// Test F: zero examples should not panic and return (0.0, 0.0).
@@ -3854,6 +4103,7 @@ mod tests {
             vocab_order: vocab_order.clone(),
             ffn_trained: false,
             attention_trained: false,
+            attention_projection_mask: 0,
         };
 
         use std::collections::HashMap;
@@ -3940,6 +4190,7 @@ mod tests {
             vocab_order: vocab_order.clone(),
             ffn_trained: false,
             attention_trained: false,
+            attention_projection_mask: 0,
         };
         // Make output_w[0] = [100, 0, 0, 0] so token 10 dominates
         model.output_w[0] = 100.0;
@@ -3984,6 +4235,7 @@ mod tests {
             vocab_order: vocab_order.clone(),
             ffn_trained: false,
             attention_trained: false,
+            attention_projection_mask: 0,
         };
         // All output_w entries are 0, so all logits are equal → probs uniform.
         // In uniform probs over 5 tokens, each has prob 0.2.
@@ -4082,6 +4334,7 @@ mod tests {
         let last = model.output_w.len() - 1;
         model.output_w[last] = f32::INFINITY;
         model.block.attention.w_o[0] = f32::NAN;
+        model.block.attention.w_v[0] = f32::INFINITY;
         assert!(
             !is_finite_model(&model),
             "should be non-finite after corruption"
@@ -4101,6 +4354,15 @@ mod tests {
             .zip(snapshot.block.attention.w_o.iter())
         {
             assert!((a - b).abs() < 1e-6, "w_o should match after rollback");
+        }
+        for (a, b) in model
+            .block
+            .attention
+            .w_v
+            .iter()
+            .zip(snapshot.block.attention.w_v.iter())
+        {
+            assert!((a - b).abs() < 1e-6, "w_v should match after rollback");
         }
     }
 

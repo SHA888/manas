@@ -797,7 +797,7 @@ Full CLI reference is in [Section 17](#17-cli-reference).
 
 ### 6.8 `manas-language`
 
-The language modeling crate. Provides next-token prediction, a transition-count sequence memory, a hybrid memory+neural predictor, autoregressive text generation, and a small custom transformer path with trained output-head, FFN, and partial attention output-projection training.
+The language modeling crate. Provides next-token prediction, a transition-count sequence memory, a hybrid memory+neural predictor, autoregressive text generation, and a small custom transformer path with trained output-head, FFN, and partial attention output/value projection training.
 
 #### Key Components
 
@@ -902,6 +902,8 @@ inputs
 
 **v0.9.1** — transformer training now updates only the attention output projection `w_o`. The training step uses the cached final-position weighted value vector as `context_last` and the gradient flowing into the attention output as `grad_attention_output_last`, then computes `grad_w_o = outer(grad_attention_output_last, context_last)`. Minimal FFN backward support returns `dL/d(ffn_input)` so the attention-output gradient is the residual gradient plus the FFN input gradient. The update goes through the existing safety path: norm tracking, clipping, invalid-gradient rejection, finite-model checks, and rollback. `w_q`, `w_k`, and `w_v` remain frozen; no softmax/QK gradients, scoring change, generation change, tokenizer change, model-size change, or sidecar version bump are included. `manas inspect` and training reports show partial attention as `Attention trained : partial` and `Attention projections : o`.
 
+**v0.9.2** — transformer training now also updates the attention value projection `w_v`. It first computes `grad_context_last = w_o^T * grad_attention_output_last` using the pre-update output projection, then uses the cached final-position attention row to distribute that gradient into value vectors: `grad_v_j = attention_prob(last, j) * grad_context_last`, followed by `grad_w_v += outer(grad_v_j, input_j)`. The existing output head, FFN, and `w_o` training continue. `w_q` and `w_k` remain frozen, and there is still no backprop through attention scores, softmax, Q, or K. Safety metrics include `w_v` gradient norms, clipping, invalid update counts, finite checks, and rollback. The transformer sidecar remains version 3; new files append an optional projection bitmask so inspect can report `Attention projections : o,v`, while legacy v3 files without the bitmask load as `o`.
+
 #### Single-Head Causal Attention (v0.4)
 
 `CausalSelfAttention` is a standalone module in `attention.rs` with QKV projections, scaled dot-product scores, causal masking, and an output projection. It is implemented as custom Rust with no external dependencies. Not yet integrated into the default prediction path.
@@ -933,6 +935,8 @@ pub struct AttentionForwardCache {
 `CausalSelfAttention::forward_with_cache()` returns `(outputs, cache)`. `forward()` delegates through the same path, so inference and prediction behavior stay unchanged.
 
 `CausalSelfAttention::train_output_projection_step()` is the v0.9.1 partial attention trainer. It accepts a cached context vector, an output gradient, a learning rate, and a max gradient norm. It updates only `w_o`, reports whether the update applied or clipped, rejects non-finite gradients without mutation, and leaves `w_q`, `w_k`, and `w_v` untouched.
+
+`CausalSelfAttention::train_value_projection_step()` is the v0.9.2 partial attention trainer. It accepts the original token embeddings, the cached final-position attention weights, `grad_context_last`, a learning rate, and a max gradient norm. It updates only `w_v`, reports whether the update applied or clipped, rejects non-finite gradients without mutation, and leaves `w_q`, `w_k`, and `w_o` untouched.
 
 Helpers: `mat_vec_mul`, `dot`, `softmax` (numerically stable, subtracts max before exp).
 
@@ -1469,6 +1473,7 @@ No panics in library code. The CLI converts errors to user-friendly messages.
 | M20 | **Training metrics (v0.8.1)** — `TransformerTrainReport`, per-epoch loss, top-1/top-3 accuracy, improvement %, invalid update tracking, formatted CLI output | `manas-language`, `manas-cli` | Measurable transformer training |
 | M21 | **Attention cache + persistence prep (v0.9.0)** — `AttentionForwardCache`, `forward_with_cache()`, attention finite checks, v3 transformer sidecar with attention weights, `attention_trained` inspect status | `manas-language`, `manas-cli` | Foundation for attention projection training |
 | M22 | **Attention output projection training (v0.9.1)** — `train_output_projection_step()`, FFN input-gradient support, `w_o` update with safety metrics and rollback, `q/k/v` frozen, partial inspect/report status | `manas-language`, `manas-cli` | Safest attention projection starts learning |
+| M23 | **Attention value projection training (v0.9.2)** — `train_value_projection_step()`, `w_v` update from cached final attention row, optional v3 projection bitmask, `q/k` frozen, partial `o,v` inspect/report status | `manas-language`, `manas-cli` | Attention value representations start learning |
 
 ---
 
@@ -1497,7 +1502,7 @@ manas ingest --folder ./docs/ --dry-run
 # Train next-token prediction
 manas train-language "Rust is a systems programming language" --epochs 50
 
-# Train next-token prediction with transformer output head, FFN, and attention w_o (v0.9.1)
+# Train next-token prediction with transformer output head, FFN, and attention w_o/w_v (v0.9.2)
 manas train-language "Rust is a systems programming language" --epochs 50 --train-transformer
 
 # Train next-token prediction with growth control (v0.7.1)
@@ -1569,7 +1574,7 @@ manas inspect
 #   Output head trained : yes
 #   FFN trained         : yes
 #   Attention trained     : partial
-#   Attention projections : o
+#   Attention projections : o,v
 #   Attention params    : 16,384
 #   FFN params          : 16,512
 #   Output head params  : 799,872

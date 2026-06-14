@@ -24,7 +24,7 @@ Manas is **not** trying to replace large hosted LLMs. It is a learning and resea
 | v0.8.2 | Safer transformer training | Done |
 | v0.9.0 | Attention cache + persistence prep | Done |
 | v0.9.1 | Train attention output projection w_o | Done |
-| v0.9.2 | Train attention value projection w_v | Planned |
+| v0.9.2 | Train attention value projection w_v | Done |
 | v0.9.3 | Train attention query/key projections w_q + w_k | Planned |
 | v0.9.4 | Attention training safety and metrics cleanup | Planned |
 | v0.9.5 | Improve transformer score weight | Planned |
@@ -370,25 +370,32 @@ Goal achieved:
 
 ---
 
-## Next Milestones
+### v0.9.2 — Train Attention Value Projection `w_v`
 
-## v0.9.2 — Train Attention Value Projection `w_v`
+Manas now trains the attention value projection after `w_o`, without training attention routing.
 
-Train value projection after `w_o` is stable.
+Completed:
 
-### Scope
+- `CausalSelfAttention::train_value_projection_step()` computes `grad_w_v` from cached final-position attention probabilities
+- `grad_context_last` is computed with the pre-update `w_o` transpose
+- Transformer training continues updating output head, FFN, and `w_o`
+- Only `w_v` is added to attention training in this milestone
+- `w_q` and `w_k` remain frozen, with tests proving they do not change
+- `w_v` gradients participate in norm tracking, clipping, invalid update counting, finite checks, and rollback
+- Existing transformer sidecar version 3 persists changed `w_o` and `w_v`
+- Version 3 sidecars now include an optional trailing projection bitmask without bumping the sidecar version
+- Legacy v3 files without the projection bitmask still load as `o`-only
+- Training reports show `attention : partially trained` and `attention projections : o,v`
+- `manas inspect` shows `Attention trained : partial` and `Attention projections : o,v`
+- No Q/K training, softmax-gradient training, scoring weight change, generation behavior change, tokenizer change, model size change, or sidecar version bump
 
-- Train `w_v`
-- Keep `w_q`, `w_k` frozen
-- Continue training output head, FFN, and `w_o`
-- Use cached attention probabilities
-- Add tests proving `w_v` changes and `w_q/w_k` remain frozen
-
-### Goal
+Goal achieved:
 
 > Allow attention to learn better value representations while avoiding Q/K softmax-gradient risk.
 
 ---
+
+## Next Milestones
 
 ## v0.9.3 — Train Attention Query/Key Projections `w_q + w_k`
 
@@ -465,7 +472,7 @@ This is the first stable language milestone.
 - Persistent brain + sidecars
 - Better inspect output
 - Transformer output-head training
-- FFN training and partial `w_o` attention training if stable
+- FFN training and partial `w_o`/`w_v` attention training if stable
 - Clean README examples
 - Strong tests
 
@@ -624,5 +631,5 @@ Manas should continue following these principles:
 The next coding milestone is:
 
 ```text
-v0.9.2 — Train Attention Value Projection w_v
+v0.9.3 — Train Attention Query/Key Projections w_q + w_k
 ```
