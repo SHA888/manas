@@ -614,19 +614,26 @@ fn cmd_inspect(verbose: bool, brain_path: &Path) -> Result<(), ManasError> {
         .unwrap_or(0);
 
     // ── Transformer stats ───────────────────────────────────────────
-    let (tf_enabled, tf_embed_dim, tf_hidden_dim, tf_vocab_size, tf_output_trained, tf_ffn_trained) =
-        match TransformerLanguageModel::load_from_file(&tf_path) {
-            Ok(model) => (
-                true,
-                Some(model.embed_dim),
-                Some(model.hidden_dim),
-                Some(model.vocab_order.len()),
-                model.output_w.iter().any(|&v| v != 0.0)
-                    || model.output_b.iter().any(|&v| v != 0.0),
-                model.ffn_trained,
-            ),
-            Err(_) => (false, None, None, None, false, false),
-        };
+    let (
+        tf_enabled,
+        tf_embed_dim,
+        tf_hidden_dim,
+        tf_vocab_size,
+        tf_output_trained,
+        tf_ffn_trained,
+        tf_attention_trained,
+    ) = match TransformerLanguageModel::load_from_file(&tf_path) {
+        Ok(model) => (
+            true,
+            Some(model.embed_dim),
+            Some(model.hidden_dim),
+            Some(model.vocab_order.len()),
+            model.output_w.iter().any(|&v| v != 0.0) || model.output_b.iter().any(|&v| v != 0.0),
+            model.ffn_trained,
+            model.attention_trained,
+        ),
+        Err(_) => (false, None, None, None, false, false, false),
+    };
 
     let attn_params = tf_embed_dim.map(|d| (4 * d * d) as u64).unwrap_or(0);
     let ffn_params = tf_embed_dim
@@ -712,6 +719,10 @@ fn cmd_inspect(verbose: bool, brain_path: &Path) -> Result<(), ManasError> {
         println!(
             "  FFN trained         : {}",
             if tf_ffn_trained { "yes" } else { "no" }
+        );
+        println!(
+            "  Attention trained   : {}",
+            if tf_attention_trained { "yes" } else { "no" }
         );
         println!("  Attention params    : {}", attn_params);
         println!("  FFN params          : {}", ffn_params);

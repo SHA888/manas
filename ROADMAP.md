@@ -22,6 +22,7 @@ Manas is **not** trying to replace large hosted LLMs. It is a learning and resea
 | v0.8 | Train transformer FeedForward layer | Done |
 | v0.8.1 | Transformer training metrics | Done |
 | v0.8.2 | Safer transformer training | Done |
+| v0.9.0 | Attention cache + persistence prep | Done |
 
 ## Completed Milestones
 
@@ -317,11 +318,34 @@ Goal achieved:
 
 ---
 
+### v0.9.0 — Attention Cache + Persistence Prep
+
+Before training attention projections, the attention forward path and transformer sidecar were prepared safely.
+
+Completed:
+
+- `AttentionForwardCache` stores Q/K/V projections, causal attention weights, and weighted values
+- `CausalSelfAttention::forward_with_cache()` returns normal outputs plus cache state
+- `CausalSelfAttention::forward()` keeps the same behavior by using the cached path
+- Transformer sidecar format bumped to version 3 with persisted `w_q`, `w_k`, `w_v`, and `w_o`
+- Version 2 transformer files still load with deterministic untrained attention
+- `TransformerLanguageModel` gains `attention_trained: bool`
+- `is_finite_model()` now checks attention weights for NaN/inf
+- `manas inspect` shows `Attention trained : yes/no`
+- Tests cover forward/cache equivalence, causal cache masking, cache shapes, finite attention checks, v2 compatibility, and v3 roundtrip
+- No attention training, scoring change, tokenizer change, or generation behavior change
+
+Goal achieved:
+
+> Manas now has the safe forward-cache, persistence, and inspection foundation required before attention projection training.
+
+---
+
 ## Next Milestones
 
 ## v0.9 — Train Attention Projections
 
-After FFN training is stable, train the attention projection matrices.
+After FFN training and v0.9.0 cache/persistence prep are stable, train the attention projection matrices.
 
 ### Planned Trainable Weights
 
@@ -542,5 +566,5 @@ Manas should continue following these principles:
 The next coding milestone is:
 
 ```text
-v0.8.2 — Safer Transformer Training
+v0.9 — Train Attention Projections
 ```

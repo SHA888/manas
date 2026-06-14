@@ -325,7 +325,7 @@ use crate::transformer::TinyTransformerBlock;
 
 // Magic constants for the transformer model sidecar file.
 const TRANSFORMER_FILE_MAGIC: u32 = 0x5452464C; // "TRFL"
-const TRANSFORMER_FILE_VERSION: u32 = 2;
+const TRANSFORMER_FILE_VERSION: u32 = 3;
 
 /// Weight given to the transformer score when the output head is **untrained**
 /// (cosine-similarity fallback).
@@ -344,6 +344,7 @@ const TRANSFORMER_SCORE_WEIGHT_TRAINED: f32 = 0.40;
 /// use this mapping so indices are always correct.
 ///
 /// The transformer block FFN weights are serialised from v0.8 onward.
+/// Attention weights are serialised from v0.9.0 onward.
 #[derive(Clone)]
 pub struct TransformerLanguageModel {
     pub block: TinyTransformerBlock,
@@ -354,6 +355,8 @@ pub struct TransformerLanguageModel {
     pub vocab_order: Vec<u32>,
     /// Tracks whether the FFN has been trained (updated after v0.8 training).
     pub ffn_trained: bool,
+    /// Tracks whether attention projections have been trained.
+    pub attention_trained: bool,
 }
 
 impl TransformerLanguageModel {
@@ -374,6 +377,7 @@ impl TransformerLanguageModel {
             hidden_dim,
             vocab_order,
             ffn_trained: false,
+            attention_trained: false,
         }
     }
 
@@ -464,6 +468,32 @@ impl TransformerLanguageModel {
             buf.extend_from_slice(&v.to_le_bytes());
         }
 
+        // Attention weights (v0.9.0 / sidecar v3)
+        let attn = &self.block.attention;
+        let attention_trained = if self.attention_trained { 1u8 } else { 0u8 };
+        buf.push(attention_trained);
+
+        let wq_len = attn.w_q.len() as u32;
+        buf.extend_from_slice(&wq_len.to_le_bytes());
+        for &v in &attn.w_q {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let wk_len = attn.w_k.len() as u32;
+        buf.extend_from_slice(&wk_len.to_le_bytes());
+        for &v in &attn.w_k {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let wv_len = attn.w_v.len() as u32;
+        buf.extend_from_slice(&wv_len.to_le_bytes());
+        for &v in &attn.w_v {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let wo_len = attn.w_o.len() as u32;
+        buf.extend_from_slice(&wo_len.to_le_bytes());
+        for &v in &attn.w_o {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+
         std::fs::write(path, &buf).map_err(|e| ManasError::FileReadError {
             path: path.to_path_buf(),
             source: e,
@@ -531,26 +561,26 @@ impl TransformerLanguageModel {
             *id = u32::from_le_bytes(bytes);
         }
 
+        let read_f32_vec = |c: &mut &[u8]| -> Vec<f32> {
+            let len = read_u32(c) as usize;
+            let mut v = vec![0.0; len];
+            for x in &mut v {
+                let mut bytes = [0u8; 4];
+                bytes.copy_from_slice(&c[..4]);
+                *c = &c[4..];
+                *x = f32::from_le_bytes(bytes);
+            }
+            v
+        };
+
         // FFN weights (v0.8+)
-        let (block, ffn_trained) = if version >= 2 {
+        let (mut block, ffn_trained) = if version >= 2 {
             let ffn_trained = if cursor.first().copied().unwrap_or(0) != 0 {
                 cursor = &cursor[1..];
                 true
             } else {
                 cursor = &cursor[1..];
                 false
-            };
-
-            let read_f32_vec = |c: &mut &[u8]| -> Vec<f32> {
-                let len = read_u32(c) as usize;
-                let mut v = vec![0.0; len];
-                for x in &mut v {
-                    let mut bytes = [0u8; 4];
-                    bytes.copy_from_slice(&c[..4]);
-                    *c = &c[4..];
-                    *x = f32::from_le_bytes(bytes);
-                }
-                v
             };
 
             let w1 = read_f32_vec(&mut cursor);
@@ -568,6 +598,26 @@ impl TransformerLanguageModel {
             (block, false)
         };
 
+        // Attention weights (v0.9.0+). Older sidecars keep deterministic
+        // freshly rebuilt attention weights.
+        let attention_trained = if version >= 3 {
+            let attention_trained = if cursor.first().copied().unwrap_or(0) != 0 {
+                cursor = &cursor[1..];
+                true
+            } else {
+                cursor = &cursor[1..];
+                false
+            };
+
+            block.attention.w_q = read_f32_vec(&mut cursor);
+            block.attention.w_k = read_f32_vec(&mut cursor);
+            block.attention.w_v = read_f32_vec(&mut cursor);
+            block.attention.w_o = read_f32_vec(&mut cursor);
+            attention_trained
+        } else {
+            false
+        };
+
         Ok(TransformerLanguageModel {
             block,
             output_w,
@@ -576,6 +626,7 @@ impl TransformerLanguageModel {
             hidden_dim,
             vocab_order,
             ffn_trained,
+            attention_trained,
         })
     }
 }
@@ -906,10 +957,15 @@ pub fn is_finite_model(model: &TransformerLanguageModel) -> bool {
         return false;
     }
     let ff = &model.block.feed_forward;
+    let attn = &model.block.attention;
     ff.w1.iter().all(|&v| v.is_finite())
         && ff.b1.iter().all(|&v| v.is_finite())
         && ff.w2.iter().all(|&v| v.is_finite())
         && ff.b2.iter().all(|&v| v.is_finite())
+        && attn.w_q.iter().all(|&v| v.is_finite())
+        && attn.w_k.iter().all(|&v| v.is_finite())
+        && attn.w_v.iter().all(|&v| v.is_finite())
+        && attn.w_o.iter().all(|&v| v.is_finite())
 }
 
 /// Report returned after transformer training (v0.8.1 / v0.8.2).
@@ -1823,6 +1879,53 @@ pub fn language_meta_path(brain_path: &Path) -> std::path::PathBuf {
 mod tests {
     use super::*;
 
+    fn temp_test_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("{}_{}", name, std::process::id()))
+    }
+
+    fn save_transformer_v2_for_test(
+        model: &TransformerLanguageModel,
+        path: &Path,
+    ) -> Result<(), ManasError> {
+        fn push_u32(buf: &mut Vec<u8>, value: u32) {
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+
+        fn push_f32_vec(buf: &mut Vec<u8>, values: &[f32]) {
+            push_u32(buf, values.len() as u32);
+            for &value in values {
+                buf.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+
+        let mut buf = Vec::new();
+        push_u32(&mut buf, TRANSFORMER_FILE_MAGIC);
+        push_u32(&mut buf, 2);
+        push_u32(&mut buf, model.embed_dim as u32);
+        push_u32(&mut buf, model.hidden_dim as u32);
+        push_u32(&mut buf, model.vocab_size() as u32);
+
+        push_f32_vec(&mut buf, &model.output_w);
+        push_f32_vec(&mut buf, &model.output_b);
+
+        push_u32(&mut buf, model.vocab_order.len() as u32);
+        for &id in &model.vocab_order {
+            buf.extend_from_slice(&id.to_le_bytes());
+        }
+
+        buf.push(if model.ffn_trained { 1 } else { 0 });
+        let ffn = &model.block.feed_forward;
+        push_f32_vec(&mut buf, &ffn.w1);
+        push_f32_vec(&mut buf, &ffn.b1);
+        push_f32_vec(&mut buf, &ffn.w2);
+        push_f32_vec(&mut buf, &ffn.b2);
+
+        std::fs::write(path, &buf).map_err(|e| ManasError::FileReadError {
+            path: path.to_path_buf(),
+            source: e,
+        })
+    }
+
     // ── Sequence example tests ────────────────────────────────────────────
 
     #[test]
@@ -2683,6 +2786,7 @@ mod tests {
         assert_eq!(loaded.output_w.len(), model.output_w.len());
         assert_eq!(loaded.output_b.len(), model.output_b.len());
         assert_eq!(loaded.ffn_trained, model.ffn_trained);
+        assert_eq!(loaded.attention_trained, model.attention_trained);
 
         // FFN weights should match
         let ffn_a = &loaded.block.feed_forward;
@@ -2741,6 +2845,102 @@ mod tests {
         assert!(
             !results.is_empty(),
             "predictions after reload should not be empty"
+        );
+    }
+
+    #[test]
+    fn transformer_v3_attention_persistence_roundtrip() {
+        let mut model = TransformerLanguageModel::new(4, 8, vec![10, 20, 30]);
+        model.attention_trained = true;
+        model.block.attention.w_q[0] = 0.123;
+        model.block.attention.w_k[1] = -0.234;
+        model.block.attention.w_v[2] = 0.345;
+        model.block.attention.w_o[3] = -0.456;
+
+        let path = temp_test_path("transformer_v3_attention_roundtrip.bin");
+        model.save_to_file(&path).unwrap();
+        let loaded = TransformerLanguageModel::load_from_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            loaded.attention_trained,
+            "attention_trained should round-trip"
+        );
+        assert_eq!(
+            loaded.block.attention.w_q.len(),
+            model.block.attention.w_q.len()
+        );
+        assert_eq!(
+            loaded.block.attention.w_k.len(),
+            model.block.attention.w_k.len()
+        );
+        assert_eq!(
+            loaded.block.attention.w_v.len(),
+            model.block.attention.w_v.len()
+        );
+        assert_eq!(
+            loaded.block.attention.w_o.len(),
+            model.block.attention.w_o.len()
+        );
+        for (a, b) in loaded
+            .block
+            .attention
+            .w_q
+            .iter()
+            .zip(model.block.attention.w_q.iter())
+        {
+            assert!((a - b).abs() < 1e-6, "w_q mismatch after roundtrip");
+        }
+        for (a, b) in loaded
+            .block
+            .attention
+            .w_k
+            .iter()
+            .zip(model.block.attention.w_k.iter())
+        {
+            assert!((a - b).abs() < 1e-6, "w_k mismatch after roundtrip");
+        }
+        for (a, b) in loaded
+            .block
+            .attention
+            .w_v
+            .iter()
+            .zip(model.block.attention.w_v.iter())
+        {
+            assert!((a - b).abs() < 1e-6, "w_v mismatch after roundtrip");
+        }
+        for (a, b) in loaded
+            .block
+            .attention
+            .w_o
+            .iter()
+            .zip(model.block.attention.w_o.iter())
+        {
+            assert!((a - b).abs() < 1e-6, "w_o mismatch after roundtrip");
+        }
+    }
+
+    #[test]
+    fn transformer_v2_file_still_loads_with_untrained_attention() {
+        let mut model = TransformerLanguageModel::new(4, 8, vec![10, 20, 30]);
+        model.ffn_trained = true;
+        model.attention_trained = true;
+        model.block.attention.w_q[0] = 99.0;
+
+        let path = temp_test_path("transformer_v2_compat.bin");
+        save_transformer_v2_for_test(&model, &path).unwrap();
+        let loaded = TransformerLanguageModel::load_from_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let fresh = TransformerLanguageModel::new(4, 8, vec![10, 20, 30]);
+        assert!(loaded.ffn_trained, "v2 FFN flag should still load");
+        assert!(
+            !loaded.attention_trained,
+            "v2 files do not contain trained attention state"
+        );
+        assert!(
+            (loaded.block.attention.w_q[0] - fresh.block.attention.w_q[0]).abs() < 1e-6,
+            "v2 load should rebuild deterministic attention"
         );
     }
 
@@ -3188,6 +3388,7 @@ mod tests {
             hidden_dim,
             vocab_order: vocab_order.clone(),
             ffn_trained: false,
+            attention_trained: false,
         };
 
         // Set output_w so that for the first vocab entry the score dominates
@@ -3413,6 +3614,7 @@ mod tests {
             hidden_dim,
             vocab_order: vocab_order.clone(),
             ffn_trained: false,
+            attention_trained: false,
         };
 
         use std::collections::HashMap;
@@ -3498,6 +3700,7 @@ mod tests {
             hidden_dim,
             vocab_order: vocab_order.clone(),
             ffn_trained: false,
+            attention_trained: false,
         };
         // Make output_w[0] = [100, 0, 0, 0] so token 10 dominates
         model.output_w[0] = 100.0;
@@ -3541,6 +3744,7 @@ mod tests {
             hidden_dim,
             vocab_order: vocab_order.clone(),
             ffn_trained: false,
+            attention_trained: false,
         };
         // All output_w entries are 0, so all logits are equal → probs uniform.
         // In uniform probs over 5 tokens, each has prob 0.2.
@@ -3610,6 +3814,23 @@ mod tests {
         assert!(
             !is_finite_model(&model),
             "NaN in output_w should be detected"
+        );
+    }
+
+    #[test]
+    fn safety_non_finite_attention_detected() {
+        let mut model = TransformerLanguageModel::new(4, 8, vec![10, 20, 30]);
+        model.block.attention.w_q[0] = f32::NAN;
+        assert!(
+            !is_finite_model(&model),
+            "NaN in attention w_q should be detected"
+        );
+
+        let mut model = TransformerLanguageModel::new(4, 8, vec![10, 20, 30]);
+        model.block.attention.w_o[0] = f32::INFINITY;
+        assert!(
+            !is_finite_model(&model),
+            "infinity in attention w_o should be detected"
         );
     }
 

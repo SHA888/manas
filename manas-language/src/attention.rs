@@ -49,6 +49,19 @@ pub struct CausalSelfAttention {
     pub w_o: Vec<f32>,
 }
 
+/// Cached intermediate values from a causal self-attention forward pass.
+///
+/// This is forward-only state for future training work.  It must not change
+/// inference behavior.
+#[derive(Clone, Debug)]
+pub struct AttentionForwardCache {
+    pub qs: Vec<Vec<f32>>,
+    pub ks: Vec<Vec<f32>>,
+    pub vs: Vec<Vec<f32>>,
+    pub attention_weights: Vec<Vec<f32>>,
+    pub weighted_values: Vec<Vec<f32>>,
+}
+
 impl CausalSelfAttention {
     /// Create a new attention module with small random weights.
     ///
@@ -72,9 +85,29 @@ impl CausalSelfAttention {
     /// `inputs`: sequence of token embeddings, shape `seq_len × embed_dim`.
     /// Returns output vectors of the same shape.
     pub fn forward(&self, inputs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        self.forward_with_cache(inputs).0
+    }
+
+    /// Forward pass with causal masking and reusable intermediate cache.
+    ///
+    /// Returns the same output as `forward()` plus per-position Q/K/V,
+    /// full-length causal attention weights, and weighted value vectors.
+    pub fn forward_with_cache(
+        &self,
+        inputs: &[Vec<f32>],
+    ) -> (Vec<Vec<f32>>, AttentionForwardCache) {
         let seq_len = inputs.len();
         if seq_len == 0 || self.embed_dim == 0 {
-            return Vec::new();
+            return (
+                Vec::new(),
+                AttentionForwardCache {
+                    qs: Vec::new(),
+                    ks: Vec::new(),
+                    vs: Vec::new(),
+                    attention_weights: Vec::new(),
+                    weighted_values: Vec::new(),
+                },
+            );
         }
 
         let d = self.embed_dim;
@@ -92,6 +125,8 @@ impl CausalSelfAttention {
         }
 
         let mut outputs: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
+        let mut attention_weights: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
+        let mut weighted_values: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
 
         for (i, qi) in qs.iter().enumerate() {
             // 2. Compute scaled dot-product scores for positions 0..=i (causal)
@@ -102,6 +137,10 @@ impl CausalSelfAttention {
 
             // 3. Softmax over allowed positions
             let attn_weights = softmax(&scores);
+            let mut full_weights = vec![0.0; seq_len];
+            for (j, &weight) in attn_weights.iter().enumerate() {
+                full_weights[j] = weight;
+            }
 
             // 4. Weighted sum of V
             let mut out = vec![0.0; d];
@@ -115,9 +154,20 @@ impl CausalSelfAttention {
 
             // 5. Output projection
             outputs.push(mat_vec_mul(&self.w_o, d, d, &out));
+            attention_weights.push(full_weights);
+            weighted_values.push(out);
         }
 
-        outputs
+        (
+            outputs,
+            AttentionForwardCache {
+                qs,
+                ks,
+                vs,
+                attention_weights,
+                weighted_values,
+            },
+        )
     }
 
     /// Expose attention weights for a single position (for testing).
@@ -282,6 +332,82 @@ mod tests {
             assert_eq!(v.len(), 8, "output vector {} should have embed_dim=8", i);
             for (j, &val) in v.iter().enumerate() {
                 assert!(!val.is_nan(), "output[{}][{}] is NaN", i, j);
+            }
+        }
+    }
+
+    #[test]
+    fn forward_with_cache_matches_forward() {
+        let attn = CausalSelfAttention::new(6);
+        let inputs = vec![
+            vec![0.5, -0.2, 0.1, 0.0, 0.3, -0.1],
+            vec![-0.3, 0.6, 0.0, 0.2, -0.1, 0.0],
+            vec![0.1, 0.0, -0.4, 0.7, 0.0, 0.3],
+        ];
+
+        let direct = attn.forward(&inputs);
+        let (cached, _cache) = attn.forward_with_cache(&inputs);
+
+        assert_eq!(cached.len(), direct.len());
+        for (a, b) in cached.iter().zip(direct.iter()) {
+            assert_eq!(a.len(), b.len());
+            for (&x, &y) in a.iter().zip(b.iter()) {
+                assert!((x - y).abs() < 1e-7, "cached forward mismatch");
+            }
+        }
+    }
+
+    #[test]
+    fn forward_cache_shapes_are_correct() {
+        let attn = CausalSelfAttention::new(4);
+        let inputs = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+        ];
+
+        let (_output, cache) = attn.forward_with_cache(&inputs);
+
+        assert_eq!(cache.qs.len(), 3);
+        assert_eq!(cache.ks.len(), 3);
+        assert_eq!(cache.vs.len(), 3);
+        assert_eq!(cache.attention_weights.len(), 3);
+        assert_eq!(cache.weighted_values.len(), 3);
+
+        for row in &cache.qs {
+            assert_eq!(row.len(), 4);
+        }
+        for row in &cache.ks {
+            assert_eq!(row.len(), 4);
+        }
+        for row in &cache.vs {
+            assert_eq!(row.len(), 4);
+        }
+        for row in &cache.attention_weights {
+            assert_eq!(row.len(), 3);
+        }
+        for row in &cache.weighted_values {
+            assert_eq!(row.len(), 4);
+        }
+    }
+
+    #[test]
+    fn forward_cache_preserves_causal_mask() {
+        let attn = CausalSelfAttention::new(4);
+        let inputs = vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+        ];
+
+        let (_output, cache) = attn.forward_with_cache(&inputs);
+
+        for (i, weights) in cache.attention_weights.iter().enumerate() {
+            let sum: f32 = weights.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-6, "attention row should sum to 1");
+            for &future_weight in weights.iter().skip(i + 1) {
+                assert_eq!(future_weight, 0.0, "future positions must stay masked");
             }
         }
     }
