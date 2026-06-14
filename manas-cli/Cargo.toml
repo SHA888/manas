@@ -8,6 +8,10 @@ repository.workspace = true
 homepage.workspace = true
 description = "Manas CLI — command-line interface for the personal AI brain"
 
+[[bin]]
+name = "manas"
+path = "src/main.rs"
+
 [dependencies]
 manas-core = { workspace = true }
 manas-memory = { workspace = true }
