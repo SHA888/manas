@@ -27,7 +27,7 @@ Manas is **not** trying to replace large hosted LLMs. It is a learning and resea
 | v0.9.2 | Train attention value projection w_v | Done |
 | v0.9.3 | Train attention query/key projections w_q + w_k | Done |
 | v0.9.4 | Attention training safety and metrics cleanup | Done |
-| v0.9.5 | Improve transformer score weight | Planned |
+| v0.9.5 | Reliability-aware transformer score weighting | Done |
 
 ## Completed Milestones
 
@@ -453,29 +453,35 @@ Goal achieved:
 
 ---
 
+### v0.9.5 — Reliability-Aware Transformer Score Weighting
+
+Manas now gives the transformer more influence only when the loaded transformer is trained, finite, and confident.
+
+Completed:
+
+- `TransformerPredictor` carries runtime reliability metadata for FFN training, attention projection mask, and finite model state
+- Hybrid transformer weight now depends on reliability:
+  - untrained/cosine fallback: `0.15`
+  - output head only: `0.30`
+  - output head + FFN: `0.35`
+  - attention `o`: `0.45`
+  - attention `o,v`: `0.50`
+  - attention `o,v,q,k`: `0.55`
+- Transformer confidence reduces influence when top probability or top-1/top-2 margin is weak
+- Strong base-memory candidates cap transformer influence
+- Learned sequence-memory candidates use a stricter cap so exact memory remains stable
+- Non-finite transformer model state falls back to base memory/neural scores instead of returning empty predictions
+- Transformer-only prediction remains pure transformer output
+- Prediction score sorting is deterministic for ties
+- No tokenizer change, sequence memory format change, persistence format change, sidecar version bump, training math change, attention architecture change, CLI default change, dependency change, or unified `teach` command
+
+Goal achieved:
+
+> Improve hybrid prediction quality while preserving exact sequence-memory behavior and generation stability.
+
+---
+
 ## Next Milestones
-
-## v0.9.5 — Improve Transformer Score Weight
-
-Currently the system uses a conservative hybrid score so transformer experiments do not break generation.
-
-Example:
-
-```text
-final_score = 0.60 * existing_hybrid_score + 0.40 * transformer_score
-```
-
-After attention projection training is stable, slowly increase transformer contribution.
-
-Possible future setting:
-
-```text
-final_score = 0.40 * existing_hybrid_score + 0.60 * transformer_score
-```
-
-### Goal
-
-> Move more prediction responsibility from memory shortcut to the trained transformer path.
 
 Add a future roadmap milestone after v0.9.5:
 
@@ -876,5 +882,5 @@ Manas should continue following these principles:
 The next coding milestone is:
 
 ```text
-v0.9.5 — Improve Transformer Score Weight
+v0.9.6 — Unified Teaching Command
 ```

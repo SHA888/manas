@@ -42,6 +42,15 @@ pub fn build_sequence_examples(tokens: &[u32], max_context: usize) -> Vec<Sequen
     examples
 }
 
+fn sort_prediction_scores(scored: &mut Vec<(u32, f32)>) {
+    scored.retain(|(_, score)| score.is_finite());
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+}
+
 // ─── Sequence Memory ──────────────────────────────────────────────────────────
 
 /// A transition-count table that records which tokens follow which contexts.
@@ -233,7 +242,7 @@ impl NextTokenPredictor {
             })
             .collect();
 
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        sort_prediction_scores(&mut scored);
         scored.truncate(k);
         scored
     }
@@ -312,7 +321,7 @@ impl NextTokenPredictor {
             })
             .collect();
 
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        sort_prediction_scores(&mut scored);
         scored.truncate(k);
         scored
     }
@@ -335,13 +344,16 @@ const ATTENTION_PROJECTION_KNOWN_MASK: u8 = ATTENTION_PROJECTION_O
     | ATTENTION_PROJECTION_Q
     | ATTENTION_PROJECTION_K;
 
-/// Weight given to the transformer score when the output head is **untrained**
-/// (cosine-similarity fallback).
-const TRANSFORMER_SCORE_WEIGHT_UNTRAINED: f32 = 0.25;
-
-/// Weight given to the transformer score when the output head **has been
-/// trained** via `train_transformer_output_head`.
-const TRANSFORMER_SCORE_WEIGHT_TRAINED: f32 = 0.40;
+/// Reliability-aware transformer score weights for assisted prediction.
+const TRANSFORMER_SCORE_WEIGHT_UNTRAINED: f32 = 0.15;
+const TRANSFORMER_SCORE_WEIGHT_OUTPUT_HEAD: f32 = 0.30;
+const TRANSFORMER_SCORE_WEIGHT_FFN: f32 = 0.35;
+const TRANSFORMER_SCORE_WEIGHT_ATTENTION_O: f32 = 0.45;
+const TRANSFORMER_SCORE_WEIGHT_ATTENTION_OV: f32 = 0.50;
+const TRANSFORMER_SCORE_WEIGHT_ATTENTION_OVQK: f32 = 0.55;
+const TRANSFORMER_STRONG_MEMORY_SCORE: f32 = 0.95;
+const TRANSFORMER_STRONG_MEMORY_CAP: f32 = 0.45;
+const TRANSFORMER_SEQUENCE_MEMORY_CAP: f32 = 0.40;
 
 /// The full transformer language model: a `TinyTransformerBlock` (frozen for
 /// v0.7) plus a trainable linear output head (`output_w`, `output_b`) that
@@ -709,15 +721,15 @@ impl TransformerLanguageModel {
 /// the transformer scores come from the output-head projection + softmax;
 /// otherwise a cosine-similarity fallback is used.
 ///
-/// The transformer weight is **dynamic**:
-/// * 0.25 when the output head is empty (untrained cosine-similarity mode)
-/// * 0.40 when the output head has been trained
 pub struct TransformerPredictor {
     pub block: TinyTransformerBlock,
     pub output_w: Vec<f32>,
     pub output_b: Vec<f32>,
     pub vocab_order: Vec<u32>,
     pub max_context: usize,
+    pub ffn_trained: bool,
+    pub attention_projection_mask: u8,
+    pub model_finite: bool,
 }
 
 impl TransformerPredictor {
@@ -730,6 +742,9 @@ impl TransformerPredictor {
             output_b: Vec::new(),
             vocab_order: Vec::new(),
             max_context,
+            ffn_trained: false,
+            attention_projection_mask: 0,
+            model_finite: true,
         }
     }
 
@@ -743,6 +758,9 @@ impl TransformerPredictor {
             output_b: model.output_b.clone(),
             vocab_order: model.vocab_order.clone(),
             max_context,
+            ffn_trained: model.ffn_trained,
+            attention_projection_mask: model.attention_projection_mask,
+            model_finite: is_finite_model(model),
         }
     }
 
@@ -751,13 +769,86 @@ impl TransformerPredictor {
         !self.output_w.is_empty()
     }
 
-    /// The weight to apply to the transformer score (0.25 untrained / 0.40 trained).
+    /// The base reliability weight to apply to the transformer score before
+    /// confidence and strong-memory gates.
     pub fn transformer_weight(&self) -> f32 {
-        if self.has_trained_output_head() {
-            TRANSFORMER_SCORE_WEIGHT_TRAINED
-        } else {
-            TRANSFORMER_SCORE_WEIGHT_UNTRAINED
+        self.transformer_base_blend_weight()
+    }
+
+    fn transformer_base_blend_weight(&self) -> f32 {
+        if !self.model_finite {
+            return 0.0;
         }
+        if !self.has_trained_output_head() {
+            return TRANSFORMER_SCORE_WEIGHT_UNTRAINED;
+        }
+
+        let mask = self.attention_projection_mask & ATTENTION_PROJECTION_KNOWN_MASK;
+        let has_o = mask & ATTENTION_PROJECTION_O != 0;
+        let has_v = mask & ATTENTION_PROJECTION_V != 0;
+        let has_q = mask & ATTENTION_PROJECTION_Q != 0;
+        let has_k = mask & ATTENTION_PROJECTION_K != 0;
+
+        if has_o && has_v && has_q && has_k {
+            TRANSFORMER_SCORE_WEIGHT_ATTENTION_OVQK
+        } else if has_o && has_v {
+            TRANSFORMER_SCORE_WEIGHT_ATTENTION_OV
+        } else if has_o {
+            TRANSFORMER_SCORE_WEIGHT_ATTENTION_O
+        } else if self.ffn_trained {
+            TRANSFORMER_SCORE_WEIGHT_FFN
+        } else {
+            TRANSFORMER_SCORE_WEIGHT_OUTPUT_HEAD
+        }
+    }
+
+    fn transformer_confidence_factor(&self, transformer_scores: &[(u32, f32)]) -> f32 {
+        let mut scores: Vec<f32> = transformer_scores
+            .iter()
+            .filter_map(|(_, score)| score.is_finite().then_some(*score))
+            .collect();
+        if scores.is_empty() {
+            return 0.0;
+        }
+        if !self.has_trained_output_head() {
+            return 1.0;
+        }
+
+        scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let top1 = scores[0];
+        let top2 = scores.get(1).copied().unwrap_or(0.0);
+        let margin = top1 - top2;
+
+        if top1 < 0.20 || margin < 0.03 {
+            0.50
+        } else if top1 < 0.35 || margin < 0.08 {
+            0.75
+        } else {
+            1.0
+        }
+    }
+
+    fn effective_transformer_weight(
+        &self,
+        transformer_scores: &[(u32, f32)],
+        hybrid_scores: &HashMap<u32, f32>,
+        has_memory_candidate: bool,
+    ) -> f32 {
+        if !self.model_finite {
+            return 0.0;
+        }
+
+        let mut weight = self.transformer_base_blend_weight()
+            * self.transformer_confidence_factor(transformer_scores);
+        if has_memory_candidate {
+            weight = weight.min(TRANSFORMER_SEQUENCE_MEMORY_CAP);
+        } else if hybrid_scores
+            .values()
+            .any(|score| score.is_finite() && *score >= TRANSFORMER_STRONG_MEMORY_SCORE)
+        {
+            weight = weight.min(TRANSFORMER_STRONG_MEMORY_CAP);
+        }
+        weight.clamp(0.0, 1.0)
     }
 
     /// Pure transformer scoring (used internally by `predict_top_k_assisted`).
@@ -814,8 +905,7 @@ impl TransformerPredictor {
                 .collect()
         };
 
-        scored.retain(|(_, score)| score.is_finite());
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        sort_prediction_scores(&mut scored);
         scored.truncate(k);
         scored
     }
@@ -865,37 +955,54 @@ impl TransformerPredictor {
             all_vocab,
         );
         let hybrid_map: HashMap<u32, f32> = all_hybrid.into_iter().collect();
+        let has_memory_candidate = !seq_memory.lookup_suffix(context_tokens).is_empty();
 
-        // 2. Transformer scores over the full vocab
-        let all_transformer = self.predict_top_k_transformer(embedder, context_tokens, all_vocab);
-        let transformer_map: HashMap<u32, f32> = all_transformer.into_iter().collect();
+        // 2. Transformer scores over the full vocab. Non-finite model state
+        // falls back to base scores instead of producing empty predictions.
+        let all_transformer = if self.model_finite {
+            self.predict_top_k_transformer(embedder, context_tokens, all_vocab)
+        } else {
+            Vec::new()
+        };
 
-        // 3. Weighted combination over the union of candidates
-        let mut all_ids: HashSet<u32> = hybrid_map
-            .keys()
-            .chain(transformer_map.keys())
-            .copied()
-            .collect();
-        if all_ids.is_empty() {
-            return Vec::new();
-        }
-
-        let tw = self.transformer_weight();
-        let mut scored: Vec<(u32, f32)> = all_ids
-            .drain()
-            .map(|tid| {
-                let hybrid = hybrid_map.get(&tid).copied().unwrap_or(0.0);
-                let transformer = transformer_map.get(&tid).copied().unwrap_or(0.0);
-                let final_score = (1.0 - tw) * hybrid + tw * transformer;
-                (tid, final_score)
-            })
-            .collect();
-
-        scored.retain(|(_, score)| score.is_finite());
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // 3. Reliability- and confidence-aware combination.
+        let tw =
+            self.effective_transformer_weight(&all_transformer, &hybrid_map, has_memory_candidate);
+        let mut scored = combine_prediction_scores(&hybrid_map, &all_transformer, tw);
         scored.truncate(k);
         scored
     }
+}
+
+fn combine_prediction_scores(
+    hybrid_map: &HashMap<u32, f32>,
+    transformer_scores: &[(u32, f32)],
+    transformer_weight: f32,
+) -> Vec<(u32, f32)> {
+    let transformer_map: HashMap<u32, f32> = transformer_scores
+        .iter()
+        .filter_map(|(id, score)| score.is_finite().then_some((*id, *score)))
+        .collect();
+
+    let mut all_ids: HashSet<u32> = hybrid_map
+        .keys()
+        .chain(transformer_map.keys())
+        .copied()
+        .collect();
+
+    let base_weight = 1.0 - transformer_weight;
+    let mut scored: Vec<(u32, f32)> = all_ids
+        .drain()
+        .map(|tid| {
+            let hybrid = hybrid_map.get(&tid).copied().unwrap_or(0.0);
+            let transformer = transformer_map.get(&tid).copied().unwrap_or(0.0);
+            let final_score = base_weight * hybrid + transformer_weight * transformer;
+            (tid, final_score)
+        })
+        .collect();
+
+    sort_prediction_scores(&mut scored);
+    scored
 }
 
 /// Experimental text generation that uses the transformer-assisted predictor.
@@ -2841,6 +2948,178 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transformer_weight_tiers_are_reliability_aware() {
+        let mut predictor = TransformerPredictor::new(4, 8, 5);
+        assert!((predictor.transformer_weight() - 0.15).abs() < 1e-6);
+
+        predictor.output_w = vec![0.0; 4];
+        assert!((predictor.transformer_weight() - 0.30).abs() < 1e-6);
+
+        predictor.ffn_trained = true;
+        assert!((predictor.transformer_weight() - 0.35).abs() < 1e-6);
+
+        predictor.attention_projection_mask = ATTENTION_PROJECTION_O;
+        assert!((predictor.transformer_weight() - 0.45).abs() < 1e-6);
+
+        predictor.attention_projection_mask = ATTENTION_PROJECTION_O | ATTENTION_PROJECTION_V;
+        assert!((predictor.transformer_weight() - 0.50).abs() < 1e-6);
+
+        predictor.attention_projection_mask = ATTENTION_PROJECTION_O
+            | ATTENTION_PROJECTION_V
+            | ATTENTION_PROJECTION_Q
+            | ATTENTION_PROJECTION_K;
+        assert!((predictor.transformer_weight() - 0.55).abs() < 1e-6);
+
+        predictor.model_finite = false;
+        assert!((predictor.transformer_weight() - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn transformer_confidence_factor_reduces_low_confidence_scores() {
+        let mut predictor = TransformerPredictor::new(4, 8, 5);
+        assert!(
+            (predictor.transformer_confidence_factor(&[]) - 0.0).abs() < 1e-6,
+            "empty transformer scores should have zero confidence"
+        );
+        assert!(
+            (predictor.transformer_confidence_factor(&[(10, 0.1)]) - 1.0).abs() < 1e-6,
+            "untrained cosine fallback keeps its already-low base weight"
+        );
+
+        predictor.output_w = vec![0.0; 4];
+        assert!(
+            (predictor.transformer_confidence_factor(&[(10, 0.19), (20, 0.01)]) - 0.50).abs()
+                < 1e-6,
+            "weak top-1 probability should halve influence"
+        );
+        assert!(
+            (predictor.transformer_confidence_factor(&[(10, 0.40), (20, 0.36)]) - 0.75).abs()
+                < 1e-6,
+            "small but not tiny margin should reduce influence"
+        );
+        assert!(
+            (predictor.transformer_confidence_factor(&[(10, 0.70), (20, 0.10)]) - 1.0).abs() < 1e-6,
+            "clear transformer distribution should keep full influence"
+        );
+    }
+
+    #[test]
+    fn transformer_blending_caps_strong_memory_and_can_improve_weak_ranking() {
+        use std::collections::HashMap;
+
+        let mut predictor = TransformerPredictor::new(4, 8, 5);
+        predictor.output_w = vec![0.0; 4];
+        predictor.ffn_trained = true;
+        predictor.attention_projection_mask = ATTENTION_PROJECTION_O
+            | ATTENTION_PROJECTION_V
+            | ATTENTION_PROJECTION_Q
+            | ATTENTION_PROJECTION_K;
+
+        let mut strong_memory = HashMap::new();
+        strong_memory.insert(10, 0.95);
+        let confident_wrong_transformer = vec![(20, 0.99), (10, 0.01)];
+        let capped_weight = predictor.effective_transformer_weight(
+            &confident_wrong_transformer,
+            &strong_memory,
+            false,
+        );
+        assert!((capped_weight - 0.45).abs() < 1e-6);
+
+        let combined =
+            combine_prediction_scores(&strong_memory, &confident_wrong_transformer, capped_weight);
+        assert_eq!(
+            combined.first().map(|(id, _)| *id),
+            Some(10),
+            "strong memory candidate must not be overpowered"
+        );
+
+        let mut weak_base = HashMap::new();
+        weak_base.insert(10, 0.40);
+        weak_base.insert(20, 0.35);
+        let confident_transformer = vec![(20, 0.90), (10, 0.10)];
+        let memory_capped_weight =
+            predictor.effective_transformer_weight(&confident_transformer, &weak_base, true);
+        assert!(
+            (memory_capped_weight - 0.40).abs() < 1e-6,
+            "real sequence-memory candidates should also cap transformer influence"
+        );
+
+        let weight =
+            predictor.effective_transformer_weight(&confident_transformer, &weak_base, false);
+        assert!((weight - 0.55).abs() < 1e-6);
+
+        let improved = combine_prediction_scores(&weak_base, &confident_transformer, weight);
+        assert_eq!(
+            improved.first().map(|(id, _)| *id),
+            Some(20),
+            "high-confidence transformer should improve weak/close ranking"
+        );
+    }
+
+    #[test]
+    fn non_finite_transformer_assisted_falls_back_to_base_scores() {
+        use std::collections::HashMap;
+
+        let mut table = HashMap::new();
+        table.insert(10u32, vec![1.0, 0.0, 0.0, 0.0]);
+        table.insert(20u32, vec![0.0, 1.0, 0.0, 0.0]);
+        let embedder = Embedder { dim: 4, table };
+        let network = Network::new();
+        let mut seq_memory = SequenceMemory::new();
+        seq_memory.record(&[10], 20);
+
+        let base = NextTokenPredictor::new(5).predict_top_k_with_memory(
+            &network,
+            &embedder,
+            &seq_memory,
+            &[10],
+            2,
+        );
+
+        let mut predictor = TransformerPredictor::new(4, 8, 5);
+        predictor.output_w = vec![0.0; 8];
+        predictor.output_b = vec![10.0, 0.0];
+        predictor.vocab_order = vec![10, 20];
+        predictor.model_finite = false;
+
+        let assisted = predictor.predict_top_k_assisted(&network, &embedder, &seq_memory, &[10], 2);
+        assert_eq!(assisted, base);
+        assert_eq!(assisted.first().map(|(id, _)| *id), Some(20));
+    }
+
+    #[test]
+    fn transformer_only_ignores_hybrid_reliability_gates() {
+        use std::collections::HashMap;
+
+        let mut table = HashMap::new();
+        table.insert(10u32, vec![1.0, 0.0, 0.0, 0.0]);
+        table.insert(20u32, vec![0.0, 1.0, 0.0, 0.0]);
+        let embedder = Embedder { dim: 4, table };
+
+        let mut predictor = TransformerPredictor::new(4, 8, 5);
+        predictor.output_w = vec![0.0; 8];
+        predictor.output_b = vec![10.0, 0.0];
+        predictor.vocab_order = vec![10, 20];
+        predictor.model_finite = false;
+
+        let transformer_only = predictor.predict_top_k_transformer(&embedder, &[10], 2);
+        assert_eq!(
+            transformer_only.first().map(|(id, _)| *id),
+            Some(10),
+            "pure transformer output must not use hybrid reliability fallback"
+        );
+    }
+
+    #[test]
+    fn prediction_score_sorting_is_deterministic_for_ties() {
+        let mut scored = vec![(30, 0.5), (20, 0.7), (10, 0.5), (40, f32::NAN)];
+        sort_prediction_scores(&mut scored);
+
+        let ids: Vec<u32> = scored.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec![20, 10, 30]);
+    }
+
     /// Test D: transformer-assisted generate does not panic and produces
     /// non-empty output.
     #[test]
@@ -3084,6 +3363,122 @@ mod tests {
             words_b.contains(&"rust's".to_string()),
             "'rust's' in top 3 for 'Ownership is', got: {:?}",
             words_b
+        );
+
+        // "most unique" -> "feature"
+        let tokens_c = {
+            let mut t = trainer.tokenizer.clone();
+            t.encode("most unique")
+        };
+        let results_c = predictor.predict_top_k_assisted(
+            &network,
+            &trainer.embedder,
+            &seq_memory,
+            &tokens_c,
+            3,
+        );
+        let words_c: Vec<String> = results_c
+            .iter()
+            .filter_map(|(id, _)| trainer.tokenizer.decode(*id).map(|s| s.to_string()))
+            .collect();
+        assert!(
+            words_c.contains(&"feature".to_string()),
+            "'feature' in top 3 for 'most unique', got: {:?}",
+            words_c
+        );
+    }
+
+    #[test]
+    fn transformer_generation_stays_stable_with_reliability_weighting() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        let text1 = "Rust is a systems programming language focused on safety and performance";
+        let text2 = "Ownership is Rust's most unique feature and has deep implications";
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            text1,
+            5,
+            20,
+            0.05,
+            5,
+        )
+        .unwrap();
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            text2,
+            5,
+            20,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let combined = format!("{} {}", text1, text2);
+        let all_tokens = trainer.tokenizer.encode(&combined);
+        let examples = build_sequence_examples(&all_tokens, 5);
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 30, 0.01, 0.01);
+        let predictor = TransformerPredictor::from_model(&model, 5);
+
+        let rust = generate_text_with_transformer(
+            &network,
+            &trainer.embedder,
+            &trainer.tokenizer,
+            &seq_memory,
+            &predictor,
+            "Rust is",
+            20,
+            1,
+        );
+        assert!(
+            rust.contains(
+                "rust is a systems programming language focused on safety and performance"
+            ),
+            "unexpected Rust generation: {}",
+            rust
+        );
+
+        let ownership = generate_text_with_transformer(
+            &network,
+            &trainer.embedder,
+            &trainer.tokenizer,
+            &seq_memory,
+            &predictor,
+            "Ownership",
+            20,
+            1,
+        );
+        assert!(
+            ownership.contains("ownership is rust's most unique feature and has deep implications"),
+            "unexpected Ownership generation: {}",
+            ownership
+        );
+
+        let unique = generate_text_with_transformer(
+            &network,
+            &trainer.embedder,
+            &trainer.tokenizer,
+            &seq_memory,
+            &predictor,
+            "most unique",
+            20,
+            1,
+        );
+        assert!(
+            unique.contains("most unique feature and has deep implications"),
+            "unexpected most unique generation: {}",
+            unique
         );
     }
 
