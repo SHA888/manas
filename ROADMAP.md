@@ -18,6 +18,16 @@ Manas is **not** trying to replace large hosted LLMs. It is a learning and resea
 | v0.6 | Transformer-assisted prediction and generation | Done |
 | v0.7 | Transformer output-head training | Done |
 | v0.7.1 | Controlled neuron growth during language training | Done |
+| v0.7.2 | Better inspect for language and transformer state | Done |
+| v0.8 | Train transformer FeedForward layer | Done |
+| v0.8.1 | Transformer training metrics | Done |
+| v0.8.2 | Safer transformer training | Done |
+| v0.9.0 | Attention cache + persistence prep | Done |
+| v0.9.1 | Train attention output projection w_o | Done |
+| v0.9.2 | Train attention value projection w_v | Done |
+| v0.9.3 | Train attention query/key projections w_q + w_k | Done |
+| v0.9.4 | Attention training safety and metrics cleanup | Done |
+| v0.9.5 | Reliability-aware transformer score weighting | Done |
 
 ## Completed Milestones
 
@@ -194,196 +204,507 @@ Goal achieved:
 
 > Manas can keep learning without exploding neuron count on repeated language-training runs.
 
+### v0.7.2 — Better Inspect for Language and Transformer State
+
+Inspect was updated to show the full Manas system state clearly.
+
+Completed:
+
+- `manas inspect` now shows 5 separate sections: Core Network, Language System, Transformer, Storage, and Total
+- Transformer param counting (attention, FFN, output head)
+- Sequence memory status and entry count
+- Sidecar file size reporting for all sidecars
+- Language metadata: unique texts and repeated training counts
+- `--verbose` flag for extended output
+- Renamed labels: "Neurons" → "Core neurons", "Layers" → "Core network layers"
+- Old stats continue to work correctly when sidecars are missing
+
+Goal achieved:
+
+> `manas inspect` accurately shows the full Manas system state including language, transformer, and sidecar visibility.
+
+---
+
+### v0.8 — Train Transformer Feed-Forward Layer
+
+The FeedForward layer inside the transformer block is now trained alongside the output head.
+
+Completed:
+
+- `FeedForward::train_step()` — full forward-cache, backprop through w1/b1/w2/b2, ReLU derivative, gradient clipping [-1, 1], NaN/inf safety
+- `TinyTransformerBlock::forward_with_ffn_inputs()` — returns per-position FFN inputs for backprop
+- `TransformerLanguageModel` gains `ffn_trained: bool` field
+- `TRANSFORMER_FILE_VERSION` bumped to 2 with FFN weight persistence
+- `TransformerPredictor::from_model()` copies the trained block instead of rebuilding it
+- `train_transformer_output_head()` now trains both output head AND FFN
+- `manas inspect` shows `FFN trained : yes/no`
+- 5 new tests (A: FFN weights change, B: attention stays frozen, C: prediction works, D: generation works, E: persistence roundtrip)
+- Attention Q/K/V/O remain frozen
+
+Example behaviour:
+
+```text
+$ manas train-language "text" --train-transformer
+# Now trains both output head and FFN weights
+$ manas inspect
+  Output head trained : yes
+  FFN trained         : yes
+```
+
+Goal achieved:
+
+> The transformer FFN layer learns from next-token signal through backpropagated gradients while attention remains frozen.
+
+---
+
+---
+
+### v0.8.1 — Transformer Training Metrics
+
+Transformer training now reports detailed metrics instead of a single loss number.
+
+Completed:
+
+- `TransformerTrainReport` struct with epochs, examples, loss, accuracy, and status fields
+- Per-epoch loss tracking (first, final, average)
+- Loss improvement percentage (safe with zero first-loss)
+- Top-1 and top-3 accuracy computed after training via transformer logits
+- Invalid/NaN update counting for gradient safety
+- Output head, FFN, and attention status in report
+- Formatted CLI output with all metrics
+- 5 new tests (A: report populated, B: accuracy math, C: improvement calc, D: zero-loss safe, E: format labels)
+
+Example CLI output:
+
+```text
+Transformer training
+  epochs                         : 100
+  examples                       : 10
+  language lr                    : 0.0500
+  transformer lr                 : 0.0100
+  avg train loss                   : 0.1234
+  first epoch loss                 : 0.4567
+  final epoch loss                 : 0.0234
+  improvement                      : 94.88%
+  pure transformer top-1 accuracy  : 80.00%
+  pure transformer top-3 accuracy  : 100.00%
+  output head                    : trained
+  feed-forward                   : trained
+  attention                      : frozen
+  invalid updates                : 0
+```
+
+Goal achieved:
+
+> Transformer training is now measurable with per-epoch loss, accuracy, improvement, and status reporting.
+
+---
+
+### v0.8.2 — Safer Transformer Training
+
+Before training deeper parts of the transformer, training safety was improved.
+
+Completed:
+
+- **`TransformerTrainingSafety` config** — `max_gradient_norm` (5.0), `max_loss` (50.0), `loss_explosion_factor` (5.0), `rollback_on_unstable` (true)
+- **Norm-based gradient clipping** — `gradient_norm()` / `clip_by_norm()` helper functions applied to both output head and FFN gradients
+- **Gradient norm tracking** — `max_gradient_norm_seen`, `avg_gradient_norm`, `clipped_updates` in report
+- **Loss explosion detection** — NaN/inf loss → invalid update; loss > `max_loss` → unstable; epoch loss > first epoch × explosion_factor → unstable
+- **Rollback** — snapshot before training, restore if model becomes non-finite or no examples evaluated
+- **`is_finite_model()`** — pre-save check prevents saving corrupted transformer state
+- **CLI safety block** — separate "Training safety" section in output with max/avg grad norm, clipped/invalid/unstable updates, rollback status
+- **CLI flags** — `--transformer-max-grad-norm`, `--transformer-max-loss`, `--no-transformer-rollback`
+- **6 new tests** (A: gradient norm, B: norm clipping, C: finite fresh model, D: NaN detection, E: rollback, F: normal training unchanged; 54 total)
+- All generation, prediction, default non-transformer path unchanged
+
+Goal achieved:
+
+> Transformer training is now safer with gradient norm clipping, loss explosion detection, and rollback.
+
+---
+
+### v0.9.0 — Attention Cache + Persistence Prep
+
+Before training attention projections, the attention forward path and transformer sidecar were prepared safely.
+
+Completed:
+
+- `AttentionForwardCache` stores Q/K/V projections, causal attention weights, and weighted values
+- `CausalSelfAttention::forward_with_cache()` returns normal outputs plus cache state
+- `CausalSelfAttention::forward()` keeps the same behavior by using the cached path
+- Transformer sidecar format bumped to version 3 with persisted `w_q`, `w_k`, `w_v`, and `w_o`
+- Version 2 transformer files still load with deterministic untrained attention
+- `TransformerLanguageModel` gains `attention_trained: bool`
+- `is_finite_model()` now checks attention weights for NaN/inf
+- `manas inspect` shows `Attention trained : yes/no`
+- Tests cover forward/cache equivalence, causal cache masking, cache shapes, finite attention checks, v2 compatibility, and v3 roundtrip
+- No attention training, scoring change, tokenizer change, or generation behavior change
+
+Goal achieved:
+
+> Manas now has the safe forward-cache, persistence, and inspection foundation required before attention projection training.
+
+---
+
+### v0.9.1 — Train Attention Output Projection `w_o`
+
+Manas now trains the safest attention projection first: only the output projection `w_o`.
+
+Completed:
+
+- `CausalSelfAttention::train_output_projection_step()` computes `grad_w_o = outer(grad_output, context)`
+- The attention cache supplies the final-position weighted value vector used as `context`
+- Minimal FFN backward support returns `dL/d(ffn_input)` for the final position
+- Transformer training computes the attention-output gradient from the residual path plus FFN input gradient
+- Only `w_o` is updated
+- `w_q`, `w_k`, and `w_v` remain frozen, with tests proving they do not change
+- `w_o` gradients participate in norm tracking, clipping, invalid update counting, finite checks, and rollback
+- Existing v3 transformer persistence round-trips the changed `w_o`
+- Training reports show `attention : partially trained` and `attention projections : o`
+- `manas inspect` shows `Attention trained : partial` and `Attention projections : o`
+- No softmax/QK gradients, scoring weight change, generation behavior change, tokenizer change, model size change, or sidecar version bump
+
+Goal achieved:
+
+> Make the safest attention projection learn first without touching softmax/QK gradients.
+
+---
+
+### v0.9.2 — Train Attention Value Projection `w_v`
+
+Manas now trains the attention value projection after `w_o`, without training attention routing.
+
+Completed:
+
+- `CausalSelfAttention::train_value_projection_step()` computes `grad_w_v` from cached final-position attention probabilities
+- `grad_context_last` is computed with the pre-update `w_o` transpose
+- Transformer training continues updating output head, FFN, and `w_o`
+- Only `w_v` is added to attention training in this milestone
+- `w_q` and `w_k` remain frozen, with tests proving they do not change
+- `w_v` gradients participate in norm tracking, clipping, invalid update counting, finite checks, and rollback
+- Existing transformer sidecar version 3 persists changed `w_o` and `w_v`
+- Version 3 sidecars now include an optional trailing projection bitmask without bumping the sidecar version
+- Legacy v3 files without the projection bitmask still load as `o`-only
+- Training reports show `attention : partially trained` and `attention projections : o,v`
+- `manas inspect` shows `Attention trained : partial` and `Attention projections : o,v`
+- No Q/K training, softmax-gradient training, scoring weight change, generation behavior change, tokenizer change, model size change, or sidecar version bump
+
+Goal achieved:
+
+> Allow attention to learn better value representations while avoiding Q/K softmax-gradient risk.
+
+---
+
+### v0.9.3 — Train Attention Query/Key Projections `w_q + w_k`
+
+Manas now trains attention routing through query/key projections after `w_o` and `w_v`.
+
+Completed:
+
+- `CausalSelfAttention::train_query_key_projection_step()` trains `w_q` and `w_k` together
+- Q/K gradients use cached Q/K/V projections and cached final-position causal attention probabilities
+- Softmax score gradients use only allowed positions `j <= i`
+- Output head, FFN, `w_o`, and `w_v` continue training
+- `w_q` and `w_k` gradients participate in norm tracking, clipping, invalid update counting, finite checks, and rollback
+- Existing transformer sidecar version 3 persists changed `w_o`, `w_v`, `w_q`, and `w_k`
+- The optional v3 projection bitmask now records `o,v,q,k` without bumping the sidecar version
+- Legacy v3 files without the projection bitmask still load as `o`-only
+- Existing v3 files with an `o,v` mask still load without claiming `q/k`
+- Finite-difference tests check selected `w_q` and `w_k` parameters
+- Training reports show `attention : partially trained` and `attention projections : o,v,q,k`
+- `manas inspect` shows `Attention trained : partial` and `Attention projections : o,v,q,k`
+- No scoring weight change, generation behavior change, tokenizer change, model size change, multi-head attention, layer norm, dynamic transformer growth, or sidecar version bump
+
+Goal achieved:
+
+> Let Manas learn attention routing and context selection directly.
+
+---
+
+### v0.9.4 — Attention Training Safety and Metrics Cleanup
+
+Manas now reports attention-specific safety metrics and strengthens rollback/persistence guards after `w_o`, `w_v`, `w_q`, and `w_k` training.
+
+Completed:
+
+- `AttentionTrainStepReport` now records whether an attention update was attempted plus the pre-clip gradient norm
+- Attention update reports are consistent across `w_o`, `w_v`, and `w_q/w_k`
+- Transformer training reports compact attention-specific safety metrics:
+  - attention update attempts
+  - attention updates applied
+  - attention clipped updates
+  - attention invalid updates
+  - max attention gradient norm
+  - average attention gradient norm
+- Global safety counters still report max/avg gradient norm, clipped updates, invalid updates, unstable updates, and rollback status
+- Attention metrics are counted once per attention helper call without double-counting global counters
+- `TransformerLanguageModel::save_to_file()` refuses to save non-finite transformer models
+- Assisted and transformer-only prediction paths filter non-finite scores before sorting
+- Epoch loss explosions trigger rollback when rollback is enabled
+- Rollback restores output head, FFN, `w_o`, `w_v`, `w_q`, `w_k`, `ffn_trained`, `attention_trained`, and the projection bitmask
+- Legacy v3 files without a projection bitmask still load as `o`
+- v3 projection bitmask files still round-trip `o,v,q,k`
+- Inspect remains conservative: `Attention trained : partial` and `Attention projections : o,v,q,k`
+- No scoring weight change, generation behavior change, tokenizer change, sequence memory change, model dimension change, sidecar version bump, multi-head attention, layer norm, dynamic transformer growth, or training math rewrite
+
+Goal achieved:
+
+> Make attention training measurable, safe, and easy to debug.
+
+---
+
+### v0.9.5 — Reliability-Aware Transformer Score Weighting
+
+Manas now gives the transformer more influence only when the loaded transformer is trained, finite, and confident.
+
+Completed:
+
+- `TransformerPredictor` carries runtime reliability metadata for FFN training, attention projection mask, and finite model state
+- Hybrid transformer weight now depends on reliability:
+  - untrained/cosine fallback: `0.15`
+  - output head only: `0.30`
+  - output head + FFN: `0.35`
+  - attention `o`: `0.45`
+  - attention `o,v`: `0.50`
+  - attention `o,v,q,k`: `0.55`
+- Transformer confidence reduces influence when top probability or top-1/top-2 margin is weak
+- Strong base-memory candidates cap transformer influence
+- Learned sequence-memory candidates use a stricter cap so exact memory remains stable
+- Non-finite transformer model state falls back to base memory/neural scores instead of returning empty predictions
+- Transformer-only prediction remains pure transformer output
+- Prediction score sorting is deterministic for ties
+- No tokenizer change, sequence memory format change, persistence format change, sidecar version bump, training math change, attention architecture change, CLI default change, dependency change, or unified `teach` command
+
+Goal achieved:
+
+> Improve hybrid prediction quality while preserving exact sequence-memory behavior and generation stability.
+
+---
+
 ## Next Milestones
 
-## v0.7.2 — Better Inspect for Language and Transformer State
+Add a future roadmap milestone after v0.9.5:
 
-Current `inspect` mostly shows the original core network stats. Manas now also has sequence memory, transformer state, language metadata, and sidecar files, so inspect needs to show the full system clearly.
+---
 
-### Goals
+## v0.9.6 — Unified Teaching Command
 
-- Make `inspect` accurately explain the full Manas state
-- Separate core network stats from language/transformer stats
-- Show transformer and sequence-memory sidecars
-- Make `Layers: 2` less confusing by renaming it to `Core network layers`
+### Goal
 
-### Planned Inspect Sections
+Manas currently has multiple learning commands:
 
-```text
-Core Network
-  Core network layers
-  Core neurons
-  Core network params
-  Growth mode
-
-Language System
-  Vocab size
-  Embedding dim
-  Embedding params
-  Sequence memory status
-  Sequence entries
-  Training runs
-  Unique language texts
-  Repeated trainings
-
-Transformer
-  Enabled
-  Transformer blocks
-  Attention heads
-  Embed dim
-  FFN hidden dim
-  Output head trained
-  Attention params
-  FFN params
-  Output head params
-  Total transformer params
-
-Storage
-  brain.manas size
-  brain.manas.seq size
-  brain.manas.transformer size
-  language metadata size
-  total storage size
-
-Total
-  Core params + embedding params + transformer params
+```txt
+learn
+ingest
+train-language
 ```
 
-### Notes
+This is powerful but not ideal for normal users because teaching a file/folder requires multiple commands.
 
-- Do not add new training behavior in this milestone
-- Do not implement v0.8 yet
-- Do not add layer growth yet
-- This milestone is visibility and debugging only
+Add a unified command:
 
----
-
-## v0.8 — Train Transformer Feed-Forward Layer
-
-Right now, the transformer output head is trained, but the internal transformer block is mostly fixed.
-
-The next safe step is to train the feed-forward part of the transformer block while keeping attention frozen.
-
-### Goals
-
-- Train `FeedForward` weights and biases:
-  - `w1`
-  - `b1`
-  - `w2`
-  - `b2`
-- Keep attention Q/K/V/O frozen for now
-- Keep the default generation path stable
-- Continue using `--train-transformer` and `--use-transformer`
-
-### Why FFN First?
-
-Training attention backprop is more complex. Training the feed-forward layer first is safer and gives the transformer path more learnable capacity without destabilizing the whole system.
-
-### Expected Result
-
-- Transformer-assisted score improves
-- Generation still works
-- No neuron explosion
-- No breaking changes to default prediction/generation
-
----
-
-## v0.8.1 — Transformer Training Metrics
-
-Add better reporting for transformer training quality.
-
-### Planned Metrics
-
-- Average transformer loss
-- Top-1 accuracy
-- Top-3 accuracy
-- Examples count
-- Epochs
-- Learning rate
-- Transformer score contribution
-
-### Example Output
-
-```text
-Trained transformer:
-  epochs        : 100
-  examples      : 10
-  avg loss      : 0.1234
-  top-1 accuracy: 80.00%
-  top-3 accuracy: 100.00%
+```bash
+manas teach <PATH_OR_TEXT>
 ```
 
-### Goal
+The command should support:
 
-> Make transformer training measurable instead of guessing from manual output.
+```bash
+manas teach "Manas is a local-first AI memory system"
+manas teach teach/identity.md
+manas teach teach/
+```
 
----
+### Behavior
 
-## v0.8.2 — Safer Transformer Training
+For text input:
 
-Before training deeper parts of the transformer, training safety should improve.
+```bash
+manas teach "Manas is written in Rust" --train-transformer
+```
 
-### Planned Safety Features
+It should:
 
-- Gradient clipping
-- NaN detection
-- Infinite-value detection
-- Loss explosion guard
-- Learning-rate safety checks
-- Optional rollback if training corrupts state
+* learn text into core memory
+* train language memory
+* train transformer if `--train-transformer` is passed
 
-### Goal
+For file input:
 
-> Make transformer training safer before attention weights are trained.
+```bash
+manas teach teach/identity.md --train-transformer
+```
 
----
+It should:
 
-## v0.9 — Train Attention Projections
+* ingest the file into source-aware memory
+* extract readable text from the file
+* train language memory from that text
+* train transformer if enabled
+* preserve source path metadata
 
-After FFN training is stable, train the attention projection matrices.
+For folder input:
 
-### Planned Trainable Weights
+```bash
+manas teach teach/ --train-transformer
+```
 
-- `w_q`
-- `w_k`
-- `w_v`
-- `w_o`
+It should:
 
-### Scope
+* recursively read supported files
+* ingest each file
+* train language memory from each file
+* train transformer from each file
+* preserve per-file source metadata
+* show a summary report
 
-- Single-head attention only
-- Small context windows
-- Small vocab first
-- Gradient clipping required
-- Strong tests required
+### Supported file types
 
-### Goal
+Start simple:
 
-> Make the transformer learn context and token order more deeply instead of relying mostly on sequence memory.
+```txt
+.md
+.txt
+```
 
----
+Do not add PDF/DOCX yet.
 
-## v0.9.1 — Improve Transformer Score Weight
+### CLI flags
 
-Currently the system uses a conservative hybrid score so transformer experiments do not break generation.
+Suggested flags:
+
+```bash
+manas teach <INPUT> \
+  --max-context 5 \
+  --epochs 100 \
+  --learning-rate 0.05 \
+  --train-transformer \
+  --transformer-learning-rate 0.05
+```
+
+Optional:
+
+```bash
+--recursive
+--include "*.md"
+--dry-run
+```
+
+### Output report
 
 Example:
 
-```text
-final_score = 0.60 * existing_hybrid_score + 0.40 * transformer_score
+```txt
+Teaching complete
+
+Core memory
+  files ingested        : 3
+  text chunks learned   : 3
+  source metadata       : preserved
+
+Language memory
+  sequence training     : yes
+  transformer training  : yes
+  total tokens          : ...
+
+Transformer
+  output head           : trained
+  feed-forward          : trained
+  attention             : partial
+  projections           : o,v,q,k
+
+Safety
+  invalid updates       : 0
+  unstable updates      : 0
+  rolled back           : no
 ```
 
-After transformer training improves, slowly increase transformer contribution.
+### Strict rules
 
-Possible future setting:
+Do not remove existing commands.
 
-```text
-final_score = 0.40 * existing_hybrid_score + 0.60 * transformer_score
+Keep these working:
+
+```txt
+learn
+ingest
+train-language
+predict-next
+generate
 ```
 
-### Goal
+`teach` is a higher-level convenience command built on top of existing logic.
 
-> Move more prediction responsibility from memory shortcut to the trained transformer path.
+Do not change transformer math.
+
+Do not change tokenizer.
+
+Do not change generation behavior.
+
+Do not change sidecar version.
+
+### Tests
+
+Add tests for:
+
+* teaching direct text
+* teaching one `.md` file
+* teaching one `.txt` file
+* teaching folder with multiple files
+* unsupported files are skipped safely
+* source metadata is preserved
+* language memory is trained
+* transformer training works from file text
+* predictions work after teaching file
+* dry-run does not mutate brain
+* old commands still work
+
+### Example validation
+
+Create:
+
+```bash
+mkdir -p teach
+cat > teach/identity.md <<'EOF'
+Manas is a local-first AI memory system written in Rust.
+Manas learns from text and files.
+Manas stores persistent memory in a .manas brain file.
+Manas uses custom transformer training.
+Manas is not a ChatGPT clone.
+EOF
+```
+
+Run:
+
+```bash
+./target/release/manas teach teach/identity.md \
+  --max-context 5 \
+  --epochs 100 \
+  --learning-rate 0.05 \
+  --train-transformer \
+  --transformer-learning-rate 0.05
+```
+
+Then test:
+
+```bash
+./target/release/manas predict-next "Manas is" --use-transformer --max-context 5 --top-k 5
+./target/release/manas generate "Manas is" --use-transformer --max-context 5 --max-tokens 30
+./target/release/manas inspect --verbose
+```
+
+Expected:
+
+```txt
+Manas is -> a / local-first
+generate -> manas is a local-first ai memory system written in rust
+```
+
+### Milestone name
+
+```txt
+v0.9.6 — Unified Teaching Command
+```
 
 ---
 
@@ -402,7 +723,7 @@ This is the first stable language milestone.
 - Persistent brain + sidecars
 - Better inspect output
 - Transformer output-head training
-- FFN training if stable
+- FFN training and partial `w_o`/`w_v` attention training if stable
 - Clean README examples
 - Strong tests
 
@@ -561,11 +882,5 @@ Manas should continue following these principles:
 The next coding milestone is:
 
 ```text
-v0.7.2 — Better inspect for language and transformer state
-```
-
-After that:
-
-```text
-v0.8 — Train transformer FeedForward layer
+v0.9.6 — Unified Teaching Command
 ```

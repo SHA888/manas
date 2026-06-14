@@ -797,7 +797,7 @@ Full CLI reference is in [Section 17](#17-cli-reference).
 
 ### 6.8 `manas-language`
 
-The language modeling crate. Provides next-token prediction, a transition-count sequence memory, a hybrid memory+neural predictor, and autoregressive text generation — all using the existing neural network (no attention, no transformers).
+The language modeling crate. Provides next-token prediction, a transition-count sequence memory, a hybrid memory+neural predictor, autoregressive text generation, and a small custom transformer path with trained output-head, FFN, and partial attention output/value projection training.
 
 #### Key Components
 
@@ -892,6 +892,24 @@ inputs
 
 **v0.7.1** — neural growth optimization for `train-language`. Growth is now capped by `max_new_neurons` (default 10) and only attempted during the **first epoch** of training, preventing repeated per-epoch explosion. A `LanguageMeta` struct persisted as `brain.manas.langmeta` tracks text hashes for **duplicate-text detection** — repeated training of the same text automatically sets the growth cap to 0. CLI flags `--max-new-neurons <N>` and `--no-grow` give the user direct control. The `LanguageTrainReport` now reports `neurons_grown`.
 
+**v0.8** — transformer training now includes the `FeedForward` layer. `FeedForward::train_step()` performs forward-pass caching, full backprop through w1/b1/w2/b2 with ReLU derivative, gradient clipping to [-1, 1], and NaN/inf skip. `train_transformer_output_head()` now trains both the output head and the FFN: it computes dL/d(block output) by backpropagating through the output head, then calls `feed_forward.train_step()` on the last token's FFN input. The `TransformerLanguageModel` persists FFN weights in the sidecar (version 2 format) and tracks an `ffn_trained` flag. `TransformerPredictor::from_model()` copies the trained block. Attention Q/K/V/O remain frozen. `manas inspect` reports `FFN trained : yes/no`.
+
+**v0.8.1** — transformer training now returns a `TransformerTrainReport` with detailed metrics: per-epoch loss tracking, first/final/avg loss, improvement percentage, pure transformer top-1/top-3 accuracy, invalid/NaN update count, and output-head/FFN/attention status. Added `evaluate_transformer_on_examples()` which computes both loss and accuracy from the same pure-transformer forward pass, skipping examples whose target is not in `vocab_order` (consistent with training). Added `TransformerEvalReport` struct. CLI features: `--transformer-learning-rate` (default 0.01) separates transformer LR from language LR; `--transformer-only` on `predict-next` shows pure transformer scores without hybrid mixing.
+
+**v0.8.2** — safer transformer training with norm-based gradient clipping (`gradient_norm()` / `clip_by_norm()` helpers), loss explosion detection (NaN/inf, max_loss, epoch-explosion factor), `TransformerTrainingSafety` config struct (defaults: max_gradient_norm=5.0, max_loss=50.0, loss_explosion_factor=5.0, rollback_on_unstable=true), model snapshot rollback on serious instability, `is_finite_model()` pre-save guard, and `train_transformer_output_head_with_safety()` entry point. `TransformerTrainReport` extended with `max_gradient_norm_seen`, `avg_gradient_norm`, `clipped_updates`, `unstable_updates`, `rolled_back`. CLI shows a dedicated "Training safety" block with `--transformer-max-grad-norm`, `--transformer-max-loss`, `--no-transformer-rollback` flags.
+
+**v0.9.0** — attention training foundation only. `CausalSelfAttention::forward_with_cache()` returns the normal forward output plus Q/K/V projections, causal attention weights, and weighted values so future attention backprop can reuse exact forward-pass state. `TransformerLanguageModel` now tracks `attention_trained: bool`; the transformer sidecar is version 3 and persists `w_q`, `w_k`, `w_v`, and `w_o` while preserving v2 loading by rebuilding deterministic untrained attention. `is_finite_model()` checks attention weights. No attention projection training, scoring change, or generation change is included in v0.9.0.
+
+**v0.9.1** — transformer training now updates only the attention output projection `w_o`. The training step uses the cached final-position weighted value vector as `context_last` and the gradient flowing into the attention output as `grad_attention_output_last`, then computes `grad_w_o = outer(grad_attention_output_last, context_last)`. Minimal FFN backward support returns `dL/d(ffn_input)` so the attention-output gradient is the residual gradient plus the FFN input gradient. The update goes through the existing safety path: norm tracking, clipping, invalid-gradient rejection, finite-model checks, and rollback. `w_q`, `w_k`, and `w_v` remain frozen; no softmax/QK gradients, scoring change, generation change, tokenizer change, model-size change, or sidecar version bump are included. `manas inspect` and training reports show partial attention as `Attention trained : partial` and `Attention projections : o`.
+
+**v0.9.2** — transformer training now also updates the attention value projection `w_v`. It first computes `grad_context_last = w_o^T * grad_attention_output_last` using the pre-update output projection, then uses the cached final-position attention row to distribute that gradient into value vectors: `grad_v_j = attention_prob(last, j) * grad_context_last`, followed by `grad_w_v += outer(grad_v_j, input_j)`. The existing output head, FFN, and `w_o` training continue. `w_q` and `w_k` remain frozen, and there is still no backprop through attention scores, softmax, Q, or K. Safety metrics include `w_v` gradient norms, clipping, invalid update counts, finite checks, and rollback. The transformer sidecar remains version 3; new files append an optional projection bitmask so inspect can report `Attention projections : o,v`, while legacy v3 files without the bitmask load as `o`.
+
+**v0.9.3** — transformer training now also updates the attention query/key projections `w_q` and `w_k` together for the final token position. It reuses the same attention cache as the forward pass and computes the causal softmax gradient only over allowed positions `j <= i`: `grad_a_j = dot(grad_context_last, v_j)`, `grad_score_j = a_j * (grad_a_j - sum_l a_l * grad_a_l)`, then accumulates `grad_w_q += outer(grad_q_i, x_i)` and `grad_w_k += outer(grad_k_j, x_j)`. Output head, FFN, `w_o`, and `w_v` continue training. The system remains single-head, keeps transformer sidecar version 3, and does not change tokenizer, sequence memory, scoring weights, model dimensions, generation behavior, layer norm, or dynamic growth. Inspect and training reports still say partial attention and display `Attention projections : o,v,q,k`.
+
+**v0.9.4** — attention training safety and observability were tightened without changing training math, scoring weights, generation behavior, model dimensions, or sidecar version. `AttentionTrainStepReport` now records attempted updates and pre-clip gradient norms consistently for `w_o`, `w_v`, and `w_q/w_k`. `TransformerTrainReport` adds attention-specific attempts/applied/clipped/invalid counters plus max/avg attention gradient norms, while global safety counters remain unchanged and are not double-counted. The CLI prints a compact "Attention safety" block. `TransformerLanguageModel::save_to_file()` refuses non-finite transformer models, assisted and transformer-only prediction filter non-finite scores before sorting, and rollback on serious instability restores the output head, FFN, all attention projections, `ffn_trained`, `attention_trained`, and the projection bitmask. Inspect remains conservative: `Attention trained : partial` and `Attention projections : o,v,q,k`.
+
+**v0.9.5** — transformer-assisted prediction now uses reliability-aware score weighting instead of the old fixed 0.25/0.40 blend. `TransformerPredictor` carries runtime metadata copied from `TransformerLanguageModel`: `ffn_trained`, `attention_projection_mask`, and `model_finite`. The base transformer weight is `0.15` for untrained cosine fallback, `0.30` for output-head-only, `0.35` for output head + FFN, `0.45` for attention `o`, `0.50` for attention `o,v`, and `0.55` for attention `o,v,q,k`. A simple confidence factor reduces transformer influence when top probability or top-1/top-2 margin is weak. Strong base-memory candidates cap transformer influence, learned sequence-memory candidates use a stricter cap to preserve exact transitions, and non-finite transformer state falls back to base memory/neural scores. `--transformer-only` remains pure transformer output. No tokenizer, sequence memory format, persistence format, sidecar version, training math, attention architecture, CLI default, or generation CLI behavior changes are included.
+
 #### Single-Head Causal Attention (v0.4)
 
 `CausalSelfAttention` is a standalone module in `attention.rs` with QKV projections, scaled dot-product scores, causal masking, and an output projection. It is implemented as custom Rust with no external dependencies. Not yet integrated into the default prediction path.
@@ -907,6 +925,26 @@ pub struct CausalSelfAttention {
 ```
 
 Weights are initialized with small random values (`N(0, 0.02)` scaled by `1/sqrt(d)`). The forward pass computes Q, K, V for each input token, applies causal masking (position `i` only attends to `0..=i`), scaled dot-product attention, softmax, weighted sum of V, and output projection.
+
+`AttentionForwardCache` stores the forward intermediates needed by the next training step:
+
+```rust
+pub struct AttentionForwardCache {
+    pub qs: Vec<Vec<f32>>,
+    pub ks: Vec<Vec<f32>>,
+    pub vs: Vec<Vec<f32>>,
+    pub attention_weights: Vec<Vec<f32>>,
+    pub weighted_values: Vec<Vec<f32>>,
+}
+```
+
+`CausalSelfAttention::forward_with_cache()` returns `(outputs, cache)`. `forward()` delegates through the same path, so inference and prediction behavior stay unchanged.
+
+`CausalSelfAttention::train_output_projection_step()` is the v0.9.1 partial attention trainer. It accepts a cached context vector, an output gradient, a learning rate, and a max gradient norm. It updates only `w_o`, reports whether the update was attempted, applied, clipped, or invalid, records the pre-clip gradient norm, rejects non-finite gradients without mutation, and leaves `w_q`, `w_k`, and `w_v` untouched.
+
+`CausalSelfAttention::train_value_projection_step()` is the v0.9.2 partial attention trainer. It accepts the original token embeddings, the cached final-position attention weights, `grad_context_last`, a learning rate, and a max gradient norm. It updates only `w_v`, reports whether the update was attempted, applied, clipped, or invalid, records the pre-clip gradient norm, rejects non-finite gradients without mutation, and leaves `w_q`, `w_k`, and `w_o` untouched.
+
+`CausalSelfAttention::train_query_key_projection_step()` is the v0.9.3 partial attention trainer. It accepts the original token embeddings, cached Q/K/V projections, the cached final-position attention row, `grad_context_last`, a learning rate, and a max gradient norm. It updates only `w_q` and `w_k` through the causal softmax score gradient, clips their combined gradient norm, reports attempted/applied/clipped/invalid state and the pre-clip gradient norm, rejects non-finite gradients without mutation, and leaves `w_v` and `w_o` untouched.
 
 Helpers: `mat_vec_mul`, `dot`, `softmax` (numerically stable, subtracts max before exp).
 
@@ -1438,6 +1476,15 @@ No panics in library code. The CLI converts errors to user-friendly messages.
 | M15 | **Transformer-assisted prediction (v0.6)** — `--use-transformer` flag, hybrid scoring, default path unchanged | `manas-language`, `manas-cli` | Experimental transformer integration |
 | M16 | **Transformer output-head training (v0.7)** — `--train-transformer` flag, cross-entropy, output head only, dynamic weight (0.40 trained / 0.25 untrained) | `manas-language`, `manas-cli` | Transformer learns next-token prediction |
 | M17 | **Neural growth optimization (v0.7.1)** — `max_new_neurons` cap, first-epoch-only growth, `LanguageMeta` sidecar for duplicate-text detection, `--max-new-neurons`/`--no-grow` CLI flags | `manas-language`, `manas-cli` | Controlled network growth |
+| M18 | **Enhanced system inspect (v0.7.2)** — `manas inspect` shows Core Network, Language System, Transformer, Storage, and Total sections; reports sidecar file sizes, transformer param counts, sequence memory status, language metadata; `--verbose` flag | `manas-cli` | Full inspect visibility |
+| M19 | **FFN training (v0.8)** — `FeedForward::train_step()`, `forward_with_ffn_inputs()`, FFN weight persistence (v2 sidecar), `ffn_trained` flag, gradients clipped to [-1, 1], NaN/inf safety, attention frozen | `manas-language`, `manas-cli` | Transformer FFN learns next-token signal |
+| M20 | **Training metrics (v0.8.1)** — `TransformerTrainReport`, per-epoch loss, top-1/top-3 accuracy, improvement %, invalid update tracking, formatted CLI output | `manas-language`, `manas-cli` | Measurable transformer training |
+| M21 | **Attention cache + persistence prep (v0.9.0)** — `AttentionForwardCache`, `forward_with_cache()`, attention finite checks, v3 transformer sidecar with attention weights, `attention_trained` inspect status | `manas-language`, `manas-cli` | Foundation for attention projection training |
+| M22 | **Attention output projection training (v0.9.1)** — `train_output_projection_step()`, FFN input-gradient support, `w_o` update with safety metrics and rollback, `q/k/v` frozen, partial inspect/report status | `manas-language`, `manas-cli` | Safest attention projection starts learning |
+| M23 | **Attention value projection training (v0.9.2)** — `train_value_projection_step()`, `w_v` update from cached final attention row, optional v3 projection bitmask, `q/k` frozen, partial `o,v` inspect/report status | `manas-language`, `manas-cli` | Attention value representations start learning |
+| M24 | **Attention query/key projection training (v0.9.3)** — `train_query_key_projection_step()`, causal final-token softmax gradient, combined Q/K clipping, finite-difference tests, partial `o,v,q,k` inspect/report status | `manas-language`, `manas-cli` | Attention routing starts learning |
+| M25 | **Attention safety and metrics cleanup (v0.9.4)** — attention-specific safety counters, finite save guard, non-finite prediction-score filtering, rollback of output head/FFN/attention flags and projections, stable `o,v,q,k` reporting | `manas-language`, `manas-cli` | Attention training is safer and easier to debug |
+| M26 | **Reliability-aware transformer score weighting (v0.9.5)** — runtime reliability metadata, trained-projection weight tiers, confidence factor, sequence-memory cap, non-finite fallback to base scores, deterministic score sorting | `manas-language` | Transformer influence grows only when reliable |
 
 ---
 
@@ -1466,7 +1513,7 @@ manas ingest --folder ./docs/ --dry-run
 # Train next-token prediction
 manas train-language "Rust is a systems programming language" --epochs 50
 
-# Train next-token prediction with transformer output head (v0.7)
+# Train next-token prediction with transformer output head, FFN, and attention w_o/w_v/w_q/w_k (v0.9.5)
 manas train-language "Rust is a systems programming language" --epochs 50 --train-transformer
 
 # Train next-token prediction with growth control (v0.7.1)
@@ -1504,20 +1551,62 @@ manas refresh
 # Refresh only a specific freshness category
 manas refresh --category fast
 
-# Show brain stats
+# Show brain stats (v0.7.2 shows full system state)
 manas inspect
 # Output:
-#  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #   Manas Brain — brain.manas
-#  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#   Neurons       :  4,821
-#   Layers        :  8
-#   Vocab size    :  12,483
-#   Brain size    :  9.4 MB
-#   Texts learned :  31,209
-#   Files ingested:  47
-#   Last updated  :  2 hours ago
-#  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+#  Core Network
+#  ─────────────────────────────────────
+#   Core network layers : 8
+#   Core neurons        : 4,821
+#   Core network params : 128,498
+#
+#  Language System
+#  ─────────────────────────────────────
+#   Vocab size          : 12,483
+#   Embedding dim       : 64
+#   Embedding params    : 798,912
+#   Sequence memory     : enabled
+#   Sequence entries    : 15,342
+#   Training runs       : 31,209
+#   Unique texts        : 4,102
+#   Repeated trainings  : 712
+#
+#  Transformer
+#  ─────────────────────────────────────
+#   Enabled             : yes
+#   Blocks              : 1
+#   Attention heads     : 1
+#   Embed dim           : 64
+#   FFN hidden dim      : 128
+#   Output head trained : yes
+#   FFN trained         : yes
+#   Attention trained     : partial
+#   Attention projections : o,v,q,k
+#   Attention params    : 16,384
+#   FFN params          : 16,512
+#   Output head params  : 799,872
+#   Transformer params  : 832,768
+#
+#  Storage
+#  ─────────────────────────────────────
+#   Brain file          : 9,437,184  (9.00 MB)
+#   Sequence file       : 1,245,312  (1.19 MB)
+#   Transformer file    : 3,201,792  (3.05 MB)
+#   Language metadata   : 164,352    (160.50 KB)
+#   Total storage       : 14,048,640 (13.40 MB)
+#
+#  Total
+#  ─────────────────────────────────────
+#   Total params        : 1,760,178
+#   Last updated        : 2 hours ago
+#  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# Show with verbose output
+manas inspect --verbose
 
 # List all ingested files
 manas files

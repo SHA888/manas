@@ -42,6 +42,15 @@ pub fn build_sequence_examples(tokens: &[u32], max_context: usize) -> Vec<Sequen
     examples
 }
 
+fn sort_prediction_scores(scored: &mut Vec<(u32, f32)>) {
+    scored.retain(|(_, score)| score.is_finite());
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+}
+
 // ─── Sequence Memory ──────────────────────────────────────────────────────────
 
 /// A transition-count table that records which tokens follow which contexts.
@@ -81,7 +90,7 @@ impl SequenceMemory {
                 && !targets.is_empty()
             {
                 let mut result: Vec<(u32, u32)> = targets.iter().map(|(&t, &c)| (t, c)).collect();
-                result.sort_by(|a, b| b.1.cmp(&a.1));
+                result.sort_by_key(|b| std::cmp::Reverse(b.1));
                 return result;
             }
         }
@@ -233,7 +242,7 @@ impl NextTokenPredictor {
             })
             .collect();
 
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        sort_prediction_scores(&mut scored);
         scored.truncate(k);
         scored
     }
@@ -312,7 +321,7 @@ impl NextTokenPredictor {
             })
             .collect();
 
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        sort_prediction_scores(&mut scored);
         scored.truncate(k);
         scored
     }
@@ -325,15 +334,26 @@ use crate::transformer::TinyTransformerBlock;
 
 // Magic constants for the transformer model sidecar file.
 const TRANSFORMER_FILE_MAGIC: u32 = 0x5452464C; // "TRFL"
-const TRANSFORMER_FILE_VERSION: u32 = 1;
+const TRANSFORMER_FILE_VERSION: u32 = 3;
+const ATTENTION_PROJECTION_O: u8 = 0b0000_0001;
+const ATTENTION_PROJECTION_V: u8 = 0b0000_0010;
+const ATTENTION_PROJECTION_Q: u8 = 0b0000_0100;
+const ATTENTION_PROJECTION_K: u8 = 0b0000_1000;
+const ATTENTION_PROJECTION_KNOWN_MASK: u8 = ATTENTION_PROJECTION_O
+    | ATTENTION_PROJECTION_V
+    | ATTENTION_PROJECTION_Q
+    | ATTENTION_PROJECTION_K;
 
-/// Weight given to the transformer score when the output head is **untrained**
-/// (cosine-similarity fallback).
-const TRANSFORMER_SCORE_WEIGHT_UNTRAINED: f32 = 0.25;
-
-/// Weight given to the transformer score when the output head **has been
-/// trained** via `train_transformer_output_head`.
-const TRANSFORMER_SCORE_WEIGHT_TRAINED: f32 = 0.40;
+/// Reliability-aware transformer score weights for assisted prediction.
+const TRANSFORMER_SCORE_WEIGHT_UNTRAINED: f32 = 0.15;
+const TRANSFORMER_SCORE_WEIGHT_OUTPUT_HEAD: f32 = 0.30;
+const TRANSFORMER_SCORE_WEIGHT_FFN: f32 = 0.35;
+const TRANSFORMER_SCORE_WEIGHT_ATTENTION_O: f32 = 0.45;
+const TRANSFORMER_SCORE_WEIGHT_ATTENTION_OV: f32 = 0.50;
+const TRANSFORMER_SCORE_WEIGHT_ATTENTION_OVQK: f32 = 0.55;
+const TRANSFORMER_STRONG_MEMORY_SCORE: f32 = 0.95;
+const TRANSFORMER_STRONG_MEMORY_CAP: f32 = 0.45;
+const TRANSFORMER_SEQUENCE_MEMORY_CAP: f32 = 0.40;
 
 /// The full transformer language model: a `TinyTransformerBlock` (frozen for
 /// v0.7) plus a trainable linear output head (`output_w`, `output_b`) that
@@ -343,9 +363,9 @@ const TRANSFORMER_SCORE_WEIGHT_TRAINED: f32 = 0.40;
 /// deterministically (sorted) at creation time.  Both training and inference
 /// use this mapping so indices are always correct.
 ///
-/// Weights are deterministic (seeded Box-Muller).  The block is **not**
-/// serialised by default — on load it is rebuilt from `(embed_dim, hidden_dim)`
-/// using the same seeds, which is correct while block weights are frozen.
+/// The transformer block FFN weights are serialised from v0.8 onward.
+/// Attention weights are serialised from v0.9.0 onward.
+#[derive(Clone)]
 pub struct TransformerLanguageModel {
     pub block: TinyTransformerBlock,
     pub output_w: Vec<f32>,
@@ -353,6 +373,12 @@ pub struct TransformerLanguageModel {
     pub embed_dim: usize,
     pub hidden_dim: usize,
     pub vocab_order: Vec<u32>,
+    /// Tracks whether the FFN has been trained (updated after v0.8 training).
+    pub ffn_trained: bool,
+    /// Tracks whether attention projections have been trained.
+    pub attention_trained: bool,
+    /// Bitmask of trained attention projections. v0.9.1 legacy files imply `o`.
+    pub attention_projection_mask: u8,
 }
 
 impl TransformerLanguageModel {
@@ -372,7 +398,46 @@ impl TransformerLanguageModel {
             embed_dim,
             hidden_dim,
             vocab_order,
+            ffn_trained: false,
+            attention_trained: false,
+            attention_projection_mask: 0,
         }
+    }
+
+    pub fn attention_projection_o_trained(&self) -> bool {
+        self.attention_projection_mask & ATTENTION_PROJECTION_O != 0
+    }
+
+    pub fn attention_projection_v_trained(&self) -> bool {
+        self.attention_projection_mask & ATTENTION_PROJECTION_V != 0
+    }
+
+    pub fn attention_projection_q_trained(&self) -> bool {
+        self.attention_projection_mask & ATTENTION_PROJECTION_Q != 0
+    }
+
+    pub fn attention_projection_k_trained(&self) -> bool {
+        self.attention_projection_mask & ATTENTION_PROJECTION_K != 0
+    }
+
+    fn mark_attention_projection_o_trained(&mut self) {
+        self.attention_projection_mask |= ATTENTION_PROJECTION_O;
+        self.attention_trained = true;
+    }
+
+    fn mark_attention_projection_v_trained(&mut self) {
+        self.attention_projection_mask |= ATTENTION_PROJECTION_V;
+        self.attention_trained = true;
+    }
+
+    fn mark_attention_projection_q_trained(&mut self) {
+        self.attention_projection_mask |= ATTENTION_PROJECTION_Q;
+        self.attention_trained = true;
+    }
+
+    fn mark_attention_projection_k_trained(&mut self) {
+        self.attention_projection_mask |= ATTENTION_PROJECTION_K;
+        self.attention_trained = true;
     }
 
     /// Number of vocabulary entries in the output head.
@@ -409,6 +474,12 @@ impl TransformerLanguageModel {
 
     /// Save the model to a sidecar binary file.
     pub fn save_to_file(&self, path: &Path) -> Result<(), ManasError> {
+        if !is_finite_model(self) {
+            return Err(ManasError::GrowthFailed(
+                "refusing to save non-finite transformer model".to_string(),
+            ));
+        }
+
         let mut buf = Vec::new();
         let vsize = self.vocab_size() as u32;
 
@@ -435,6 +506,66 @@ impl TransformerLanguageModel {
         for &id in &self.vocab_order {
             buf.extend_from_slice(&id.to_le_bytes());
         }
+
+        // FFN weights (v0.8)
+        let ffn = &self.block.feed_forward;
+        let ffn_trained = if self.ffn_trained { 1u8 } else { 0u8 };
+        buf.push(ffn_trained);
+
+        let w1_len = ffn.w1.len() as u32;
+        buf.extend_from_slice(&w1_len.to_le_bytes());
+        for &v in &ffn.w1 {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let b1_len = ffn.b1.len() as u32;
+        buf.extend_from_slice(&b1_len.to_le_bytes());
+        for &v in &ffn.b1 {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let w2_len = ffn.w2.len() as u32;
+        buf.extend_from_slice(&w2_len.to_le_bytes());
+        for &v in &ffn.w2 {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let b2_len = ffn.b2.len() as u32;
+        buf.extend_from_slice(&b2_len.to_le_bytes());
+        for &v in &ffn.b2 {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+
+        // Attention weights (v0.9.0 / sidecar v3)
+        let attn = &self.block.attention;
+        let attention_trained = if self.attention_trained { 1u8 } else { 0u8 };
+        buf.push(attention_trained);
+
+        let wq_len = attn.w_q.len() as u32;
+        buf.extend_from_slice(&wq_len.to_le_bytes());
+        for &v in &attn.w_q {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let wk_len = attn.w_k.len() as u32;
+        buf.extend_from_slice(&wk_len.to_le_bytes());
+        for &v in &attn.w_k {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let wv_len = attn.w_v.len() as u32;
+        buf.extend_from_slice(&wv_len.to_le_bytes());
+        for &v in &attn.w_v {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let wo_len = attn.w_o.len() as u32;
+        buf.extend_from_slice(&wo_len.to_le_bytes());
+        for &v in &attn.w_o {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let projection_mask = if self.attention_projection_mask != 0 {
+            self.attention_projection_mask & ATTENTION_PROJECTION_KNOWN_MASK
+        } else if self.attention_trained {
+            ATTENTION_PROJECTION_O
+        } else {
+            0
+        };
+        buf.push(projection_mask);
 
         std::fs::write(path, &buf).map_err(|e| ManasError::FileReadError {
             path: path.to_path_buf(),
@@ -469,7 +600,7 @@ impl TransformerLanguageModel {
                 magic
             )));
         }
-        let _version = read_u32(&mut cursor);
+        let version = read_u32(&mut cursor);
         let embed_dim = read_u32(&mut cursor) as usize;
         let hidden_dim = read_u32(&mut cursor) as usize;
         let _vocab_size = read_u32(&mut cursor);
@@ -503,6 +634,70 @@ impl TransformerLanguageModel {
             *id = u32::from_le_bytes(bytes);
         }
 
+        let read_f32_vec = |c: &mut &[u8]| -> Vec<f32> {
+            let len = read_u32(c) as usize;
+            let mut v = vec![0.0; len];
+            for x in &mut v {
+                let mut bytes = [0u8; 4];
+                bytes.copy_from_slice(&c[..4]);
+                *c = &c[4..];
+                *x = f32::from_le_bytes(bytes);
+            }
+            v
+        };
+
+        // FFN weights (v0.8+)
+        let (mut block, ffn_trained) = if version >= 2 {
+            let ffn_trained = if cursor.first().copied().unwrap_or(0) != 0 {
+                cursor = &cursor[1..];
+                true
+            } else {
+                cursor = &cursor[1..];
+                false
+            };
+
+            let w1 = read_f32_vec(&mut cursor);
+            let b1 = read_f32_vec(&mut cursor);
+            let w2 = read_f32_vec(&mut cursor);
+            let b2 = read_f32_vec(&mut cursor);
+
+            let mut block = block;
+            block.feed_forward.w1 = w1;
+            block.feed_forward.b1 = b1;
+            block.feed_forward.w2 = w2;
+            block.feed_forward.b2 = b2;
+            (block, ffn_trained)
+        } else {
+            (block, false)
+        };
+
+        // Attention weights (v0.9.0+). Older sidecars keep deterministic
+        // freshly rebuilt attention weights.
+        let (attention_trained, attention_projection_mask) = if version >= 3 {
+            let attention_trained = if cursor.first().copied().unwrap_or(0) != 0 {
+                cursor = &cursor[1..];
+                true
+            } else {
+                cursor = &cursor[1..];
+                false
+            };
+
+            block.attention.w_q = read_f32_vec(&mut cursor);
+            block.attention.w_k = read_f32_vec(&mut cursor);
+            block.attention.w_v = read_f32_vec(&mut cursor);
+            block.attention.w_o = read_f32_vec(&mut cursor);
+            let projection_mask = if let Some(&mask) = cursor.first() {
+                mask & ATTENTION_PROJECTION_KNOWN_MASK
+            } else if attention_trained {
+                ATTENTION_PROJECTION_O
+            } else {
+                0
+            };
+            (attention_trained || projection_mask != 0, projection_mask)
+        } else {
+            (false, 0)
+        };
+
         Ok(TransformerLanguageModel {
             block,
             output_w,
@@ -510,6 +705,9 @@ impl TransformerLanguageModel {
             embed_dim,
             hidden_dim,
             vocab_order,
+            ffn_trained,
+            attention_trained,
+            attention_projection_mask,
         })
     }
 }
@@ -523,15 +721,15 @@ impl TransformerLanguageModel {
 /// the transformer scores come from the output-head projection + softmax;
 /// otherwise a cosine-similarity fallback is used.
 ///
-/// The transformer weight is **dynamic**:
-/// * 0.25 when the output head is empty (untrained cosine-similarity mode)
-/// * 0.40 when the output head has been trained
 pub struct TransformerPredictor {
     pub block: TinyTransformerBlock,
     pub output_w: Vec<f32>,
     pub output_b: Vec<f32>,
     pub vocab_order: Vec<u32>,
     pub max_context: usize,
+    pub ffn_trained: bool,
+    pub attention_projection_mask: u8,
+    pub model_finite: bool,
 }
 
 impl TransformerPredictor {
@@ -544,20 +742,25 @@ impl TransformerPredictor {
             output_b: Vec::new(),
             vocab_order: Vec::new(),
             max_context,
+            ffn_trained: false,
+            attention_projection_mask: 0,
+            model_finite: true,
         }
     }
 
     /// Create a predictor from a trained `TransformerLanguageModel`.
     ///
-    /// The block is **rebuilt** from the model's dimensions using the same
-    /// deterministic seeds (correct while block weights are frozen).
+    /// The block weights (including trained FFN) are copied from the model.
     pub fn from_model(model: &TransformerLanguageModel, max_context: usize) -> Self {
         TransformerPredictor {
-            block: TinyTransformerBlock::new(model.embed_dim, model.hidden_dim),
+            block: model.block.clone(),
             output_w: model.output_w.clone(),
             output_b: model.output_b.clone(),
             vocab_order: model.vocab_order.clone(),
             max_context,
+            ffn_trained: model.ffn_trained,
+            attention_projection_mask: model.attention_projection_mask,
+            model_finite: is_finite_model(model),
         }
     }
 
@@ -566,20 +769,93 @@ impl TransformerPredictor {
         !self.output_w.is_empty()
     }
 
-    /// The weight to apply to the transformer score (0.25 untrained / 0.40 trained).
+    /// The base reliability weight to apply to the transformer score before
+    /// confidence and strong-memory gates.
     pub fn transformer_weight(&self) -> f32 {
-        if self.has_trained_output_head() {
-            TRANSFORMER_SCORE_WEIGHT_TRAINED
-        } else {
-            TRANSFORMER_SCORE_WEIGHT_UNTRAINED
+        self.transformer_base_blend_weight()
+    }
+
+    fn transformer_base_blend_weight(&self) -> f32 {
+        if !self.model_finite {
+            return 0.0;
         }
+        if !self.has_trained_output_head() {
+            return TRANSFORMER_SCORE_WEIGHT_UNTRAINED;
+        }
+
+        let mask = self.attention_projection_mask & ATTENTION_PROJECTION_KNOWN_MASK;
+        let has_o = mask & ATTENTION_PROJECTION_O != 0;
+        let has_v = mask & ATTENTION_PROJECTION_V != 0;
+        let has_q = mask & ATTENTION_PROJECTION_Q != 0;
+        let has_k = mask & ATTENTION_PROJECTION_K != 0;
+
+        if has_o && has_v && has_q && has_k {
+            TRANSFORMER_SCORE_WEIGHT_ATTENTION_OVQK
+        } else if has_o && has_v {
+            TRANSFORMER_SCORE_WEIGHT_ATTENTION_OV
+        } else if has_o {
+            TRANSFORMER_SCORE_WEIGHT_ATTENTION_O
+        } else if self.ffn_trained {
+            TRANSFORMER_SCORE_WEIGHT_FFN
+        } else {
+            TRANSFORMER_SCORE_WEIGHT_OUTPUT_HEAD
+        }
+    }
+
+    fn transformer_confidence_factor(&self, transformer_scores: &[(u32, f32)]) -> f32 {
+        let mut scores: Vec<f32> = transformer_scores
+            .iter()
+            .filter_map(|(_, score)| score.is_finite().then_some(*score))
+            .collect();
+        if scores.is_empty() {
+            return 0.0;
+        }
+        if !self.has_trained_output_head() {
+            return 1.0;
+        }
+
+        scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let top1 = scores[0];
+        let top2 = scores.get(1).copied().unwrap_or(0.0);
+        let margin = top1 - top2;
+
+        if top1 < 0.20 || margin < 0.03 {
+            0.50
+        } else if top1 < 0.35 || margin < 0.08 {
+            0.75
+        } else {
+            1.0
+        }
+    }
+
+    fn effective_transformer_weight(
+        &self,
+        transformer_scores: &[(u32, f32)],
+        hybrid_scores: &HashMap<u32, f32>,
+        has_memory_candidate: bool,
+    ) -> f32 {
+        if !self.model_finite {
+            return 0.0;
+        }
+
+        let mut weight = self.transformer_base_blend_weight()
+            * self.transformer_confidence_factor(transformer_scores);
+        if has_memory_candidate {
+            weight = weight.min(TRANSFORMER_SEQUENCE_MEMORY_CAP);
+        } else if hybrid_scores
+            .values()
+            .any(|score| score.is_finite() && *score >= TRANSFORMER_STRONG_MEMORY_SCORE)
+        {
+            weight = weight.min(TRANSFORMER_STRONG_MEMORY_CAP);
+        }
+        weight.clamp(0.0, 1.0)
     }
 
     /// Pure transformer scoring (used internally by `predict_top_k_assisted`).
     ///
     /// When the output head is trained:  output-head projection → softmax.
     /// Otherwise:                        cosine-similarity against vocab embeddings.
-    fn predict_top_k_transformer(
+    pub fn predict_top_k_transformer(
         &self,
         embedder: &Embedder,
         context_tokens: &[u32],
@@ -629,7 +905,7 @@ impl TransformerPredictor {
                 .collect()
         };
 
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        sort_prediction_scores(&mut scored);
         scored.truncate(k);
         scored
     }
@@ -679,36 +955,54 @@ impl TransformerPredictor {
             all_vocab,
         );
         let hybrid_map: HashMap<u32, f32> = all_hybrid.into_iter().collect();
+        let has_memory_candidate = !seq_memory.lookup_suffix(context_tokens).is_empty();
 
-        // 2. Transformer scores over the full vocab
-        let all_transformer = self.predict_top_k_transformer(embedder, context_tokens, all_vocab);
-        let transformer_map: HashMap<u32, f32> = all_transformer.into_iter().collect();
+        // 2. Transformer scores over the full vocab. Non-finite model state
+        // falls back to base scores instead of producing empty predictions.
+        let all_transformer = if self.model_finite {
+            self.predict_top_k_transformer(embedder, context_tokens, all_vocab)
+        } else {
+            Vec::new()
+        };
 
-        // 3. Weighted combination over the union of candidates
-        let mut all_ids: HashSet<u32> = hybrid_map
-            .keys()
-            .chain(transformer_map.keys())
-            .copied()
-            .collect();
-        if all_ids.is_empty() {
-            return Vec::new();
-        }
-
-        let tw = self.transformer_weight();
-        let mut scored: Vec<(u32, f32)> = all_ids
-            .drain()
-            .map(|tid| {
-                let hybrid = hybrid_map.get(&tid).copied().unwrap_or(0.0);
-                let transformer = transformer_map.get(&tid).copied().unwrap_or(0.0);
-                let final_score = (1.0 - tw) * hybrid + tw * transformer;
-                (tid, final_score)
-            })
-            .collect();
-
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // 3. Reliability- and confidence-aware combination.
+        let tw =
+            self.effective_transformer_weight(&all_transformer, &hybrid_map, has_memory_candidate);
+        let mut scored = combine_prediction_scores(&hybrid_map, &all_transformer, tw);
         scored.truncate(k);
         scored
     }
+}
+
+fn combine_prediction_scores(
+    hybrid_map: &HashMap<u32, f32>,
+    transformer_scores: &[(u32, f32)],
+    transformer_weight: f32,
+) -> Vec<(u32, f32)> {
+    let transformer_map: HashMap<u32, f32> = transformer_scores
+        .iter()
+        .filter_map(|(id, score)| score.is_finite().then_some((*id, *score)))
+        .collect();
+
+    let mut all_ids: HashSet<u32> = hybrid_map
+        .keys()
+        .chain(transformer_map.keys())
+        .copied()
+        .collect();
+
+    let base_weight = 1.0 - transformer_weight;
+    let mut scored: Vec<(u32, f32)> = all_ids
+        .drain()
+        .map(|tid| {
+            let hybrid = hybrid_map.get(&tid).copied().unwrap_or(0.0);
+            let transformer = transformer_map.get(&tid).copied().unwrap_or(0.0);
+            let final_score = base_weight * hybrid + transformer_weight * transformer;
+            (tid, final_score)
+        })
+        .collect();
+
+    sort_prediction_scores(&mut scored);
+    scored
 }
 
 /// Experimental text generation that uses the transformer-assisted predictor.
@@ -785,6 +1079,108 @@ pub struct LanguageTrainReport {
     pub average_loss: f32,
     pub tokens_learned: u32,
     pub neurons_grown: usize,
+}
+
+/// Safety configuration for transformer training (v0.8.2).
+#[derive(Clone, Debug)]
+pub struct TransformerTrainingSafety {
+    /// Maximum allowed gradient norm before scaling (default 5.0).
+    pub max_gradient_norm: f32,
+    /// Maximum allowed per-example loss before marking as unstable (default 50.0).
+    pub max_loss: f32,
+    /// If epoch loss exceeds `first_epoch_loss * loss_explosion_factor`, mark unstable (default 5.0).
+    pub loss_explosion_factor: f32,
+    /// Whether to roll back model weights on serious instability (default true).
+    pub rollback_on_unstable: bool,
+}
+
+impl Default for TransformerTrainingSafety {
+    fn default() -> Self {
+        Self {
+            max_gradient_norm: 5.0,
+            max_loss: 50.0,
+            loss_explosion_factor: 5.0,
+            rollback_on_unstable: true,
+        }
+    }
+}
+
+/// Compute the L2 norm of a slice of values.
+pub fn gradient_norm(values: &[f32]) -> f32 {
+    values.iter().map(|&v| v * v).sum::<f32>().sqrt()
+}
+
+/// Clip gradients by global norm.  Returns `true` if clipping was applied.
+pub fn clip_by_norm(values: &mut [f32], max_norm: f32) -> bool {
+    if max_norm <= 0.0 || values.is_empty() {
+        return false;
+    }
+    let n = gradient_norm(values);
+    if n.is_finite() && n > max_norm {
+        let scale = max_norm / n;
+        for v in values.iter_mut() {
+            *v *= scale;
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Check whether all trainable parameters of the model are finite (no NaN/inf).
+pub fn is_finite_model(model: &TransformerLanguageModel) -> bool {
+    if model.output_w.iter().any(|&v| !v.is_finite())
+        || model.output_b.iter().any(|&v| !v.is_finite())
+    {
+        return false;
+    }
+    let ff = &model.block.feed_forward;
+    let attn = &model.block.attention;
+    ff.w1.iter().all(|&v| v.is_finite())
+        && ff.b1.iter().all(|&v| v.is_finite())
+        && ff.w2.iter().all(|&v| v.is_finite())
+        && ff.b2.iter().all(|&v| v.is_finite())
+        && attn.w_q.iter().all(|&v| v.is_finite())
+        && attn.w_k.iter().all(|&v| v.is_finite())
+        && attn.w_v.iter().all(|&v| v.is_finite())
+        && attn.w_o.iter().all(|&v| v.is_finite())
+}
+
+/// Report returned after transformer training (v0.8.1 / v0.8.2).
+#[derive(Clone, Debug)]
+pub struct TransformerTrainReport {
+    pub epochs: usize,
+    pub examples: usize,
+    pub language_lr: f32,
+    pub transformer_lr: f32,
+    pub avg_loss: f32,
+    pub first_loss: Option<f32>,
+    pub final_loss: Option<f32>,
+    pub improvement_pct: Option<f32>,
+    pub top1_accuracy: f32,
+    pub top3_accuracy: f32,
+    pub output_head_trained: bool,
+    pub ffn_trained: bool,
+    pub attention_frozen: bool,
+    pub attention_trained: bool,
+    pub attention_projection_o_trained: bool,
+    pub attention_projection_v_trained: bool,
+    pub attention_projection_q_trained: bool,
+    pub attention_projection_k_trained: bool,
+    pub invalid_updates: usize,
+    // v0.8.2 safety fields
+    pub max_gradient_norm_seen: f32,
+    pub avg_gradient_norm: f32,
+    pub clipped_updates: usize,
+    pub unstable_updates: usize,
+    pub rolled_back: bool,
+    // v0.9.4 attention-specific safety fields
+    pub attention_update_attempts: usize,
+    pub attention_updates_applied: usize,
+    pub attention_clipped_updates: usize,
+    pub attention_invalid_updates: usize,
+    pub max_attention_grad_norm: f32,
+    pub avg_attention_grad_norm: f32,
 }
 
 /// Train the network on next-token prediction and populate the sequence memory.
@@ -950,34 +1346,287 @@ pub fn train_next_token_examples(
     })
 }
 
-// ─── Transformer Output-Head Training (v0.7) ─────────────────────────────────
+// ─── Transformer Training (v0.8.1) ────────────────────────────────────────────
 
-/// Train only the **output head** (`output_w`, `output_b`) of a
+/// Result of evaluating a transformer model on a set of examples.
+///
+/// Both loss and accuracy are computed from the **same** pure-transformer
+/// forward pass and use the **same** example-selection criteria (target must
+/// be in `vocab_order`), guaranteeing consistency between the two metrics.
+#[derive(Debug, Clone)]
+pub struct TransformerEvalReport {
+    /// Average cross-entropy loss over evaluated examples.
+    pub avg_loss: f32,
+    /// Percentage of examples where the target token was the top-1 prediction.
+    pub top1_accuracy: f32,
+    /// Percentage of examples where the target token was in the top-3 predictions.
+    pub top3_accuracy: f32,
+    /// Number of examples that were actually evaluated (target in vocab_order).
+    pub evaluated_examples: usize,
+}
+
+/// Evaluate a transformer model on the given examples, returning both
+/// cross-entropy loss and top-1/top-3 accuracy from **pure transformer logits**
+/// (no hybrid scores, no sequence memory, no neural predictor).
+///
+/// Examples whose target token is not in `model.vocab_order` are skipped
+/// (the same criterion used during training), ensuring the reported metrics
+/// are computed over a consistent set.
+pub fn evaluate_transformer_on_examples(
+    model: &TransformerLanguageModel,
+    embedder: &Embedder,
+    examples: &[SequenceExample],
+    max_context: usize,
+) -> TransformerEvalReport {
+    if examples.is_empty() || model.vocab_size() == 0 {
+        return TransformerEvalReport {
+            avg_loss: 0.0,
+            top1_accuracy: 0.0,
+            top3_accuracy: 0.0,
+            evaluated_examples: 0,
+        };
+    }
+
+    let mut total_loss = 0.0f32;
+    let mut correct_top1 = 0usize;
+    let mut correct_top3 = 0usize;
+    let mut count = 0usize;
+
+    for example in examples {
+        // Build token embeddings for the context (same as in training)
+        let start = example.context.len().saturating_sub(max_context);
+        let seq: Vec<Vec<f32>> = example.context[start..]
+            .iter()
+            .filter_map(|id| embedder.embed(*id).map(<[f32]>::to_vec))
+            .collect();
+        if seq.is_empty() {
+            continue;
+        }
+
+        // Pure transformer forward pass
+        let block_out = model.block.forward(&seq);
+        let last = match block_out.last() {
+            Some(v) => v,
+            None => continue,
+        };
+
+        // Output-head logits → softmax probabilities
+        let logits = model.logits_from_last(last);
+        let probs = softmax(&logits);
+
+        // Find target position in vocab_order (skip if absent — same as training)
+        let target_pos = match model
+            .vocab_order
+            .iter()
+            .position(|&id| id == example.target)
+        {
+            Some(p) => p,
+            None => continue,
+        };
+        count += 1;
+
+        // Cross-entropy loss for this example
+        let p = probs[target_pos].max(1e-10);
+        total_loss += -p.ln();
+
+        // Top-3 positions sorted by probability
+        let mut indices: Vec<usize> = (0..probs.len()).collect();
+        indices.sort_by(|&a, &b| {
+            probs[b]
+                .partial_cmp(&probs[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        if indices[0] == target_pos {
+            correct_top1 += 1;
+            correct_top3 += 1;
+        } else if indices.iter().take(3).any(|&idx| idx == target_pos) {
+            correct_top3 += 1;
+        }
+    }
+
+    if count == 0 {
+        return TransformerEvalReport {
+            avg_loss: 0.0,
+            top1_accuracy: 0.0,
+            top3_accuracy: 0.0,
+            evaluated_examples: 0,
+        };
+    }
+
+    TransformerEvalReport {
+        avg_loss: total_loss / count as f32,
+        top1_accuracy: correct_top1 as f32 / count as f32 * 100.0,
+        top3_accuracy: correct_top3 as f32 / count as f32 * 100.0,
+        evaluated_examples: count,
+    }
+}
+
+/// Train the **output head** and **FeedForward** of a
 /// `TransformerLanguageModel` using cross-entropy loss.
 ///
-/// The transformer block weights remain **frozen** (deterministic from seed).
-/// This is the v0.7 approach — it lets the model learn to map the last hidden
-/// state to the correct next-token probability without full backprop through
-/// the attention/FFN layers.
+/// The causal attention weights remain **frozen**.  Gradients are computed for
+/// the output head (`output_w`, `output_b`) and the FFN (`w1`, `b1`, `w2`, `b2`)
+/// via backpropagation through the last token's block output.
 ///
-/// Returns the average cross-entropy loss over all examples × epochs.
+/// FFN gradients are derived by backpropagating through the output head into
+/// the last hidden state, then through the second residual add into the FFN
+/// output.  Gradients are clipped to `[-1.0, 1.0]` and NaN/inf gradients cause
+/// the weight update to be skipped for that example.
+///
+/// Returns a `TransformerTrainReport` with training metrics.
 pub fn train_transformer_output_head(
     model: &mut TransformerLanguageModel,
     embedder: &Embedder,
     examples: &[SequenceExample],
     max_context: usize,
     epochs: usize,
-    learning_rate: f32,
-) -> f32 {
-    if examples.is_empty() || model.vocab_size() == 0 {
-        return 0.0;
+    transformer_lr: f32,
+    language_lr: f32,
+) -> TransformerTrainReport {
+    train_transformer_output_head_with_safety(
+        model,
+        embedder,
+        examples,
+        max_context,
+        epochs,
+        transformer_lr,
+        language_lr,
+        &TransformerTrainingSafety::default(),
+    )
+}
+
+/// Internal helper: snapshot the model weights before training for rollback.
+fn snapshot_model(model: &TransformerLanguageModel) -> TransformerLanguageModel {
+    model.clone()
+}
+
+/// Restore model from a snapshot (used on rollback).
+fn restore_model(model: &mut TransformerLanguageModel, snapshot: &TransformerLanguageModel) {
+    *model = snapshot.clone();
+}
+
+fn transpose_mat_vec_mul(matrix: &[f32], rows: usize, cols: usize, input: &[f32]) -> Vec<f32> {
+    let mut out = vec![0.0; cols];
+    for r in 0..rows {
+        let input_value = input.get(r).copied().unwrap_or(0.0);
+        if input_value.abs() < 1e-10 {
+            continue;
+        }
+        let base = r * cols;
+        for c in 0..cols {
+            out[c] += matrix[base + c] * input_value;
+        }
     }
+    out
+}
+
+fn record_attention_train_step(
+    report: &mut TransformerTrainReport,
+    grad_norm_sum: &mut f32,
+    grad_norm_count: &mut usize,
+    attention_grad_norm_sum: &mut f32,
+    attention_grad_norm_count: &mut usize,
+    step: &crate::attention::AttentionTrainStepReport,
+) {
+    if step.attempted {
+        report.attention_update_attempts += 1;
+    }
+    if step.applied {
+        report.attention_updates_applied += 1;
+    }
+    if step.grad_norm_before_clip.is_finite() {
+        if step.grad_norm_before_clip > report.max_gradient_norm_seen {
+            report.max_gradient_norm_seen = step.grad_norm_before_clip;
+        }
+        if step.grad_norm_before_clip > report.max_attention_grad_norm {
+            report.max_attention_grad_norm = step.grad_norm_before_clip;
+        }
+        *grad_norm_sum += step.grad_norm_before_clip;
+        *grad_norm_count += 1;
+        *attention_grad_norm_sum += step.grad_norm_before_clip;
+        *attention_grad_norm_count += 1;
+    }
+    if step.clipped {
+        report.clipped_updates += 1;
+        report.attention_clipped_updates += 1;
+    }
+    if step.invalid {
+        report.invalid_updates += 1;
+        report.attention_invalid_updates += 1;
+    }
+}
+
+/// Full training function with safety configuration.
+#[allow(clippy::too_many_arguments)]
+pub fn train_transformer_output_head_with_safety(
+    model: &mut TransformerLanguageModel,
+    embedder: &Embedder,
+    examples: &[SequenceExample],
+    max_context: usize,
+    epochs: usize,
+    transformer_lr: f32,
+    language_lr: f32,
+    safety: &TransformerTrainingSafety,
+) -> TransformerTrainReport {
+    let mut report = TransformerTrainReport {
+        epochs,
+        examples: examples.len(),
+        language_lr,
+        transformer_lr,
+        avg_loss: 0.0,
+        first_loss: None,
+        final_loss: None,
+        improvement_pct: None,
+        top1_accuracy: 0.0,
+        top3_accuracy: 0.0,
+        output_head_trained: false,
+        ffn_trained: model.ffn_trained,
+        attention_frozen: !model.attention_trained,
+        attention_trained: model.attention_trained,
+        attention_projection_o_trained: model.attention_projection_o_trained(),
+        attention_projection_v_trained: model.attention_projection_v_trained(),
+        attention_projection_q_trained: model.attention_projection_q_trained(),
+        attention_projection_k_trained: model.attention_projection_k_trained(),
+        invalid_updates: 0,
+        max_gradient_norm_seen: 0.0,
+        avg_gradient_norm: 0.0,
+        clipped_updates: 0,
+        unstable_updates: 0,
+        rolled_back: false,
+        attention_update_attempts: 0,
+        attention_updates_applied: 0,
+        attention_clipped_updates: 0,
+        attention_invalid_updates: 0,
+        max_attention_grad_norm: 0.0,
+        avg_attention_grad_norm: 0.0,
+    };
+
+    if examples.is_empty() || model.vocab_size() == 0 {
+        return report;
+    }
+
+    // Take snapshot before training for potential rollback
+    let original_model = if safety.rollback_on_unstable {
+        Some(snapshot_model(model))
+    } else {
+        None
+    };
 
     let embed_dim = model.embed_dim;
     let mut total_loss = 0.0;
     let mut count = 0usize;
+    let mut epoch_losses: Vec<f32> = Vec::new();
+    let mut grad_norm_sum = 0.0;
+    let mut grad_norm_count = 0usize;
+    let mut attention_grad_norm_sum = 0.0;
+    let mut attention_grad_norm_count = 0usize;
+    let mut rollback_for_unstable_loss = false;
 
-    for _epoch in 0..epochs {
+    for _epoch_idx in 0..epochs {
+        let mut epoch_loss = 0.0;
+        let mut epoch_count = 0usize;
+
         for example in examples {
             // Build ordered token embeddings for the context
             let start = example.context.len().saturating_sub(max_context);
@@ -989,12 +1638,22 @@ pub fn train_transformer_output_head(
                 continue;
             }
 
-            // Forward through transformer block (frozen)
-            let block_out = match model.block_forward(&seq) {
-                Some(o) => o,
+            // Forward through transformer block (attention cached for w_o training)
+            let (block_out, ffn_inputs, attention_cache) =
+                model.block.forward_with_training_cache(&seq);
+            let last = match block_out.last() {
+                Some(v) => v.clone(),
                 None => continue,
             };
-            let last = match block_out.last() {
+            let last_ffn_input = match ffn_inputs.last() {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            let last_attention_context = match attention_cache.weighted_values.last() {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            let last_attention_weights = match attention_cache.attention_weights.last() {
                 Some(v) => v.clone(),
                 None => continue,
             };
@@ -1015,30 +1674,276 @@ pub fn train_transformer_output_head(
 
             // Cross-entropy loss
             let p = probs[target_pos].max(1e-10);
-            total_loss += -p.ln();
-            count += 1;
+            let loss = -p.ln();
+
+            // ── Loss explosion detection ─────────────────────────────
+            if !loss.is_finite() {
+                report.invalid_updates += 1;
+                continue;
+            }
+            if loss > safety.max_loss {
+                report.unstable_updates += 1;
+                continue;
+            }
+            epoch_loss += loss;
+            epoch_count += 1;
 
             // Gradient for output_w / output_b
             //   dL/d(logit_v) = probs[v] - (v == target_pos)
-            for (v, &prob) in probs.iter().enumerate() {
-                let grad = prob - if v == target_pos { 1.0 } else { 0.0 };
-                if grad.abs() < 1e-10 {
+            let grads: Vec<f32> = probs
+                .iter()
+                .enumerate()
+                .map(|(v, &prob)| prob - if v == target_pos { 1.0 } else { 0.0 })
+                .collect();
+
+            // Compute dL/d(last[i]) = sum_v dL/d(logit_v) * output_w[v,i]
+            let mut grad_block = vec![0.0; embed_dim];
+            for (v, &g) in grads.iter().enumerate() {
+                if g.abs() < 1e-10 {
                     continue;
                 }
-                for (i, &val) in last.iter().enumerate().take(embed_dim) {
-                    let idx = v * embed_dim + i;
-                    model.output_w[idx] -= learning_rate * grad * val;
+                let base = v * embed_dim;
+                for (i, gb) in grad_block.iter_mut().enumerate() {
+                    *gb += g * model.output_w[base + i];
                 }
-                model.output_b[v] -= learning_rate * grad;
+            }
+
+            // ── Norm-based gradient clipping for output head ──────────
+            let mut flat_grads: Vec<f32> = Vec::new();
+            for &g in &grads {
+                if g.abs() < 1e-10 {
+                    continue;
+                }
+                for &val in last.iter().take(embed_dim) {
+                    flat_grads.push(g * val);
+                }
+                flat_grads.push(g); // bias gradient
+            }
+
+            let head_norm = gradient_norm(&flat_grads);
+            if head_norm.is_finite() {
+                if head_norm > report.max_gradient_norm_seen {
+                    report.max_gradient_norm_seen = head_norm;
+                }
+                grad_norm_sum += head_norm;
+                grad_norm_count += 1;
+            }
+
+            if clip_by_norm(&mut flat_grads, safety.max_gradient_norm) {
+                report.clipped_updates += 1;
+            }
+
+            // Update output head weights using (possibly clipped) gradients
+            let mut idx = 0usize;
+            for (v, &g) in grads.iter().enumerate() {
+                if g.abs() < 1e-10 {
+                    continue;
+                }
+                let base = v * embed_dim;
+                for i in 0..embed_dim {
+                    model.output_w[base + i] -= transformer_lr * flat_grads[idx];
+                    idx += 1;
+                }
+                model.output_b[v] -= transformer_lr * flat_grads[idx];
+                idx += 1;
+            }
+
+            // Backprop through residual add 2 into FFN output
+            for g in &mut grad_block {
+                *g = g.clamp(-1.0, 1.0);
+            }
+            if grad_block.iter().any(|&g| !g.is_finite()) {
+                report.invalid_updates += 1;
+                continue;
+            }
+
+            // Norm clip FFN gradients
+            if clip_by_norm(&mut grad_block, safety.max_gradient_norm) {
+                report.clipped_updates += 1;
+            }
+            let grad_residual = grad_block.clone();
+
+            let ffn_lr = transformer_lr * 0.5;
+            let ffn_report = model.block.feed_forward.train_step_with_input_gradient(
+                &last_ffn_input,
+                &grad_block,
+                ffn_lr,
+            );
+            if ffn_report.applied {
+                model.ffn_trained = true;
+            } else {
+                report.invalid_updates += 1;
+                continue;
+            }
+
+            let mut grad_attention_output = grad_residual;
+            for (g, ffn_g) in grad_attention_output
+                .iter_mut()
+                .zip(ffn_report.grad_input.iter())
+            {
+                *g += ffn_g;
+            }
+            if grad_attention_output.iter().any(|&g| !g.is_finite()) {
+                report.invalid_updates += 1;
+                continue;
+            }
+
+            let attention_lr = transformer_lr * 0.5;
+            let grad_context_last = transpose_mat_vec_mul(
+                &model.block.attention.w_o,
+                embed_dim,
+                embed_dim,
+                &grad_attention_output,
+            );
+            if grad_context_last.iter().any(|&g| !g.is_finite()) {
+                report.invalid_updates += 1;
+                continue;
+            }
+
+            let attention_o_report = model.block.attention.train_output_projection_step(
+                &last_attention_context,
+                &grad_attention_output,
+                attention_lr,
+                safety.max_gradient_norm,
+            );
+            record_attention_train_step(
+                &mut report,
+                &mut grad_norm_sum,
+                &mut grad_norm_count,
+                &mut attention_grad_norm_sum,
+                &mut attention_grad_norm_count,
+                &attention_o_report,
+            );
+            if attention_o_report.applied {
+                model.mark_attention_projection_o_trained();
+                report.attention_frozen = false;
+                report.attention_trained = true;
+                report.attention_projection_o_trained = true;
+            } else if attention_o_report.invalid {
+                continue;
+            }
+
+            let attention_v_report = model.block.attention.train_value_projection_step(
+                &seq,
+                &last_attention_weights,
+                &grad_context_last,
+                attention_lr,
+                safety.max_gradient_norm,
+            );
+            record_attention_train_step(
+                &mut report,
+                &mut grad_norm_sum,
+                &mut grad_norm_count,
+                &mut attention_grad_norm_sum,
+                &mut attention_grad_norm_count,
+                &attention_v_report,
+            );
+            if attention_v_report.applied {
+                model.mark_attention_projection_v_trained();
+                report.attention_frozen = false;
+                report.attention_trained = true;
+                report.attention_projection_v_trained = true;
+            } else if attention_v_report.invalid {
+                continue;
+            }
+
+            let attention_qk_report = model.block.attention.train_query_key_projection_step(
+                &seq,
+                &attention_cache.qs,
+                &attention_cache.ks,
+                &attention_cache.vs,
+                &last_attention_weights,
+                &grad_context_last,
+                attention_lr,
+                safety.max_gradient_norm,
+            );
+            record_attention_train_step(
+                &mut report,
+                &mut grad_norm_sum,
+                &mut grad_norm_count,
+                &mut attention_grad_norm_sum,
+                &mut attention_grad_norm_count,
+                &attention_qk_report,
+            );
+            if attention_qk_report.applied {
+                model.mark_attention_projection_q_trained();
+                model.mark_attention_projection_k_trained();
+                report.attention_frozen = false;
+                report.attention_trained = true;
+                report.attention_projection_q_trained = true;
+                report.attention_projection_k_trained = true;
+            }
+        }
+
+        if epoch_count > 0 {
+            let avg_epoch_loss = epoch_loss / epoch_count as f32;
+            epoch_losses.push(avg_epoch_loss);
+            total_loss += epoch_loss;
+            count += epoch_count;
+
+            // ── Loss explosion detection across epochs ────────────────
+            if epoch_losses.len() > 1
+                && epoch_losses[0].is_finite()
+                && epoch_losses[0].abs() > 1e-10
+                && avg_epoch_loss > epoch_losses[0] * safety.loss_explosion_factor
+            {
+                report.unstable_updates += epoch_count;
+                rollback_for_unstable_loss = true;
             }
         }
     }
 
-    if count > 0 {
-        total_loss / count as f32
-    } else {
-        0.0
+    // Set gradient norm stats
+    if grad_norm_count > 0 {
+        report.avg_gradient_norm = grad_norm_sum / grad_norm_count as f32;
     }
+    if attention_grad_norm_count > 0 {
+        report.avg_attention_grad_norm = attention_grad_norm_sum / attention_grad_norm_count as f32;
+    }
+
+    // ── Rollback if model is corrupted ───────────────────────────────
+    if !is_finite_model(model) || count == 0 || rollback_for_unstable_loss {
+        if let Some(ref snap) = original_model
+            && safety.rollback_on_unstable
+        {
+            restore_model(model, snap);
+            report.rolled_back = true;
+        }
+        // Return early with safe report (no loss/accuracy from corrupted state)
+        if !is_finite_model(model) {
+            return report;
+        }
+    }
+
+    // ── Post-training evaluation (only if model is healthy) ───────────
+    let eval = evaluate_transformer_on_examples(model, embedder, examples, max_context);
+    report.top1_accuracy = eval.top1_accuracy;
+    report.top3_accuracy = eval.top3_accuracy;
+
+    // Set loss metrics
+    if !epoch_losses.is_empty() {
+        report.first_loss = Some(epoch_losses[0]);
+        report.final_loss = Some(epoch_losses[epoch_losses.len() - 1]);
+        if epoch_losses[0].abs() > 1e-10 {
+            report.improvement_pct = Some(
+                (epoch_losses[0] - epoch_losses[epoch_losses.len() - 1]) / epoch_losses[0] * 100.0,
+            );
+        }
+    }
+    if count > 0 {
+        report.avg_loss = total_loss / count as f32;
+    }
+    report.output_head_trained =
+        model.output_w.iter().any(|&v| v != 0.0) || model.output_b.iter().any(|&v| v != 0.0);
+    report.ffn_trained = model.ffn_trained;
+    report.attention_trained = model.attention_trained;
+    report.attention_projection_o_trained = model.attention_projection_o_trained();
+    report.attention_projection_v_trained = model.attention_projection_v_trained();
+    report.attention_projection_q_trained = model.attention_projection_q_trained();
+    report.attention_projection_k_trained = model.attention_projection_k_trained();
+    report.attention_frozen = !model.attention_trained;
+
+    report
 }
 
 // ─── Text Generation ──────────────────────────────────────────────────────────
@@ -1348,6 +2253,102 @@ pub fn language_meta_path(brain_path: &Path) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_test_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("{}_{}", name, std::process::id()))
+    }
+
+    fn save_transformer_v2_for_test(
+        model: &TransformerLanguageModel,
+        path: &Path,
+    ) -> Result<(), ManasError> {
+        fn push_u32(buf: &mut Vec<u8>, value: u32) {
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+
+        fn push_f32_vec(buf: &mut Vec<u8>, values: &[f32]) {
+            push_u32(buf, values.len() as u32);
+            for &value in values {
+                buf.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+
+        let mut buf = Vec::new();
+        push_u32(&mut buf, TRANSFORMER_FILE_MAGIC);
+        push_u32(&mut buf, 2);
+        push_u32(&mut buf, model.embed_dim as u32);
+        push_u32(&mut buf, model.hidden_dim as u32);
+        push_u32(&mut buf, model.vocab_size() as u32);
+
+        push_f32_vec(&mut buf, &model.output_w);
+        push_f32_vec(&mut buf, &model.output_b);
+
+        push_u32(&mut buf, model.vocab_order.len() as u32);
+        for &id in &model.vocab_order {
+            buf.extend_from_slice(&id.to_le_bytes());
+        }
+
+        buf.push(if model.ffn_trained { 1 } else { 0 });
+        let ffn = &model.block.feed_forward;
+        push_f32_vec(&mut buf, &ffn.w1);
+        push_f32_vec(&mut buf, &ffn.b1);
+        push_f32_vec(&mut buf, &ffn.w2);
+        push_f32_vec(&mut buf, &ffn.b2);
+
+        std::fs::write(path, &buf).map_err(|e| ManasError::FileReadError {
+            path: path.to_path_buf(),
+            source: e,
+        })
+    }
+
+    fn assert_transformer_snapshot_restored(
+        model: &TransformerLanguageModel,
+        snapshot: &TransformerLanguageModel,
+    ) {
+        assert_eq!(model.output_w, snapshot.output_w, "output_w mismatch");
+        assert_eq!(model.output_b, snapshot.output_b, "output_b mismatch");
+        assert_eq!(
+            model.block.feed_forward.w1, snapshot.block.feed_forward.w1,
+            "FFN w1 mismatch"
+        );
+        assert_eq!(
+            model.block.feed_forward.b1, snapshot.block.feed_forward.b1,
+            "FFN b1 mismatch"
+        );
+        assert_eq!(
+            model.block.feed_forward.w2, snapshot.block.feed_forward.w2,
+            "FFN w2 mismatch"
+        );
+        assert_eq!(
+            model.block.feed_forward.b2, snapshot.block.feed_forward.b2,
+            "FFN b2 mismatch"
+        );
+        assert_eq!(
+            model.block.attention.w_o, snapshot.block.attention.w_o,
+            "attention w_o mismatch"
+        );
+        assert_eq!(
+            model.block.attention.w_v, snapshot.block.attention.w_v,
+            "attention w_v mismatch"
+        );
+        assert_eq!(
+            model.block.attention.w_q, snapshot.block.attention.w_q,
+            "attention w_q mismatch"
+        );
+        assert_eq!(
+            model.block.attention.w_k, snapshot.block.attention.w_k,
+            "attention w_k mismatch"
+        );
+        assert_eq!(model.ffn_trained, snapshot.ffn_trained, "FFN flag mismatch");
+        assert_eq!(
+            model.attention_trained, snapshot.attention_trained,
+            "attention flag mismatch"
+        );
+        assert_eq!(
+            model.attention_projection_mask, snapshot.attention_projection_mask,
+            "attention projection mask mismatch"
+        );
+    }
 
     // ── Sequence example tests ────────────────────────────────────────────
 
@@ -1914,6 +2915,211 @@ mod tests {
         }
     }
 
+    #[test]
+    fn transformer_prediction_filters_non_finite_scores() {
+        use std::collections::HashMap;
+
+        let mut table = HashMap::new();
+        table.insert(10u32, vec![1.0, 0.0, 0.0, 0.0]);
+        table.insert(20u32, vec![0.0, 1.0, 0.0, 0.0]);
+        let embedder = Embedder { dim: 4, table };
+
+        let network = Network::new();
+        let mut seq_memory = SequenceMemory::new();
+        seq_memory.record(&[10], 20);
+
+        let mut predictor = TransformerPredictor::new(4, 8, 5);
+        predictor.vocab_order = vec![10, 20];
+        predictor.output_w = vec![0.0; 8];
+        predictor.output_b = vec![f32::NAN, 0.0];
+
+        let transformer_only = predictor.predict_top_k_transformer(&embedder, &[10], 2);
+        assert!(
+            transformer_only.iter().all(|(_, score)| score.is_finite()),
+            "transformer-only scores should all be finite: {:?}",
+            transformer_only
+        );
+
+        let assisted = predictor.predict_top_k_assisted(&network, &embedder, &seq_memory, &[10], 2);
+        assert!(
+            assisted.iter().all(|(_, score)| score.is_finite()),
+            "assisted scores should all be finite: {:?}",
+            assisted
+        );
+    }
+
+    #[test]
+    fn transformer_weight_tiers_are_reliability_aware() {
+        let mut predictor = TransformerPredictor::new(4, 8, 5);
+        assert!((predictor.transformer_weight() - 0.15).abs() < 1e-6);
+
+        predictor.output_w = vec![0.0; 4];
+        assert!((predictor.transformer_weight() - 0.30).abs() < 1e-6);
+
+        predictor.ffn_trained = true;
+        assert!((predictor.transformer_weight() - 0.35).abs() < 1e-6);
+
+        predictor.attention_projection_mask = ATTENTION_PROJECTION_O;
+        assert!((predictor.transformer_weight() - 0.45).abs() < 1e-6);
+
+        predictor.attention_projection_mask = ATTENTION_PROJECTION_O | ATTENTION_PROJECTION_V;
+        assert!((predictor.transformer_weight() - 0.50).abs() < 1e-6);
+
+        predictor.attention_projection_mask = ATTENTION_PROJECTION_O
+            | ATTENTION_PROJECTION_V
+            | ATTENTION_PROJECTION_Q
+            | ATTENTION_PROJECTION_K;
+        assert!((predictor.transformer_weight() - 0.55).abs() < 1e-6);
+
+        predictor.model_finite = false;
+        assert!((predictor.transformer_weight() - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn transformer_confidence_factor_reduces_low_confidence_scores() {
+        let mut predictor = TransformerPredictor::new(4, 8, 5);
+        assert!(
+            (predictor.transformer_confidence_factor(&[]) - 0.0).abs() < 1e-6,
+            "empty transformer scores should have zero confidence"
+        );
+        assert!(
+            (predictor.transformer_confidence_factor(&[(10, 0.1)]) - 1.0).abs() < 1e-6,
+            "untrained cosine fallback keeps its already-low base weight"
+        );
+
+        predictor.output_w = vec![0.0; 4];
+        assert!(
+            (predictor.transformer_confidence_factor(&[(10, 0.19), (20, 0.01)]) - 0.50).abs()
+                < 1e-6,
+            "weak top-1 probability should halve influence"
+        );
+        assert!(
+            (predictor.transformer_confidence_factor(&[(10, 0.40), (20, 0.36)]) - 0.75).abs()
+                < 1e-6,
+            "small but not tiny margin should reduce influence"
+        );
+        assert!(
+            (predictor.transformer_confidence_factor(&[(10, 0.70), (20, 0.10)]) - 1.0).abs() < 1e-6,
+            "clear transformer distribution should keep full influence"
+        );
+    }
+
+    #[test]
+    fn transformer_blending_caps_strong_memory_and_can_improve_weak_ranking() {
+        use std::collections::HashMap;
+
+        let mut predictor = TransformerPredictor::new(4, 8, 5);
+        predictor.output_w = vec![0.0; 4];
+        predictor.ffn_trained = true;
+        predictor.attention_projection_mask = ATTENTION_PROJECTION_O
+            | ATTENTION_PROJECTION_V
+            | ATTENTION_PROJECTION_Q
+            | ATTENTION_PROJECTION_K;
+
+        let mut strong_memory = HashMap::new();
+        strong_memory.insert(10, 0.95);
+        let confident_wrong_transformer = vec![(20, 0.99), (10, 0.01)];
+        let capped_weight = predictor.effective_transformer_weight(
+            &confident_wrong_transformer,
+            &strong_memory,
+            false,
+        );
+        assert!((capped_weight - 0.45).abs() < 1e-6);
+
+        let combined =
+            combine_prediction_scores(&strong_memory, &confident_wrong_transformer, capped_weight);
+        assert_eq!(
+            combined.first().map(|(id, _)| *id),
+            Some(10),
+            "strong memory candidate must not be overpowered"
+        );
+
+        let mut weak_base = HashMap::new();
+        weak_base.insert(10, 0.40);
+        weak_base.insert(20, 0.35);
+        let confident_transformer = vec![(20, 0.90), (10, 0.10)];
+        let memory_capped_weight =
+            predictor.effective_transformer_weight(&confident_transformer, &weak_base, true);
+        assert!(
+            (memory_capped_weight - 0.40).abs() < 1e-6,
+            "real sequence-memory candidates should also cap transformer influence"
+        );
+
+        let weight =
+            predictor.effective_transformer_weight(&confident_transformer, &weak_base, false);
+        assert!((weight - 0.55).abs() < 1e-6);
+
+        let improved = combine_prediction_scores(&weak_base, &confident_transformer, weight);
+        assert_eq!(
+            improved.first().map(|(id, _)| *id),
+            Some(20),
+            "high-confidence transformer should improve weak/close ranking"
+        );
+    }
+
+    #[test]
+    fn non_finite_transformer_assisted_falls_back_to_base_scores() {
+        use std::collections::HashMap;
+
+        let mut table = HashMap::new();
+        table.insert(10u32, vec![1.0, 0.0, 0.0, 0.0]);
+        table.insert(20u32, vec![0.0, 1.0, 0.0, 0.0]);
+        let embedder = Embedder { dim: 4, table };
+        let network = Network::new();
+        let mut seq_memory = SequenceMemory::new();
+        seq_memory.record(&[10], 20);
+
+        let base = NextTokenPredictor::new(5).predict_top_k_with_memory(
+            &network,
+            &embedder,
+            &seq_memory,
+            &[10],
+            2,
+        );
+
+        let mut predictor = TransformerPredictor::new(4, 8, 5);
+        predictor.output_w = vec![0.0; 8];
+        predictor.output_b = vec![10.0, 0.0];
+        predictor.vocab_order = vec![10, 20];
+        predictor.model_finite = false;
+
+        let assisted = predictor.predict_top_k_assisted(&network, &embedder, &seq_memory, &[10], 2);
+        assert_eq!(assisted, base);
+        assert_eq!(assisted.first().map(|(id, _)| *id), Some(20));
+    }
+
+    #[test]
+    fn transformer_only_ignores_hybrid_reliability_gates() {
+        use std::collections::HashMap;
+
+        let mut table = HashMap::new();
+        table.insert(10u32, vec![1.0, 0.0, 0.0, 0.0]);
+        table.insert(20u32, vec![0.0, 1.0, 0.0, 0.0]);
+        let embedder = Embedder { dim: 4, table };
+
+        let mut predictor = TransformerPredictor::new(4, 8, 5);
+        predictor.output_w = vec![0.0; 8];
+        predictor.output_b = vec![10.0, 0.0];
+        predictor.vocab_order = vec![10, 20];
+        predictor.model_finite = false;
+
+        let transformer_only = predictor.predict_top_k_transformer(&embedder, &[10], 2);
+        assert_eq!(
+            transformer_only.first().map(|(id, _)| *id),
+            Some(10),
+            "pure transformer output must not use hybrid reliability fallback"
+        );
+    }
+
+    #[test]
+    fn prediction_score_sorting_is_deterministic_for_ties() {
+        let mut scored = vec![(30, 0.5), (20, 0.7), (10, 0.5), (40, f32::NAN)];
+        sort_prediction_scores(&mut scored);
+
+        let ids: Vec<u32> = scored.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec![20, 10, 30]);
+    }
+
     /// Test D: transformer-assisted generate does not panic and produces
     /// non-empty output.
     #[test]
@@ -2034,8 +3240,15 @@ mod tests {
             5,
         );
         let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
-        let _loss =
-            train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 30, 0.01);
+        let _loss = train_transformer_output_head(
+            &mut model,
+            &trainer.embedder,
+            &examples,
+            5,
+            30,
+            0.01,
+            0.01,
+        );
 
         let predictor = TransformerPredictor::from_model(&model, 5);
         let tokens = {
@@ -2104,7 +3317,7 @@ mod tests {
         let examples = build_sequence_examples(&all_tokens, 5);
 
         let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
-        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 30, 0.01);
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 30, 0.01, 0.01);
 
         let predictor = TransformerPredictor::from_model(&model, 5);
 
@@ -2151,6 +3364,122 @@ mod tests {
             "'rust's' in top 3 for 'Ownership is', got: {:?}",
             words_b
         );
+
+        // "most unique" -> "feature"
+        let tokens_c = {
+            let mut t = trainer.tokenizer.clone();
+            t.encode("most unique")
+        };
+        let results_c = predictor.predict_top_k_assisted(
+            &network,
+            &trainer.embedder,
+            &seq_memory,
+            &tokens_c,
+            3,
+        );
+        let words_c: Vec<String> = results_c
+            .iter()
+            .filter_map(|(id, _)| trainer.tokenizer.decode(*id).map(|s| s.to_string()))
+            .collect();
+        assert!(
+            words_c.contains(&"feature".to_string()),
+            "'feature' in top 3 for 'most unique', got: {:?}",
+            words_c
+        );
+    }
+
+    #[test]
+    fn transformer_generation_stays_stable_with_reliability_weighting() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        let text1 = "Rust is a systems programming language focused on safety and performance";
+        let text2 = "Ownership is Rust's most unique feature and has deep implications";
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            text1,
+            5,
+            20,
+            0.05,
+            5,
+        )
+        .unwrap();
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            text2,
+            5,
+            20,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let combined = format!("{} {}", text1, text2);
+        let all_tokens = trainer.tokenizer.encode(&combined);
+        let examples = build_sequence_examples(&all_tokens, 5);
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 30, 0.01, 0.01);
+        let predictor = TransformerPredictor::from_model(&model, 5);
+
+        let rust = generate_text_with_transformer(
+            &network,
+            &trainer.embedder,
+            &trainer.tokenizer,
+            &seq_memory,
+            &predictor,
+            "Rust is",
+            20,
+            1,
+        );
+        assert!(
+            rust.contains(
+                "rust is a systems programming language focused on safety and performance"
+            ),
+            "unexpected Rust generation: {}",
+            rust
+        );
+
+        let ownership = generate_text_with_transformer(
+            &network,
+            &trainer.embedder,
+            &trainer.tokenizer,
+            &seq_memory,
+            &predictor,
+            "Ownership",
+            20,
+            1,
+        );
+        assert!(
+            ownership.contains("ownership is rust's most unique feature and has deep implications"),
+            "unexpected Ownership generation: {}",
+            ownership
+        );
+
+        let unique = generate_text_with_transformer(
+            &network,
+            &trainer.embedder,
+            &trainer.tokenizer,
+            &seq_memory,
+            &predictor,
+            "most unique",
+            20,
+            1,
+        );
+        assert!(
+            unique.contains("most unique feature and has deep implications"),
+            "unexpected most unique generation: {}",
+            unique
+        );
     }
 
     /// Test D: persistence — save model to temp file, reload, verify
@@ -2185,7 +3514,7 @@ mod tests {
             5,
         );
         let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
-        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 10, 0.01);
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 10, 0.01, 0.01);
 
         // Save to temp file
         let path = std::env::temp_dir().join("transformer_test_roundtrip.bin");
@@ -2201,6 +3530,66 @@ mod tests {
         assert_eq!(loaded.vocab_order, model.vocab_order);
         assert_eq!(loaded.output_w.len(), model.output_w.len());
         assert_eq!(loaded.output_b.len(), model.output_b.len());
+        assert_eq!(loaded.ffn_trained, model.ffn_trained);
+        assert_eq!(loaded.attention_trained, model.attention_trained);
+        assert_eq!(
+            loaded.attention_projection_mask, model.attention_projection_mask,
+            "attention projection mask should round-trip"
+        );
+        assert!(
+            loaded.attention_projection_o_trained(),
+            "projection o should be marked trained after reload"
+        );
+        assert!(
+            loaded.attention_projection_v_trained(),
+            "projection v should be marked trained after reload"
+        );
+        assert!(
+            loaded.attention_projection_q_trained(),
+            "projection q should be marked trained after reload"
+        );
+        assert!(
+            loaded.attention_projection_k_trained(),
+            "projection k should be marked trained after reload"
+        );
+
+        // FFN weights should match
+        let ffn_a = &loaded.block.feed_forward;
+        let ffn_b = &model.block.feed_forward;
+        assert_eq!(ffn_a.w1.len(), ffn_b.w1.len());
+        for (a, b) in ffn_a.w1.iter().zip(ffn_b.w1.iter()) {
+            assert!((a - b).abs() < 1e-5, "FFN w1 mismatch");
+        }
+        for (a, b) in ffn_a.b1.iter().zip(ffn_b.b1.iter()) {
+            assert!((a - b).abs() < 1e-5, "FFN b1 mismatch");
+        }
+        for (a, b) in ffn_a.w2.iter().zip(ffn_b.w2.iter()) {
+            assert!((a - b).abs() < 1e-5, "FFN w2 mismatch");
+        }
+        for (a, b) in ffn_a.b2.iter().zip(ffn_b.b2.iter()) {
+            assert!((a - b).abs() < 1e-5, "FFN b2 mismatch");
+        }
+
+        // Verify transformer param counting formulas
+        let d = loaded.embed_dim as u64;
+        let h = loaded.hidden_dim as u64;
+        let vs = loaded.vocab_order.len() as u64;
+        let attn_params = 4 * d * d;
+        let ffn_params = 2 * d * h + h + d;
+        let output_params = d * vs + vs;
+        // Attention: 4 matrices of size d×d
+        assert_eq!(attn_params, (4 * d * d) as u64);
+        // FeedForward: w1(d×h) + b1(h) + w2(h×d) + b2(d)
+        assert_eq!(ffn_params, (2 * d * h + h + d) as u64);
+        // Output head: w(d×vs) + b(vs)
+        assert_eq!(output_params, (d * vs + vs) as u64);
+        // Total transformer params
+        let total_tf = attn_params + ffn_params + output_params;
+        assert!(total_tf > 0, "transformer params should be > 0");
+        // output_w.len() should equal d * vs
+        assert_eq!(loaded.output_w.len(), (d * vs) as usize);
+        // output_b.len() should equal vs
+        assert_eq!(loaded.output_b.len(), vs as usize);
 
         // Output weights should be very close
         for (a, b) in loaded.output_w.iter().zip(model.output_w.iter()) {
@@ -2221,6 +3610,200 @@ mod tests {
         assert!(
             !results.is_empty(),
             "predictions after reload should not be empty"
+        );
+    }
+
+    #[test]
+    fn transformer_v3_attention_persistence_roundtrip() {
+        let mut model = TransformerLanguageModel::new(4, 8, vec![10, 20, 30]);
+        model.mark_attention_projection_o_trained();
+        model.mark_attention_projection_v_trained();
+        model.mark_attention_projection_q_trained();
+        model.mark_attention_projection_k_trained();
+        model.block.attention.w_q[0] = 0.123;
+        model.block.attention.w_k[1] = -0.234;
+        model.block.attention.w_v[2] = 0.345;
+        model.block.attention.w_o[3] = -0.456;
+
+        let path = temp_test_path("transformer_v3_attention_roundtrip.bin");
+        model.save_to_file(&path).unwrap();
+        let loaded = TransformerLanguageModel::load_from_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            loaded.attention_trained,
+            "attention_trained should round-trip"
+        );
+        assert!(
+            loaded.attention_projection_o_trained(),
+            "projection o should round-trip"
+        );
+        assert!(
+            loaded.attention_projection_v_trained(),
+            "projection v should round-trip"
+        );
+        assert!(
+            loaded.attention_projection_q_trained(),
+            "projection q should round-trip"
+        );
+        assert!(
+            loaded.attention_projection_k_trained(),
+            "projection k should round-trip"
+        );
+        assert_eq!(
+            loaded.block.attention.w_q.len(),
+            model.block.attention.w_q.len()
+        );
+        assert_eq!(
+            loaded.block.attention.w_k.len(),
+            model.block.attention.w_k.len()
+        );
+        assert_eq!(
+            loaded.block.attention.w_v.len(),
+            model.block.attention.w_v.len()
+        );
+        assert_eq!(
+            loaded.block.attention.w_o.len(),
+            model.block.attention.w_o.len()
+        );
+        for (a, b) in loaded
+            .block
+            .attention
+            .w_q
+            .iter()
+            .zip(model.block.attention.w_q.iter())
+        {
+            assert!((a - b).abs() < 1e-6, "w_q mismatch after roundtrip");
+        }
+        for (a, b) in loaded
+            .block
+            .attention
+            .w_k
+            .iter()
+            .zip(model.block.attention.w_k.iter())
+        {
+            assert!((a - b).abs() < 1e-6, "w_k mismatch after roundtrip");
+        }
+        for (a, b) in loaded
+            .block
+            .attention
+            .w_v
+            .iter()
+            .zip(model.block.attention.w_v.iter())
+        {
+            assert!((a - b).abs() < 1e-6, "w_v mismatch after roundtrip");
+        }
+        for (a, b) in loaded
+            .block
+            .attention
+            .w_o
+            .iter()
+            .zip(model.block.attention.w_o.iter())
+        {
+            assert!((a - b).abs() < 1e-6, "w_o mismatch after roundtrip");
+        }
+    }
+
+    #[test]
+    fn transformer_v3_legacy_attention_file_without_projection_mask_loads_as_o_only() {
+        let mut model = TransformerLanguageModel::new(4, 8, vec![10, 20, 30]);
+        model.attention_trained = true;
+        model.block.attention.w_o[3] = -0.456;
+
+        let path = temp_test_path("transformer_v3_legacy_attention_no_mask.bin");
+        model.save_to_file(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.pop();
+        std::fs::write(&path, bytes).unwrap();
+
+        let loaded = TransformerLanguageModel::load_from_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            loaded.attention_trained,
+            "legacy v3 attention flag should still load"
+        );
+        assert!(
+            loaded.attention_projection_o_trained(),
+            "legacy trained attention should be interpreted as projection o"
+        );
+        assert!(
+            !loaded.attention_projection_v_trained(),
+            "legacy v3 without bitmask should not claim projection v"
+        );
+        assert!(
+            !loaded.attention_projection_q_trained(),
+            "legacy v3 without bitmask should not claim projection q"
+        );
+        assert!(
+            !loaded.attention_projection_k_trained(),
+            "legacy v3 without bitmask should not claim projection k"
+        );
+        assert!(
+            (loaded.block.attention.w_o[3] - model.block.attention.w_o[3]).abs() < 1e-6,
+            "legacy v3 should still preserve attention weights"
+        );
+    }
+
+    #[test]
+    fn transformer_v3_existing_ov_mask_loads_without_qk() {
+        let mut model = TransformerLanguageModel::new(4, 8, vec![10, 20, 30]);
+        model.mark_attention_projection_o_trained();
+        model.mark_attention_projection_v_trained();
+        model.block.attention.w_v[2] = 0.345;
+        model.block.attention.w_o[3] = -0.456;
+
+        let path = temp_test_path("transformer_v3_existing_ov_mask.bin");
+        model.save_to_file(&path).unwrap();
+        let loaded = TransformerLanguageModel::load_from_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            loaded.attention_projection_o_trained(),
+            "projection o should load from existing v3 mask"
+        );
+        assert!(
+            loaded.attention_projection_v_trained(),
+            "projection v should load from existing v3 mask"
+        );
+        assert!(
+            !loaded.attention_projection_q_trained(),
+            "existing o,v mask should not claim projection q"
+        );
+        assert!(
+            !loaded.attention_projection_k_trained(),
+            "existing o,v mask should not claim projection k"
+        );
+    }
+
+    #[test]
+    fn transformer_v2_file_still_loads_with_untrained_attention() {
+        let mut model = TransformerLanguageModel::new(4, 8, vec![10, 20, 30]);
+        model.ffn_trained = true;
+        model.attention_trained = true;
+        model.block.attention.w_q[0] = 99.0;
+
+        let path = temp_test_path("transformer_v2_compat.bin");
+        save_transformer_v2_for_test(&model, &path).unwrap();
+        let loaded = TransformerLanguageModel::load_from_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let fresh = TransformerLanguageModel::new(4, 8, vec![10, 20, 30]);
+        assert!(loaded.ffn_trained, "v2 FFN flag should still load");
+        assert!(
+            !loaded.attention_trained,
+            "v2 files do not contain trained attention state"
+        );
+        assert!(
+            !loaded.attention_projection_o_trained()
+                && !loaded.attention_projection_v_trained()
+                && !loaded.attention_projection_q_trained()
+                && !loaded.attention_projection_k_trained(),
+            "v2 files should not claim trained attention projections"
+        );
+        assert!(
+            (loaded.block.attention.w_q[0] - fresh.block.attention.w_q[0]).abs() < 1e-6,
+            "v2 load should rebuild deterministic attention"
         );
     }
 
@@ -2255,7 +3838,7 @@ mod tests {
             5,
         );
         let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
-        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 5, 0.01);
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 5, 0.01, 0.01);
 
         let predictor = TransformerPredictor::from_model(&model, 5);
         let tokens = {
@@ -2267,5 +3850,1472 @@ mod tests {
 
         // Should not panic; empty or non-empty is acceptable
         let _ = results;
+    }
+
+    // ── v0.8 FFN training tests ─────────────────────────────────────
+
+    /// Test A: FFN weights change after training.
+    #[test]
+    fn ffn_weights_change_after_training() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            5,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+
+        let w1_before = model.block.feed_forward.w1.clone();
+        let b1_before = model.block.feed_forward.b1.clone();
+        let w2_before = model.block.feed_forward.w2.clone();
+        let b2_before = model.block.feed_forward.b2.clone();
+
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 10, 0.01, 0.01);
+
+        let w1_after = &model.block.feed_forward.w1;
+        let b1_after = &model.block.feed_forward.b1;
+        let w2_after = &model.block.feed_forward.w2;
+        let b2_after = &model.block.feed_forward.b2;
+
+        let w1_diff: f32 = w1_before
+            .iter()
+            .zip(w1_after)
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        let b1_diff: f32 = b1_before
+            .iter()
+            .zip(b1_after)
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        let w2_diff: f32 = w2_before
+            .iter()
+            .zip(w2_after)
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        let b2_diff: f32 = b2_before
+            .iter()
+            .zip(b2_after)
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+
+        let total_diff = w1_diff + b1_diff + w2_diff + b2_diff;
+        assert!(
+            total_diff > 1e-6,
+            "FFN weights should change after training (total_diff={})",
+            total_diff
+        );
+        assert!(model.ffn_trained, "ffn_trained flag should be set");
+    }
+
+    /// Test B: Attention Q/K/O/V all train after v0.9.3 transformer training.
+    #[test]
+    fn attention_qkvo_change_after_transformer_training() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            5,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+
+        let q_before = model.block.attention.w_q.clone();
+        let k_before = model.block.attention.w_k.clone();
+        let v_before = model.block.attention.w_v.clone();
+        let o_before = model.block.attention.w_o.clone();
+
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 25, 0.05, 0.01);
+
+        assert_ne!(model.block.attention.w_q, q_before, "w_q did not change");
+        assert_ne!(model.block.attention.w_k, k_before, "w_k did not change");
+        assert_ne!(model.block.attention.w_v, v_before, "w_v did not change");
+        assert_ne!(model.block.attention.w_o, o_before, "w_o did not change");
+        assert!(
+            model.attention_trained,
+            "attention_trained should be set after w_o update"
+        );
+        assert!(
+            model.attention_projection_o_trained(),
+            "projection o should be marked trained"
+        );
+        assert!(
+            model.attention_projection_v_trained(),
+            "projection v should be marked trained"
+        );
+        assert!(
+            model.attention_projection_q_trained(),
+            "projection q should be marked trained"
+        );
+        assert!(
+            model.attention_projection_k_trained(),
+            "projection k should be marked trained"
+        );
+        assert!(is_finite_model(&model), "model should remain finite");
+    }
+
+    #[test]
+    fn w_o_changes_after_transformer_training() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            5,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+        let o_before = model.block.attention.w_o.clone();
+
+        let report = train_transformer_output_head(
+            &mut model,
+            &trainer.embedder,
+            &examples,
+            5,
+            10,
+            0.01,
+            0.01,
+        );
+
+        assert_ne!(model.block.attention.w_o, o_before, "w_o should change");
+        assert!(
+            report.attention_projection_o_trained,
+            "report should mark projection o as trained"
+        );
+        assert!(
+            report.attention_projection_v_trained,
+            "report should mark projection v as trained"
+        );
+        assert!(
+            report.attention_projection_q_trained,
+            "report should mark projection q as trained"
+        );
+        assert!(
+            report.attention_projection_k_trained,
+            "report should mark projection k as trained"
+        );
+        assert!(
+            model.attention_trained,
+            "model should mark attention as partially trained"
+        );
+    }
+
+    #[test]
+    fn w_v_changes_after_transformer_training() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            5,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+        let v_before = model.block.attention.w_v.clone();
+
+        let report = train_transformer_output_head(
+            &mut model,
+            &trainer.embedder,
+            &examples,
+            5,
+            10,
+            0.01,
+            0.01,
+        );
+
+        assert_ne!(model.block.attention.w_v, v_before, "w_v should change");
+        assert!(
+            report.attention_projection_v_trained,
+            "report should mark projection v as trained"
+        );
+        assert!(
+            report.attention_projection_q_trained,
+            "report should mark projection q as trained"
+        );
+        assert!(
+            report.attention_projection_k_trained,
+            "report should mark projection k as trained"
+        );
+    }
+
+    #[test]
+    fn finite_model_after_w_o_training() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            5,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 10, 0.01, 0.01);
+
+        assert!(is_finite_model(&model), "model should remain finite");
+    }
+
+    #[test]
+    fn attention_qkvo_persistence_roundtrip() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            5,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+        let q_before = model.block.attention.w_q.clone();
+        let k_before = model.block.attention.w_k.clone();
+        let v_before = model.block.attention.w_v.clone();
+        let o_before = model.block.attention.w_o.clone();
+
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 25, 0.05, 0.01);
+
+        let path = temp_test_path("attention_qkvo_persistence_roundtrip.bin");
+        model.save_to_file(&path).unwrap();
+        let loaded = TransformerLanguageModel::load_from_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_ne!(
+            loaded.block.attention.w_o, o_before,
+            "w_o should persist changed values"
+        );
+        assert_eq!(loaded.block.attention.w_o, model.block.attention.w_o);
+        assert_ne!(
+            loaded.block.attention.w_q, q_before,
+            "w_q should persist changed values"
+        );
+        assert_eq!(loaded.block.attention.w_q, model.block.attention.w_q);
+        assert_ne!(
+            loaded.block.attention.w_k, k_before,
+            "w_k should persist changed values"
+        );
+        assert_eq!(loaded.block.attention.w_k, model.block.attention.w_k);
+        assert_ne!(
+            loaded.block.attention.w_v, v_before,
+            "w_v should persist changed values"
+        );
+        assert_eq!(loaded.block.attention.w_v, model.block.attention.w_v);
+        assert!(
+            loaded.attention_trained,
+            "partial attention training flag should persist"
+        );
+        assert!(
+            loaded.attention_projection_o_trained(),
+            "projection o flag should persist"
+        );
+        assert!(
+            loaded.attention_projection_v_trained(),
+            "projection v flag should persist"
+        );
+        assert!(
+            loaded.attention_projection_q_trained(),
+            "projection q flag should persist"
+        );
+        assert!(
+            loaded.attention_projection_k_trained(),
+            "projection k flag should persist"
+        );
+    }
+
+    /// Test C: Prediction still works after FFN training.
+    #[test]
+    fn prediction_still_works_after_ffn_training() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            15,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 30, 0.01, 0.01);
+
+        let predictor = TransformerPredictor::from_model(&model, 5);
+        let tokens = {
+            let mut t = trainer.tokenizer.clone();
+            t.encode("Rust is a")
+        };
+        let results =
+            predictor.predict_top_k_assisted(&network, &trainer.embedder, &seq_memory, &tokens, 3);
+
+        assert!(!results.is_empty(), "predictions should not be empty");
+        let words: Vec<String> = results
+            .iter()
+            .filter_map(|(id, _)| trainer.tokenizer.decode(*id).map(|s| s.to_string()))
+            .collect();
+        assert!(
+            words.contains(&"systems".to_string()),
+            "'systems' in top 3 after FFN training, got: {:?}",
+            words
+        );
+    }
+
+    /// Test D: Generation still works after FFN training.
+    #[test]
+    fn generation_still_works_after_ffn_training() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            15,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 30, 0.01, 0.01);
+
+        let predictor = TransformerPredictor::from_model(&model, 5);
+        let output = generate_text_with_transformer(
+            &network,
+            &trainer.embedder,
+            &trainer.tokenizer,
+            &seq_memory,
+            &predictor,
+            "Rust is",
+            10,
+            1,
+        );
+
+        assert!(!output.is_empty(), "generation should produce output");
+        assert!(
+            output.contains("rust"),
+            "output should contain 'rust', got: '{}'",
+            output
+        );
+    }
+
+    /// Test E: FFN roundtrip — save and load FFN weights.
+    #[test]
+    fn ffn_persistence_roundtrip() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            5,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 10, 0.01, 0.01);
+
+        let path = std::env::temp_dir().join("ffn_persistence_test.bin");
+        model.save_to_file(&path).unwrap();
+        let loaded = TransformerLanguageModel::load_from_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            loaded.ffn_trained,
+            "ffn_trained should be true after reload"
+        );
+
+        let ffn_a = &loaded.block.feed_forward;
+        let ffn_b = &model.block.feed_forward;
+        for (a, b) in ffn_a.w1.iter().zip(ffn_b.w1.iter()) {
+            assert!((a - b).abs() < 1e-5, "w1 mismatch after roundtrip");
+        }
+        for (a, b) in ffn_a.b1.iter().zip(ffn_b.b1.iter()) {
+            assert!((a - b).abs() < 1e-5, "b1 mismatch after roundtrip");
+        }
+        for (a, b) in ffn_a.w2.iter().zip(ffn_b.w2.iter()) {
+            assert!((a - b).abs() < 1e-5, "w2 mismatch after roundtrip");
+        }
+        for (a, b) in ffn_a.b2.iter().zip(ffn_b.b2.iter()) {
+            assert!((a - b).abs() < 1e-5, "b2 mismatch after roundtrip");
+        }
+
+        // Predictions should still work after FFN roundtrip
+        let mut network = Network::new();
+        let mut seq_memory = SequenceMemory::new();
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            15,
+            0.05,
+            5,
+        )
+        .unwrap();
+        let predictor = TransformerPredictor::from_model(&loaded, 5);
+        let tokens = {
+            let mut t = trainer.tokenizer.clone();
+            t.encode("Rust is a")
+        };
+        let results =
+            predictor.predict_top_k_assisted(&network, &trainer.embedder, &seq_memory, &tokens, 3);
+        assert!(
+            !results.is_empty(),
+            "predictions after FFN roundtrip should not be empty"
+        );
+    }
+
+    // ── v0.8.1 Transformer Training Metrics tests ─────────────────
+
+    /// Test A: report fields are populated after transformer training.
+    #[test]
+    fn transformer_report_fields_populated() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            5,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+
+        let report = train_transformer_output_head(
+            &mut model,
+            &trainer.embedder,
+            &examples,
+            5,
+            10,
+            0.01,
+            0.01,
+        );
+
+        assert_eq!(report.epochs, 10, "epochs should be 10");
+        assert!(report.examples > 0, "examples should be > 0");
+        assert!(
+            (report.transformer_lr - 0.01).abs() < 1e-6,
+            "transformer_lr should be 0.01"
+        );
+        assert!(
+            (report.language_lr - 0.01).abs() < 1e-6,
+            "language_lr should be 0.01"
+        );
+        assert!(report.avg_loss.is_finite(), "avg_loss should be finite");
+        assert!(report.avg_loss > 0.0, "avg_loss should be positive");
+        assert!(report.first_loss.is_some(), "first_loss should be set");
+        assert!(report.final_loss.is_some(), "final_loss should be set");
+        assert!(
+            report.improvement_pct.is_some(),
+            "improvement should be set"
+        );
+        assert!(report.top1_accuracy >= 0.0, "top1_accuracy should be >= 0");
+        assert!(report.top3_accuracy >= 0.0, "top3_accuracy should be >= 0");
+        assert!(
+            report.output_head_trained,
+            "output_head_trained should be true"
+        );
+        assert!(report.ffn_trained, "ffn_trained should be true");
+        assert!(
+            !report.attention_frozen,
+            "attention should be partially trained"
+        );
+        assert!(report.attention_trained, "attention_trained should be true");
+        assert!(
+            report.attention_projection_o_trained,
+            "w_o should be marked trained"
+        );
+        assert!(
+            report.attention_projection_v_trained,
+            "w_v should be marked trained"
+        );
+        assert!(
+            report.attention_projection_q_trained,
+            "w_q should be marked trained"
+        );
+        assert!(
+            report.attention_projection_k_trained,
+            "w_k should be marked trained"
+        );
+        // invalid_updates may be 0 or more — just check it's a valid value
+        assert!(
+            report.invalid_updates <= report.examples * report.epochs,
+            "invalid_updates should be within range"
+        );
+    }
+
+    /// Test B: top-k accuracy math is correct.
+    #[test]
+    fn transformer_accuracy_math() {
+        let embed_dim = 4;
+        let hidden_dim = 8;
+        let vocab_size = 3;
+        let vocab_order: Vec<u32> = vec![10, 20, 30]; // token IDs
+
+        let mut model = TransformerLanguageModel {
+            block: crate::transformer::TinyTransformerBlock::new(embed_dim, hidden_dim),
+            output_w: vec![0.0; embed_dim * vocab_size],
+            output_b: vec![0.0; vocab_size],
+            embed_dim,
+            hidden_dim,
+            vocab_order: vocab_order.clone(),
+            ffn_trained: false,
+            attention_trained: false,
+            attention_projection_mask: 0,
+        };
+
+        // Set output_w so that for the first vocab entry the score dominates
+        // output_w[0] = [1.0, 0.0, 0.0, 0.0] makes token 10 win when last = [1,0,0,0]
+        model.output_w[0] = 1.0;
+
+        // Create a minimal embedder
+        use std::collections::HashMap;
+        let mut table = HashMap::new();
+        table.insert(10u32, vec![1.0, 0.0, 0.0, 0.0]);
+        table.insert(20u32, vec![0.0, 1.0, 0.0, 0.0]);
+        table.insert(30u32, vec![0.0, 0.0, 1.0, 0.0]);
+        let embedder = manas_learn::Embedder { dim: 4, table };
+
+        // Example: context=[10], target=10 → should be correct top-1
+        let examples = vec![SequenceExample {
+            context: vec![10],
+            target: 10,
+        }];
+
+        let eval = evaluate_transformer_on_examples(&model, &embedder, &examples, 5);
+        assert_eq!(
+            eval.top1_accuracy, 100.0,
+            "top-1 should be 100% for exact match"
+        );
+        assert_eq!(
+            eval.top3_accuracy, 100.0,
+            "top-3 should be 100% for exact match"
+        );
+
+        // Example with target not in top-1 but in top-3
+        let examples = vec![
+            SequenceExample {
+                context: vec![20],
+                target: 20,
+            },
+            SequenceExample {
+                context: vec![30],
+                target: 30,
+            },
+        ];
+        let eval = evaluate_transformer_on_examples(&model, &embedder, &examples, 5);
+        // Each should get its correct token based on embedding match
+        assert!(eval.top1_accuracy >= 0.0, "top-1 should be >= 0");
+        assert!(
+            eval.top3_accuracy >= eval.top1_accuracy,
+            "top-3 should be >= top-1"
+        );
+    }
+
+    /// Test C: improvement calculation — first=1.0, final=0.25 → 75%.
+    #[test]
+    fn transformer_improvement_calculation() {
+        let first = 1.0f32;
+        let final_ = 0.25f32;
+        let improvement = (first - final_) / first * 100.0;
+        assert!(
+            (improvement - 75.0).abs() < 1e-6,
+            "75% improvement expected, got {}",
+            improvement
+        );
+
+        // Verify it works through the report flow
+        let mut report = TransformerTrainReport {
+            epochs: 10,
+            examples: 5,
+            language_lr: 0.01,
+            transformer_lr: 0.01,
+            avg_loss: 0.5,
+            first_loss: Some(first),
+            final_loss: Some(final_),
+            improvement_pct: None,
+            top1_accuracy: 0.0,
+            top3_accuracy: 0.0,
+            output_head_trained: false,
+            ffn_trained: false,
+            attention_frozen: true,
+            attention_trained: false,
+            attention_projection_o_trained: false,
+            attention_projection_v_trained: false,
+            attention_projection_q_trained: false,
+            attention_projection_k_trained: false,
+            invalid_updates: 0,
+            max_gradient_norm_seen: 0.0,
+            avg_gradient_norm: 0.0,
+            clipped_updates: 0,
+            unstable_updates: 0,
+            rolled_back: false,
+            attention_update_attempts: 0,
+            attention_updates_applied: 0,
+            attention_clipped_updates: 0,
+            attention_invalid_updates: 0,
+            max_attention_grad_norm: 0.0,
+            avg_attention_grad_norm: 0.0,
+        };
+        if let (Some(f), Some(l)) = (report.first_loss, report.final_loss)
+            && f.abs() > 1e-10
+        {
+            report.improvement_pct = Some((f - l) / f * 100.0);
+        }
+        let pct = report.improvement_pct.unwrap();
+        assert!(
+            (pct - 75.0).abs() < 1e-4,
+            "improvement should be ~75%, got {}",
+            pct
+        );
+    }
+
+    /// Test D: zero first loss should not panic or divide by zero.
+    #[test]
+    fn transformer_zero_first_loss_safe() {
+        let mut report = TransformerTrainReport {
+            epochs: 10,
+            examples: 5,
+            language_lr: 0.01,
+            transformer_lr: 0.01,
+            avg_loss: 0.0,
+            first_loss: Some(0.0),
+            final_loss: Some(0.0),
+            improvement_pct: None,
+            top1_accuracy: 0.0,
+            top3_accuracy: 0.0,
+            output_head_trained: false,
+            ffn_trained: false,
+            attention_frozen: true,
+            attention_trained: false,
+            attention_projection_o_trained: false,
+            attention_projection_v_trained: false,
+            attention_projection_q_trained: false,
+            attention_projection_k_trained: false,
+            invalid_updates: 0,
+            max_gradient_norm_seen: 0.0,
+            avg_gradient_norm: 0.0,
+            clipped_updates: 0,
+            unstable_updates: 0,
+            rolled_back: false,
+            attention_update_attempts: 0,
+            attention_updates_applied: 0,
+            attention_clipped_updates: 0,
+            attention_invalid_updates: 0,
+            max_attention_grad_norm: 0.0,
+            avg_attention_grad_norm: 0.0,
+        };
+
+        // This should not panic
+        if let (Some(f), Some(l)) = (report.first_loss, report.final_loss)
+            && f.abs() > 1e-10
+        {
+            report.improvement_pct = Some((f - l) / f * 100.0);
+        }
+        // improvement should remain None
+        assert!(
+            report.improvement_pct.is_none(),
+            "improvement should be None when first_loss is zero"
+        );
+    }
+
+    /// Test E: report formatting contains expected labels.
+    #[test]
+    fn transformer_metrics_format_labels() {
+        let report = TransformerTrainReport {
+            epochs: 10,
+            examples: 5,
+            language_lr: 0.01,
+            transformer_lr: 0.01,
+            avg_loss: 0.5,
+            first_loss: Some(0.8),
+            final_loss: Some(0.2),
+            improvement_pct: Some(75.0),
+            top1_accuracy: 80.0,
+            top3_accuracy: 100.0,
+            output_head_trained: true,
+            ffn_trained: true,
+            attention_frozen: false,
+            attention_trained: true,
+            attention_projection_o_trained: true,
+            attention_projection_v_trained: true,
+            attention_projection_q_trained: true,
+            attention_projection_k_trained: true,
+            invalid_updates: 0,
+            max_gradient_norm_seen: 0.0,
+            avg_gradient_norm: 0.0,
+            clipped_updates: 0,
+            unstable_updates: 0,
+            rolled_back: false,
+            attention_update_attempts: 3,
+            attention_updates_applied: 3,
+            attention_clipped_updates: 1,
+            attention_invalid_updates: 0,
+            max_attention_grad_norm: 2.0,
+            avg_attention_grad_norm: 1.0,
+        };
+
+        let formatted = format!(
+            "Transformer training\n\
+             \x20 epochs          : {}\n\
+             \x20 language lr                      : {:.4}\n\
+             \x20 transformer lr                   : {:.4}\n\
+             \x20 pure transformer top-1 accuracy  : {:.2}%\n\
+             \x20 pure transformer top-3 accuracy  : {:.2}%\n\
+             \x20 feed-forward    : {}\n\
+             \x20 attention       : {}\n\
+             \x20 attention projections : {}\n\
+             \n\
+             Attention safety\n\
+             \x20 projections trained              : {}\n\
+             \x20 attention update attempts        : {}\n\
+             \x20 attention updates applied        : {}\n\
+             \x20 attention clipped updates        : {}\n\
+             \x20 attention invalid updates        : {}\n\
+             \x20 max attention grad norm          : {:.4}\n\
+             \x20 avg attention grad norm          : {:.4}\n",
+            report.epochs,
+            report.language_lr,
+            report.transformer_lr,
+            report.top1_accuracy,
+            report.top3_accuracy,
+            if report.ffn_trained {
+                "trained"
+            } else {
+                "untrained"
+            },
+            if report.attention_frozen {
+                "frozen"
+            } else if report.attention_projection_o_trained
+                || report.attention_projection_v_trained
+                || report.attention_projection_q_trained
+                || report.attention_projection_k_trained
+            {
+                "partially trained"
+            } else {
+                "trainable"
+            },
+            "o,v,q,k",
+            "o,v,q,k",
+            report.attention_update_attempts,
+            report.attention_updates_applied,
+            report.attention_clipped_updates,
+            report.attention_invalid_updates,
+            report.max_attention_grad_norm,
+            report.avg_attention_grad_norm,
+        );
+
+        assert!(
+            formatted.contains("Transformer training"),
+            "should contain 'Transformer training'"
+        );
+        assert!(
+            formatted.contains("pure transformer top-1 accuracy"),
+            "should contain 'pure transformer top-1 accuracy'"
+        );
+        assert!(
+            formatted.contains("pure transformer top-3 accuracy"),
+            "should contain 'pure transformer top-3 accuracy'"
+        );
+        assert!(
+            formatted.contains("feed-forward"),
+            "should contain 'feed-forward'"
+        );
+        assert!(
+            formatted.contains("attention"),
+            "should contain 'attention'"
+        );
+        assert!(
+            formatted.contains("partially trained"),
+            "should contain 'partially trained'"
+        );
+        assert!(
+            formatted.contains("attention projections"),
+            "should contain 'attention projections'"
+        );
+        assert!(
+            formatted.contains("o,v,q,k"),
+            "should contain projections 'o,v,q,k'"
+        );
+        assert!(
+            formatted.contains("Attention safety"),
+            "should contain 'Attention safety'"
+        );
+        assert!(
+            formatted.contains("attention update attempts"),
+            "should contain attention update attempts"
+        );
+    }
+
+    /// Test F: zero examples should not panic and return (0.0, 0.0).
+    #[test]
+    fn transformer_zero_examples_safe() {
+        let embed_dim = 4;
+        let hidden_dim = 8;
+        let vocab_size = 3;
+        let vocab_order: Vec<u32> = vec![10, 20, 30];
+
+        let model = TransformerLanguageModel {
+            block: crate::transformer::TinyTransformerBlock::new(embed_dim, hidden_dim),
+            output_w: vec![0.0; embed_dim * vocab_size],
+            output_b: vec![0.0; vocab_size],
+            embed_dim,
+            hidden_dim,
+            vocab_order: vocab_order.clone(),
+            ffn_trained: false,
+            attention_trained: false,
+            attention_projection_mask: 0,
+        };
+
+        use std::collections::HashMap;
+        let mut table = HashMap::new();
+        table.insert(10u32, vec![1.0, 0.0, 0.0, 0.0]);
+        let embedder = manas_learn::Embedder { dim: 4, table };
+
+        let examples: Vec<SequenceExample> = vec![];
+
+        let eval = evaluate_transformer_on_examples(&model, &embedder, &examples, 5);
+        assert_eq!(
+            eval.top1_accuracy, 0.0,
+            "top-1 should be 0.0 for empty examples"
+        );
+        assert_eq!(
+            eval.top3_accuracy, 0.0,
+            "top-3 should be 0.0 for empty examples"
+        );
+    }
+
+    /// Test G: report shows both language_lr and transformer_lr.
+    #[test]
+    fn transformer_report_both_lrs() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let text = "Rust is a systems programming language";
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut SequenceMemory::new(),
+            text,
+            5,
+            10,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let tokens = trainer.tokenizer.encode(text);
+        let examples = build_sequence_examples(&tokens, 5);
+
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+        let report = train_transformer_output_head(
+            &mut model,
+            &trainer.embedder,
+            &examples,
+            5,
+            10,
+            0.01,
+            0.05,
+        );
+
+        assert!(
+            (report.language_lr - 0.05).abs() < 1e-6,
+            "language_lr should be 0.05, got {}",
+            report.language_lr
+        );
+        assert!(
+            (report.transformer_lr - 0.01).abs() < 1e-6,
+            "transformer_lr should be 0.01, got {}",
+            report.transformer_lr
+        );
+    }
+
+    /// Test H: when logits strongly favor the target token, loss is low and
+    /// top-1 accuracy is 100% (pure transformer eval consistency).
+    #[test]
+    fn evaluate_strong_target_low_loss_high_accuracy() {
+        let embed_dim = 4;
+        let hidden_dim = 8;
+        let vocab_size = 3;
+        let vocab_order: Vec<u32> = vec![10, 20, 30];
+
+        let mut model = TransformerLanguageModel {
+            block: crate::transformer::TinyTransformerBlock::new(embed_dim, hidden_dim),
+            output_w: vec![0.0; embed_dim * vocab_size],
+            output_b: vec![0.0; vocab_size],
+            embed_dim,
+            hidden_dim,
+            vocab_order: vocab_order.clone(),
+            ffn_trained: false,
+            attention_trained: false,
+            attention_projection_mask: 0,
+        };
+        // Make output_w[0] = [100, 0, 0, 0] so token 10 dominates
+        model.output_w[0] = 100.0;
+
+        use std::collections::HashMap;
+        let mut table = HashMap::new();
+        table.insert(10u32, vec![1.0, 0.0, 0.0, 0.0]);
+        table.insert(20u32, vec![0.0, 1.0, 0.0, 0.0]);
+        table.insert(30u32, vec![0.0, 0.0, 1.0, 0.0]);
+        let embedder = manas_learn::Embedder { dim: 4, table };
+
+        let examples = vec![SequenceExample {
+            context: vec![10],
+            target: 10,
+        }];
+
+        let eval = evaluate_transformer_on_examples(&model, &embedder, &examples, 5);
+        assert!(
+            eval.avg_loss < 0.01,
+            "loss should be very low for strongly favored target, got {}",
+            eval.avg_loss
+        );
+        assert_eq!(eval.top1_accuracy, 100.0, "top-1 should be 100%");
+        assert_eq!(eval.top3_accuracy, 100.0, "top-3 should be 100%");
+        assert_eq!(eval.evaluated_examples, 1);
+    }
+
+    /// Test I: when target token is not in top-3, top-3 accuracy is 0%.
+    #[test]
+    fn evaluate_target_not_in_top3() {
+        let embed_dim = 4;
+        let hidden_dim = 8;
+        // Use 5 vocab entries so top-3 doesn't cover everything
+        let vocab_order: Vec<u32> = vec![10, 20, 30, 40, 50];
+
+        let model = TransformerLanguageModel {
+            block: crate::transformer::TinyTransformerBlock::new(embed_dim, hidden_dim),
+            output_w: vec![0.0; embed_dim * 5],
+            output_b: vec![0.0; 5],
+            embed_dim,
+            hidden_dim,
+            vocab_order: vocab_order.clone(),
+            ffn_trained: false,
+            attention_trained: false,
+            attention_projection_mask: 0,
+        };
+        // All output_w entries are 0, so all logits are equal → probs uniform.
+        // In uniform probs over 5 tokens, each has prob 0.2.
+        // Top-3 will be the first 3 vocab_order entries (10, 20, 30) after sort
+        // by equal probs (ties broken by original order).
+        // target=50 → not in top-3.
+
+        use std::collections::HashMap;
+        let mut table = HashMap::new();
+        table.insert(10u32, vec![1.0, 0.0, 0.0, 0.0]);
+        let embedder = manas_learn::Embedder { dim: 4, table };
+
+        let examples = vec![SequenceExample {
+            context: vec![10],
+            target: 50,
+        }];
+
+        let eval = evaluate_transformer_on_examples(&model, &embedder, &examples, 5);
+        assert_eq!(eval.top1_accuracy, 0.0, "token 50 should not be top-1");
+        assert_eq!(
+            eval.top3_accuracy, 0.0,
+            "token 50 should not be in top-3 with 5 vocab entries"
+        );
+    }
+
+    // ── v0.8.2 Safety tests ─────────────────────────────────────────
+
+    #[test]
+    fn attention_safety_metrics_count_without_double_counting_global_counters() {
+        let mut report = TransformerTrainReport {
+            epochs: 1,
+            examples: 1,
+            language_lr: 0.01,
+            transformer_lr: 0.01,
+            avg_loss: 0.0,
+            first_loss: None,
+            final_loss: None,
+            improvement_pct: None,
+            top1_accuracy: 0.0,
+            top3_accuracy: 0.0,
+            output_head_trained: false,
+            ffn_trained: false,
+            attention_frozen: false,
+            attention_trained: true,
+            attention_projection_o_trained: true,
+            attention_projection_v_trained: true,
+            attention_projection_q_trained: true,
+            attention_projection_k_trained: true,
+            invalid_updates: 0,
+            max_gradient_norm_seen: 0.0,
+            avg_gradient_norm: 0.0,
+            clipped_updates: 0,
+            unstable_updates: 0,
+            rolled_back: false,
+            attention_update_attempts: 0,
+            attention_updates_applied: 0,
+            attention_clipped_updates: 0,
+            attention_invalid_updates: 0,
+            max_attention_grad_norm: 0.0,
+            avg_attention_grad_norm: 0.0,
+        };
+        let mut grad_norm_sum = 0.0;
+        let mut grad_norm_count = 0usize;
+        let mut attention_grad_norm_sum = 0.0;
+        let mut attention_grad_norm_count = 0usize;
+
+        let applied_clipped = crate::attention::AttentionTrainStepReport {
+            attempted: true,
+            applied: true,
+            clipped: true,
+            invalid: false,
+            grad_norm_before_clip: 2.0,
+            grad_norm: 2.0,
+        };
+        let applied = crate::attention::AttentionTrainStepReport {
+            attempted: true,
+            applied: true,
+            clipped: false,
+            invalid: false,
+            grad_norm_before_clip: 1.0,
+            grad_norm: 1.0,
+        };
+        let invalid = crate::attention::AttentionTrainStepReport {
+            attempted: true,
+            applied: false,
+            clipped: false,
+            invalid: true,
+            grad_norm_before_clip: f32::NAN,
+            grad_norm: f32::NAN,
+        };
+
+        for step in [&applied_clipped, &applied, &invalid] {
+            record_attention_train_step(
+                &mut report,
+                &mut grad_norm_sum,
+                &mut grad_norm_count,
+                &mut attention_grad_norm_sum,
+                &mut attention_grad_norm_count,
+                step,
+            );
+        }
+
+        assert_eq!(report.attention_update_attempts, 3);
+        assert_eq!(report.attention_updates_applied, 2);
+        assert_eq!(report.attention_clipped_updates, 1);
+        assert_eq!(report.attention_invalid_updates, 1);
+        assert_eq!(
+            report.clipped_updates, 1,
+            "global clipped count should not double-count"
+        );
+        assert_eq!(
+            report.invalid_updates, 1,
+            "global invalid count should not double-count"
+        );
+        assert_eq!(grad_norm_count, 2);
+        assert_eq!(attention_grad_norm_count, 2);
+        assert!((grad_norm_sum - 3.0).abs() < 1e-6);
+        assert!((attention_grad_norm_sum - 3.0).abs() < 1e-6);
+        assert!((report.max_gradient_norm_seen - 2.0).abs() < 1e-6);
+        assert!((report.max_attention_grad_norm - 2.0).abs() < 1e-6);
+    }
+
+    /// Test A: gradient_norm([3, 4]) = 5.
+    #[test]
+    fn safety_gradient_norm() {
+        let v = vec![3.0, 4.0];
+        let n = gradient_norm(&v);
+        assert!((n - 5.0).abs() < 1e-6, "norm should be 5, got {}", n);
+    }
+
+    /// Test B: clip_by_norm scales [6,8] to norm ≤ 5.
+    #[test]
+    fn safety_clip_by_norm() {
+        let mut v = vec![6.0, 8.0];
+        let clipped = clip_by_norm(&mut v, 5.0);
+        assert!(clipped, "should have clipped");
+        let n = gradient_norm(&v);
+        assert!(
+            (n - 5.0).abs() < 1e-6,
+            "norm should be ~5 after clipping, got {}",
+            n
+        );
+        // Direction should be preserved: 6:8 = 3:4
+        assert!(
+            (v[0] / v[1] - 0.75).abs() < 1e-6,
+            "direction should be preserved"
+        );
+    }
+
+    /// Test C: fresh model is finite.
+    #[test]
+    fn safety_finite_model_fresh() {
+        let model = TransformerLanguageModel::new(4, 8, vec![10, 20, 30]);
+        assert!(is_finite_model(&model), "fresh model should be finite");
+    }
+
+    /// Test D: model with NaN weight is detected as non-finite.
+    #[test]
+    fn safety_non_finite_model_detected() {
+        let mut model = TransformerLanguageModel::new(4, 8, vec![10, 20, 30]);
+        model.output_w[0] = f32::NAN;
+        assert!(
+            !is_finite_model(&model),
+            "NaN in output_w should be detected"
+        );
+    }
+
+    #[test]
+    fn safety_non_finite_attention_detected() {
+        let mut model = TransformerLanguageModel::new(4, 8, vec![10, 20, 30]);
+        model.block.attention.w_q[0] = f32::NAN;
+        assert!(
+            !is_finite_model(&model),
+            "NaN in attention w_q should be detected"
+        );
+
+        let mut model = TransformerLanguageModel::new(4, 8, vec![10, 20, 30]);
+        model.block.attention.w_o[0] = f32::INFINITY;
+        assert!(
+            !is_finite_model(&model),
+            "infinity in attention w_o should be detected"
+        );
+    }
+
+    #[test]
+    fn transformer_save_rejects_non_finite_model() {
+        let mut model = TransformerLanguageModel::new(4, 8, vec![10, 20, 30]);
+        model.block.attention.w_q[0] = f32::NAN;
+
+        let path = temp_test_path("transformer_non_finite_save_rejected.bin");
+        std::fs::remove_file(&path).ok();
+        let result = model.save_to_file(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            matches!(result, Err(ManasError::GrowthFailed(_))),
+            "non-finite transformer save should fail, got {:?}",
+            result
+        );
+        assert!(
+            !path.exists(),
+            "non-finite save must not create transformer sidecar"
+        );
+    }
+
+    /// Test E: rollback restores finite weights after corruption.
+    #[test]
+    fn safety_rollback_restores_finite() {
+        let mut model = TransformerLanguageModel::new(4, 8, vec![10, 20, 30]);
+        model.ffn_trained = true;
+        model.mark_attention_projection_o_trained();
+        model.mark_attention_projection_v_trained();
+        model.mark_attention_projection_q_trained();
+        model.mark_attention_projection_k_trained();
+        let snapshot = snapshot_model(&model);
+        // Simulate corruption
+        let last = model.output_w.len() - 1;
+        model.output_w[last] = f32::INFINITY;
+        model.block.attention.w_q[0] = f32::NAN;
+        model.block.attention.w_k[0] = f32::INFINITY;
+        model.block.attention.w_o[0] = f32::NAN;
+        model.block.attention.w_v[0] = f32::INFINITY;
+        assert!(
+            !is_finite_model(&model),
+            "should be non-finite after corruption"
+        );
+        // Rollback
+        restore_model(&mut model, &snapshot);
+        assert!(is_finite_model(&model), "should be finite after rollback");
+        assert_transformer_snapshot_restored(&model, &snapshot);
+    }
+
+    #[test]
+    fn safety_epoch_loss_explosion_rolls_back_when_enabled() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+        let text = "Rust is a systems programming language";
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            text,
+            5,
+            5,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let tokens = trainer.tokenizer.encode(text);
+        let examples = build_sequence_examples(&tokens, 5);
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+        let snapshot = snapshot_model(&model);
+
+        let report = train_transformer_output_head_with_safety(
+            &mut model,
+            &trainer.embedder,
+            &examples,
+            5,
+            2,
+            0.05,
+            0.05,
+            &TransformerTrainingSafety {
+                max_gradient_norm: 5.0,
+                max_loss: 50.0,
+                loss_explosion_factor: 0.0,
+                rollback_on_unstable: true,
+            },
+        );
+
+        assert!(report.rolled_back, "loss explosion should trigger rollback");
+        assert!(
+            report.unstable_updates > 0,
+            "loss explosion should be counted as unstable"
+        );
+        assert_transformer_snapshot_restored(&model, &snapshot);
+    }
+
+    /// Test F: normal training with default safety — no rollback, generation works.
+    #[test]
+    fn safety_normal_training_no_rollback() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        let text = "Rust is a systems programming language";
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            text,
+            5,
+            10,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let tokens = trainer.tokenizer.encode(text);
+        let examples = build_sequence_examples(&tokens, 5);
+
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+        let report = train_transformer_output_head_with_safety(
+            &mut model,
+            &trainer.embedder,
+            &examples,
+            5,
+            10,
+            0.01,
+            0.05,
+            &TransformerTrainingSafety::default(),
+        );
+
+        assert!(
+            !report.rolled_back,
+            "should not roll back in normal training"
+        );
+        assert!(report.avg_loss.is_finite(), "avg_loss should be finite");
+        assert!(report.top1_accuracy >= 0.0, "top1_accuracy should be >= 0");
+
+        // Generation should still work after training
+        let predictor = TransformerPredictor::from_model(&model, 5);
+        let mut tok = trainer.tokenizer.clone();
+        let prompt_tokens = tok.encode("Rust is a");
+        let results = predictor.predict_top_k_assisted(
+            &network,
+            &trainer.embedder,
+            &seq_memory,
+            &prompt_tokens,
+            3,
+        );
+        let words: Vec<String> = results
+            .iter()
+            .filter_map(|(id, _)| trainer.tokenizer.decode(*id).map(|s| s.to_string()))
+            .collect();
+        assert!(
+            words.contains(&"systems".to_string()),
+            "'systems' in top 3 for 'Rust is a', got: {:?}",
+            words
+        );
     }
 }

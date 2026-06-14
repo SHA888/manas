@@ -1,0 +1,32 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2
+    labels:
+      - dependencies
+      - rust
+    ignore:
+      - dependency-name: rand
+        update-types:
+          - version-update:semver-major
+      - dependency-name: reqwest
+        update-types:
+          - version-update:semver-major
+      - dependency-name: scraper
+        update-types:
+          - version-update:semver-major
+      - dependency-name: toml
+        update-types:
+          - version-update:semver-major
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    labels:
+      - dependencies
+      - ci

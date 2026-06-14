@@ -1,7 +1,10 @@
-use crate::attention::{CausalSelfAttention, SimpleRng, mat_vec_mul, random_vec};
+use crate::attention::{
+    AttentionForwardCache, CausalSelfAttention, SimpleRng, mat_vec_mul, random_vec,
+};
 
 // ─── Feed‑Forward ────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct FeedForward {
     pub embed_dim: usize,
     pub hidden_dim: usize,
@@ -9,6 +12,12 @@ pub struct FeedForward {
     pub b1: Vec<f32>,
     pub w2: Vec<f32>,
     pub b2: Vec<f32>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FeedForwardTrainStepReport {
+    pub(crate) applied: bool,
+    pub(crate) grad_input: Vec<f32>,
 }
 
 impl FeedForward {
@@ -35,10 +44,126 @@ impl FeedForward {
         let out = mat_vec_mul(&self.w2, self.embed_dim, self.hidden_dim, &hidden);
         add_vectors(&out, &self.b2)
     }
+
+    /// Returns `true` if the update was applied, `false` if skipped (NaN/inf).
+    pub fn train_step(&mut self, input: &[f32], grad_output: &[f32], learning_rate: f32) -> bool {
+        self.train_step_with_input_gradient(input, grad_output, learning_rate)
+            .applied
+    }
+
+    pub(crate) fn train_step_with_input_gradient(
+        &mut self,
+        input: &[f32],
+        grad_output: &[f32],
+        learning_rate: f32,
+    ) -> FeedForwardTrainStepReport {
+        // Forward with caching
+        let hidden_pre = mat_vec_mul(&self.w1, self.hidden_dim, self.embed_dim, input);
+        let hidden_pre_bias = add_vectors(&hidden_pre, &self.b1);
+        let hidden_post: Vec<f32> = hidden_pre_bias.iter().map(|x| x.max(0.0)).collect();
+
+        // Backprop through w2: grad_w2[r][c] = grad_output[r] * hidden_post[c]
+        let mut grad_w2 = vec![0.0; self.embed_dim * self.hidden_dim];
+        for (r, &go) in grad_output.iter().enumerate() {
+            let base = r * self.hidden_dim;
+            for (c, &hp) in hidden_post.iter().enumerate() {
+                grad_w2[base + c] = go * hp;
+            }
+        }
+
+        // Backprop through b2 = grad_output
+        let mut grad_b2 = grad_output.to_vec();
+
+        // Backprop through w2^T: grad_hidden[c] = sum_r w2[r][c] * grad_output[r]
+        let mut grad_hidden = vec![0.0; self.hidden_dim];
+        for (c, gh) in grad_hidden.iter_mut().enumerate() {
+            let mut s = 0.0;
+            for (r, &go) in grad_output.iter().enumerate() {
+                s += self.w2[r * self.hidden_dim + c] * go;
+            }
+            *gh = s;
+        }
+
+        // ReLU derivative
+        for (i, gh) in grad_hidden.iter_mut().enumerate() {
+            if hidden_pre_bias[i] <= 0.0 {
+                *gh = 0.0;
+            }
+        }
+
+        let mut grad_input = vec![0.0; self.embed_dim];
+        for (c, gi) in grad_input.iter_mut().enumerate() {
+            let mut s = 0.0;
+            for (r, &gh) in grad_hidden.iter().enumerate() {
+                s += self.w1[r * self.embed_dim + c] * gh;
+            }
+            *gi = s;
+        }
+
+        // Backprop through w1: grad_w1[r][c] = grad_hidden[r] * input[c]
+        let mut grad_w1 = vec![0.0; self.hidden_dim * self.embed_dim];
+        for (r, &gh) in grad_hidden.iter().enumerate() {
+            let base = r * self.embed_dim;
+            for (c, &inp) in input.iter().enumerate() {
+                grad_w1[base + c] = gh * inp;
+            }
+        }
+
+        // Backprop through b1 = grad_hidden (reuse, renamed)
+        let mut grad_b1 = grad_hidden;
+
+        // Gradient clipping to [-1.0, 1.0]
+        for g in &mut grad_w1 {
+            *g = g.clamp(-1.0, 1.0);
+        }
+        for g in &mut grad_b1 {
+            *g = g.clamp(-1.0, 1.0);
+        }
+        for g in &mut grad_w2 {
+            *g = g.clamp(-1.0, 1.0);
+        }
+        for g in &mut grad_b2 {
+            *g = g.clamp(-1.0, 1.0);
+        }
+
+        // NaN/inf check — skip update if any gradient is not finite
+        let has_nan = grad_w1
+            .iter()
+            .chain(&grad_b1)
+            .chain(&grad_w2)
+            .chain(&grad_b2)
+            .chain(&grad_input)
+            .any(|&g| !g.is_finite());
+        if has_nan {
+            return FeedForwardTrainStepReport {
+                applied: false,
+                grad_input: vec![0.0; self.embed_dim],
+            };
+        }
+
+        // Update weights
+        for (i, &g) in grad_w1.iter().enumerate() {
+            self.w1[i] -= learning_rate * g;
+        }
+        for (i, &g) in grad_b1.iter().enumerate() {
+            self.b1[i] -= learning_rate * g;
+        }
+        for (i, &g) in grad_w2.iter().enumerate() {
+            self.w2[i] -= learning_rate * g;
+        }
+        for (i, &g) in grad_b2.iter().enumerate() {
+            self.b2[i] -= learning_rate * g;
+        }
+        FeedForwardTrainStepReport {
+            applied: true,
+            grad_input,
+        }
+    }
 }
 
 // ─── Tiny Transformer Block ──────────────────────────────────────
 
+#[derive(Clone)]
 pub struct TinyTransformerBlock {
     pub embed_dim: usize,
     pub attention: CausalSelfAttention,
@@ -81,6 +206,53 @@ impl TinyTransformerBlock {
         });
 
         x
+    }
+
+    /// Forward pass that also returns the per-position FFN inputs (residual
+    /// after attention) so callers can later backprop through the FFN.
+    pub fn forward_with_ffn_inputs(&self, inputs: &[Vec<f32>]) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        let (block_out, ffn_inputs, _attention_cache) = self.forward_with_training_cache(inputs);
+        (block_out, ffn_inputs)
+    }
+
+    pub(crate) fn forward_with_training_cache(
+        &self,
+        inputs: &[Vec<f32>],
+    ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>, AttentionForwardCache) {
+        if inputs.is_empty() || self.embed_dim == 0 {
+            return (
+                Vec::new(),
+                Vec::new(),
+                AttentionForwardCache {
+                    qs: Vec::new(),
+                    ks: Vec::new(),
+                    vs: Vec::new(),
+                    attention_weights: Vec::new(),
+                    weighted_values: Vec::new(),
+                },
+            );
+        }
+
+        let (attn_out, attention_cache) = self.attention.forward_with_cache(inputs);
+
+        let ffn_inputs: Vec<Vec<f32>> = inputs
+            .iter()
+            .zip(attn_out.iter())
+            .map(|(inp, att)| add_vectors(inp, att))
+            .collect();
+
+        let ff_out: Vec<Vec<f32>> = ffn_inputs
+            .iter()
+            .map(|v| self.feed_forward.forward(v))
+            .collect();
+
+        let block_out: Vec<Vec<f32>> = ffn_inputs
+            .iter()
+            .zip(ff_out.iter())
+            .map(|(xv, ffv)| add_vectors(xv, ffv))
+            .collect();
+
+        (block_out, ffn_inputs, attention_cache)
     }
 }
 
