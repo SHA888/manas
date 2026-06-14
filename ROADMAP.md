@@ -216,6 +216,8 @@ Goal achieved:
 
 ## Next Milestones
 
+## v0.8 — Train Transformer Feed-Forward Layer
+
 Right now, the transformer output head is trained, but the internal transformer block is mostly fixed.
 
 The next safe step is to train the feed-forward part of the transformer block while keeping attention frozen.
