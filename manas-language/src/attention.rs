@@ -358,10 +358,196 @@ impl CausalSelfAttention {
             grad_norm,
         }
     }
+
+    /// Train only the query/key projections `w_q` and `w_k` for the final
+    /// token position.
+    ///
+    /// This backpropagates through the causal softmax score path, but does not
+    /// update `w_v`, `w_o`, attention probabilities, or input embeddings.
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_query_key_projection_step(
+        &mut self,
+        inputs: &[Vec<f32>],
+        qs: &[Vec<f32>],
+        ks: &[Vec<f32>],
+        vs: &[Vec<f32>],
+        attention_weights_last: &[f32],
+        grad_context_last: &[f32],
+        learning_rate: f32,
+        max_grad_norm: f32,
+    ) -> AttentionTrainStepReport {
+        if inputs.is_empty() {
+            return AttentionTrainStepReport {
+                applied: false,
+                clipped: false,
+                invalid: true,
+                grad_norm: f32::NAN,
+            };
+        }
+        self.train_query_key_projection_step_for_position(
+            inputs,
+            inputs.len() - 1,
+            qs,
+            ks,
+            vs,
+            attention_weights_last,
+            grad_context_last,
+            learning_rate,
+            max_grad_norm,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn train_query_key_projection_step_for_position(
+        &mut self,
+        inputs: &[Vec<f32>],
+        position: usize,
+        qs: &[Vec<f32>],
+        ks: &[Vec<f32>],
+        vs: &[Vec<f32>],
+        attention_weights: &[f32],
+        grad_context: &[f32],
+        learning_rate: f32,
+        max_grad_norm: f32,
+    ) -> AttentionTrainStepReport {
+        let d = self.embed_dim;
+        if d == 0
+            || inputs.is_empty()
+            || position >= inputs.len()
+            || qs.len() != inputs.len()
+            || ks.len() != inputs.len()
+            || vs.len() != inputs.len()
+            || attention_weights.len() != inputs.len()
+            || grad_context.len() != d
+            || self.w_q.len() != d * d
+            || self.w_k.len() != d * d
+            || !learning_rate.is_finite()
+            || inputs
+                .iter()
+                .any(|input| input.len() != d || input.iter().any(|&v| !v.is_finite()))
+            || qs
+                .iter()
+                .any(|q| q.len() != d || q.iter().any(|&v| !v.is_finite()))
+            || ks
+                .iter()
+                .any(|k| k.len() != d || k.iter().any(|&v| !v.is_finite()))
+            || vs
+                .iter()
+                .any(|v| v.len() != d || v.iter().any(|&x| !x.is_finite()))
+            || attention_weights.iter().any(|&v| !v.is_finite())
+            || grad_context.iter().any(|&v| !v.is_finite())
+        {
+            return AttentionTrainStepReport {
+                applied: false,
+                clipped: false,
+                invalid: true,
+                grad_norm: f32::NAN,
+            };
+        }
+
+        let allowed_len = position + 1;
+        let inv_sqrt_d = 1.0 / (d as f32).sqrt();
+
+        let mut grad_a = vec![0.0; allowed_len];
+        for j in 0..allowed_len {
+            grad_a[j] = dot(grad_context, &vs[j]);
+        }
+
+        let weighted_grad_a: f32 = attention_weights
+            .iter()
+            .take(allowed_len)
+            .zip(grad_a.iter())
+            .map(|(&a, &g)| a * g)
+            .sum();
+
+        let mut grad_q = vec![0.0; d];
+        let mut grad_ks = vec![vec![0.0; d]; allowed_len];
+
+        for j in 0..allowed_len {
+            let grad_score = attention_weights[j] * (grad_a[j] - weighted_grad_a);
+            if grad_score.abs() < 1e-10 {
+                continue;
+            }
+            let scaled_grad_score = grad_score * inv_sqrt_d;
+            for r in 0..d {
+                grad_q[r] += scaled_grad_score * ks[j][r];
+                grad_ks[j][r] += scaled_grad_score * qs[position][r];
+            }
+        }
+
+        let mut grad_w_q = vec![0.0; d * d];
+        for (r, &gq) in grad_q.iter().enumerate() {
+            if gq.abs() < 1e-10 {
+                continue;
+            }
+            let base = r * d;
+            for (c, &input_value) in inputs[position].iter().enumerate() {
+                grad_w_q[base + c] += gq * input_value;
+            }
+        }
+
+        let mut grad_w_k = vec![0.0; d * d];
+        for j in 0..allowed_len {
+            for (r, &gk) in grad_ks[j].iter().enumerate() {
+                if gk.abs() < 1e-10 {
+                    continue;
+                }
+                let base = r * d;
+                for (c, &input_value) in inputs[j].iter().enumerate() {
+                    grad_w_k[base + c] += gk * input_value;
+                }
+            }
+        }
+
+        let grad_norm = combined_vector_norm(&grad_w_q, &grad_w_k);
+        if !grad_norm.is_finite()
+            || grad_w_q.iter().any(|&g| !g.is_finite())
+            || grad_w_k.iter().any(|&g| !g.is_finite())
+        {
+            return AttentionTrainStepReport {
+                applied: false,
+                clipped: false,
+                invalid: true,
+                grad_norm,
+            };
+        }
+
+        let clipped = clip_two_vectors_by_norm(&mut grad_w_q, &mut grad_w_k, max_grad_norm);
+        let mut next_w_q = self.w_q.clone();
+        let mut next_w_k = self.w_k.clone();
+        for (w, &g) in next_w_q.iter_mut().zip(grad_w_q.iter()) {
+            *w -= learning_rate * g;
+        }
+        for (w, &g) in next_w_k.iter_mut().zip(grad_w_k.iter()) {
+            *w -= learning_rate * g;
+        }
+
+        if next_w_q.iter().any(|&w| !w.is_finite()) || next_w_k.iter().any(|&w| !w.is_finite()) {
+            return AttentionTrainStepReport {
+                applied: false,
+                clipped,
+                invalid: true,
+                grad_norm,
+            };
+        }
+
+        self.w_q = next_w_q;
+        self.w_k = next_w_k;
+        AttentionTrainStepReport {
+            applied: true,
+            clipped,
+            invalid: false,
+            grad_norm,
+        }
+    }
 }
 
 fn vector_norm(values: &[f32]) -> f32 {
     values.iter().map(|&v| v * v).sum::<f32>().sqrt()
+}
+
+fn combined_vector_norm(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().chain(b.iter()).map(|&v| v * v).sum::<f32>().sqrt()
 }
 
 fn clip_vector_by_norm(values: &mut [f32], max_norm: f32) -> bool {
@@ -372,6 +558,25 @@ fn clip_vector_by_norm(values: &mut [f32], max_norm: f32) -> bool {
     if norm.is_finite() && norm > max_norm {
         let scale = max_norm / norm;
         for value in values {
+            *value *= scale;
+        }
+        true
+    } else {
+        false
+    }
+}
+
+fn clip_two_vectors_by_norm(a: &mut [f32], b: &mut [f32], max_norm: f32) -> bool {
+    if max_norm <= 0.0 || (a.is_empty() && b.is_empty()) {
+        return false;
+    }
+    let norm = combined_vector_norm(a, b);
+    if norm.is_finite() && norm > max_norm {
+        let scale = max_norm / norm;
+        for value in a {
+            *value *= scale;
+        }
+        for value in b {
             *value *= scale;
         }
         true
@@ -702,5 +907,205 @@ mod tests {
         assert!(!report.applied, "invalid update should not apply");
         assert!(report.invalid, "non-finite gradient should be invalid");
         assert_eq!(attn.w_v, before, "w_v must not change on invalid update");
+    }
+
+    #[test]
+    fn query_key_projection_step_updates_only_w_q_and_w_k() {
+        let mut attn = CausalSelfAttention::new(3);
+        let q_before = attn.w_q.clone();
+        let k_before = attn.w_k.clone();
+        let v_before = attn.w_v.clone();
+        let o_before = attn.w_o.clone();
+        let inputs = vec![
+            vec![1.0, 0.0, 0.5],
+            vec![0.0, -1.0, 0.25],
+            vec![0.5, 0.5, 1.0],
+        ];
+        let (_outputs, cache) = attn.forward_with_cache(&inputs);
+
+        let report = attn.train_query_key_projection_step(
+            &inputs,
+            &cache.qs,
+            &cache.ks,
+            &cache.vs,
+            cache.attention_weights.last().unwrap(),
+            &[10.0, -5.0, 3.0],
+            1.0,
+            100.0,
+        );
+
+        assert!(report.applied, "w_q/w_k update should be applied");
+        assert!(!report.invalid, "w_q/w_k update should be valid");
+        assert_ne!(attn.w_q, q_before, "w_q should change");
+        assert_ne!(attn.w_k, k_before, "w_k should change");
+        assert_eq!(attn.w_v, v_before, "w_v must not change");
+        assert_eq!(attn.w_o, o_before, "w_o must not change");
+    }
+
+    #[test]
+    fn query_key_projection_step_reports_clipping() {
+        let mut attn = CausalSelfAttention::new(2);
+        let inputs = vec![vec![10.0, -5.0], vec![3.0, 8.0]];
+        let (_outputs, cache) = attn.forward_with_cache(&inputs);
+
+        let report = attn.train_query_key_projection_step(
+            &inputs,
+            &cache.qs,
+            &cache.ks,
+            &cache.vs,
+            cache.attention_weights.last().unwrap(),
+            &[1000.0, -1000.0],
+            0.01,
+            1e-8,
+        );
+
+        assert!(report.applied, "clipped update should still apply");
+        assert!(report.clipped, "large Q/K gradient should be clipped");
+        assert!(report.grad_norm > 1e-8, "pre-clip norm should be tracked");
+    }
+
+    #[test]
+    fn query_key_projection_step_rejects_non_finite_gradient() {
+        let mut attn = CausalSelfAttention::new(2);
+        let q_before = attn.w_q.clone();
+        let k_before = attn.w_k.clone();
+        let inputs = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let (_outputs, cache) = attn.forward_with_cache(&inputs);
+
+        let report = attn.train_query_key_projection_step(
+            &inputs,
+            &cache.qs,
+            &cache.ks,
+            &cache.vs,
+            cache.attention_weights.last().unwrap(),
+            &[f32::NAN, 1.0],
+            0.01,
+            1.0,
+        );
+
+        assert!(!report.applied, "invalid update should not apply");
+        assert!(report.invalid, "non-finite gradient should be invalid");
+        assert_eq!(attn.w_q, q_before, "w_q must not change");
+        assert_eq!(attn.w_k, k_before, "w_k must not change");
+    }
+
+    #[test]
+    fn query_key_projection_step_ignores_future_positions() {
+        let mut with_future = CausalSelfAttention::new(2);
+        let mut without_future = with_future.clone();
+        let inputs = vec![vec![1.0, 0.0], vec![0.5, 1.0], vec![-1.0, 2.0]];
+        let qs = vec![vec![0.2, -0.1], vec![0.4, 0.3], vec![9.0, 9.0]];
+        let ks = vec![vec![0.1, 0.3], vec![-0.2, 0.5], vec![8.0, -7.0]];
+        let vs = vec![vec![0.6, -0.4], vec![0.2, 0.7], vec![20.0, -20.0]];
+        let grad_context = vec![0.9, -0.3];
+
+        let report_with_future = with_future.train_query_key_projection_step_for_position(
+            &inputs,
+            1,
+            &qs,
+            &ks,
+            &vs,
+            &[0.6, 0.4, 1000.0],
+            &grad_context,
+            0.1,
+            100.0,
+        );
+        let report_without_future = without_future.train_query_key_projection_step_for_position(
+            &inputs,
+            1,
+            &qs,
+            &ks,
+            &vs,
+            &[0.6, 0.4, 0.0],
+            &grad_context,
+            0.1,
+            100.0,
+        );
+
+        assert!(report_with_future.applied);
+        assert!(report_without_future.applied);
+        assert_eq!(
+            with_future.w_q, without_future.w_q,
+            "future attention slots must not affect w_q gradient"
+        );
+        assert_eq!(
+            with_future.w_k, without_future.w_k,
+            "future attention slots must not affect w_k gradient"
+        );
+    }
+
+    #[test]
+    fn query_key_projection_step_matches_selected_finite_difference() {
+        let mut attn = CausalSelfAttention::new(2);
+        attn.w_q = vec![0.2, -0.3, 0.4, 0.1];
+        attn.w_k = vec![-0.2, 0.5, 0.3, -0.4];
+        attn.w_v = vec![0.6, -0.1, 0.2, 0.7];
+        let inputs = vec![vec![0.8, -0.4], vec![0.3, 0.9]];
+        let grad_context = vec![0.7, -0.5];
+        let (_outputs, cache) = attn.forward_with_cache(&inputs);
+
+        let mut trained = attn.clone();
+        let lr = 1e-3;
+        let report = trained.train_query_key_projection_step(
+            &inputs,
+            &cache.qs,
+            &cache.ks,
+            &cache.vs,
+            cache.attention_weights.last().unwrap(),
+            &grad_context,
+            lr,
+            1000.0,
+        );
+        assert!(report.applied);
+        assert!(!report.clipped);
+
+        let analytic_q0 = (attn.w_q[0] - trained.w_q[0]) / lr;
+        let analytic_k0 = (attn.w_k[0] - trained.w_k[0]) / lr;
+
+        let eps = 1e-3;
+        let numeric_q0 =
+            finite_difference_context_loss(&attn, &inputs, &grad_context, true, 0, eps);
+        let numeric_k0 =
+            finite_difference_context_loss(&attn, &inputs, &grad_context, false, 0, eps);
+
+        assert!(
+            (analytic_q0 - numeric_q0).abs() < 5e-3,
+            "w_q[0] gradient mismatch: analytic={}, numeric={}",
+            analytic_q0,
+            numeric_q0
+        );
+        assert!(
+            (analytic_k0 - numeric_k0).abs() < 5e-3,
+            "w_k[0] gradient mismatch: analytic={}, numeric={}",
+            analytic_k0,
+            numeric_k0
+        );
+    }
+
+    fn finite_difference_context_loss(
+        attn: &CausalSelfAttention,
+        inputs: &[Vec<f32>],
+        grad_context: &[f32],
+        q_param: bool,
+        idx: usize,
+        eps: f32,
+    ) -> f32 {
+        let mut plus = attn.clone();
+        let mut minus = attn.clone();
+        if q_param {
+            plus.w_q[idx] += eps;
+            minus.w_q[idx] -= eps;
+        } else {
+            plus.w_k[idx] += eps;
+            minus.w_k[idx] -= eps;
+        }
+        let plus_loss = context_loss(&plus, inputs, grad_context);
+        let minus_loss = context_loss(&minus, inputs, grad_context);
+        (plus_loss - minus_loss) / (2.0 * eps)
+    }
+
+    fn context_loss(attn: &CausalSelfAttention, inputs: &[Vec<f32>], grad_context: &[f32]) -> f32 {
+        let (_outputs, cache) = attn.forward_with_cache(inputs);
+        dot(cache.weighted_values.last().unwrap(), grad_context)
     }
 }

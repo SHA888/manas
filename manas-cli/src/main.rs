@@ -624,6 +624,8 @@ fn cmd_inspect(verbose: bool, brain_path: &Path) -> Result<(), ManasError> {
         tf_attention_trained,
         tf_attention_projection_o_trained,
         tf_attention_projection_v_trained,
+        tf_attention_projection_q_trained,
+        tf_attention_projection_k_trained,
     ) = match TransformerLanguageModel::load_from_file(&tf_path) {
         Ok(model) => (
             true,
@@ -635,8 +637,12 @@ fn cmd_inspect(verbose: bool, brain_path: &Path) -> Result<(), ManasError> {
             model.attention_trained,
             model.attention_projection_o_trained(),
             model.attention_projection_v_trained(),
+            model.attention_projection_q_trained(),
+            model.attention_projection_k_trained(),
         ),
-        Err(_) => (false, None, None, None, false, false, false, false, false),
+        Err(_) => (
+            false, None, None, None, false, false, false, false, false, false, false,
+        ),
     };
 
     let attn_params = tf_embed_dim.map(|d| (4 * d * d) as u64).unwrap_or(0);
@@ -733,6 +739,8 @@ fn cmd_inspect(verbose: bool, brain_path: &Path) -> Result<(), ManasError> {
             format_attention_projections(
                 tf_attention_projection_o_trained,
                 tf_attention_projection_v_trained,
+                tf_attention_projection_q_trained,
+                tf_attention_projection_k_trained,
             )
         );
         println!("  Attention params    : {}", attn_params);
@@ -815,10 +823,16 @@ fn format_training_attention_status(
     attention_frozen: bool,
     attention_projection_o_trained: bool,
     attention_projection_v_trained: bool,
+    attention_projection_q_trained: bool,
+    attention_projection_k_trained: bool,
 ) -> &'static str {
     if attention_frozen {
         "frozen"
-    } else if attention_projection_o_trained || attention_projection_v_trained {
+    } else if attention_projection_o_trained
+        || attention_projection_v_trained
+        || attention_projection_q_trained
+        || attention_projection_k_trained
+    {
         "partially trained"
     } else {
         "trainable"
@@ -828,15 +842,27 @@ fn format_training_attention_status(
 fn format_attention_projections(
     attention_projection_o_trained: bool,
     attention_projection_v_trained: bool,
-) -> &'static str {
-    match (
-        attention_projection_o_trained,
-        attention_projection_v_trained,
-    ) {
-        (true, true) => "o,v",
-        (true, false) => "o",
-        (false, true) => "v",
-        (false, false) => "none",
+    attention_projection_q_trained: bool,
+    attention_projection_k_trained: bool,
+) -> String {
+    let mut parts = Vec::new();
+    if attention_projection_o_trained {
+        parts.push("o");
+    }
+    if attention_projection_v_trained {
+        parts.push("v");
+    }
+    if attention_projection_q_trained {
+        parts.push("q");
+    }
+    if attention_projection_k_trained {
+        parts.push("k");
+    }
+
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(",")
     }
 }
 
@@ -1313,10 +1339,14 @@ fn cmd_train_language(
                 tf_report.attention_frozen,
                 tf_report.attention_projection_o_trained,
                 tf_report.attention_projection_v_trained,
+                tf_report.attention_projection_q_trained,
+                tf_report.attention_projection_k_trained,
             ),
             format_attention_projections(
                 tf_report.attention_projection_o_trained,
                 tf_report.attention_projection_v_trained,
+                tf_report.attention_projection_q_trained,
+                tf_report.attention_projection_k_trained,
             ),
             tf_report.max_gradient_norm_seen,
             tf_report.avg_gradient_norm,
@@ -1542,27 +1572,40 @@ mod tests {
     #[test]
     fn inspect_attention_formatting_shows_partial_o() {
         assert_eq!(format_inspect_attention_status(false), "no");
-        assert_eq!(format_attention_projections(false, false), "none");
+        assert_eq!(
+            format_attention_projections(false, false, false, false),
+            "none"
+        );
         assert_eq!(format_inspect_attention_status(true), "partial");
-        assert_eq!(format_attention_projections(true, false), "o");
-        assert_eq!(format_attention_projections(true, true), "o,v");
+        assert_eq!(format_attention_projections(true, false, false, false), "o");
+        assert_eq!(
+            format_attention_projections(true, true, false, false),
+            "o,v"
+        );
+        assert_eq!(
+            format_attention_projections(true, true, true, true),
+            "o,v,q,k"
+        );
     }
 
     #[test]
     fn training_attention_formatting_shows_partial_o() {
         assert_eq!(
-            format_training_attention_status(true, false, false),
+            format_training_attention_status(true, false, false, false, false),
             "frozen"
         );
         assert_eq!(
-            format_training_attention_status(false, false, false),
+            format_training_attention_status(false, false, false, false, false),
             "trainable"
         );
         assert_eq!(
-            format_training_attention_status(false, true, true),
+            format_training_attention_status(false, true, true, true, true),
             "partially trained"
         );
-        assert_eq!(format_attention_projections(true, true), "o,v");
+        assert_eq!(
+            format_attention_projections(true, true, true, true),
+            "o,v,q,k"
+        );
     }
 
     #[test]

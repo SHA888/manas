@@ -31,7 +31,7 @@ manas learn "Rust is a systems programming language with zero-cost abstractions"
 # Train next-token prediction (v0.2)
 manas train-language "Rust is a systems programming language" --epochs 50
 
-# Train next-token prediction with transformer output head + FFN + attention w_o/w_v (v0.7-v0.9.2)
+# Train next-token prediction with transformer output head + FFN + attention w_o/w_v/w_q/w_k (v0.7-v0.9.3)
 manas train-language "Rust is a systems programming language" --epochs 50 --train-transformer
 
 # Train with growth control (v0.7.1) — cap new neurons, or disable growth entirely
@@ -130,7 +130,7 @@ Manas is built from 7 Rust crates, each with a single responsibility:
 | **manas-ingest** | Input pipeline — 7 file format parsers, folder walker, text chunking |
 | **manas-memory** | Knowledge preservation — importance scoring, protection levels, compression |
 | **manas-agent** | Internet connection — DuckDuckGo search, HTML scraping, freshness checker |
-| **manas-language** | Next-token prediction — sequence memory, hybrid memory+neural predictor, autoregressive generation, custom transformer block with trainable output head, FFN, and partial attention `w_o`/`w_v` training |
+| **manas-language** | Next-token prediction — sequence memory, hybrid memory+neural predictor, autoregressive generation, custom transformer block with trainable output head, FFN, and partial attention `w_o`/`w_v`/`w_q`/`w_k` training |
 | **manas-cli** | Command-line interface — 16 commands for all operations |
 
 ---
@@ -226,15 +226,16 @@ Auto-detected from keywords in the text. Stale neurons trigger automatic interne
 - **Attention cache + persistence prep (v0.9.0)** — `CausalSelfAttention::forward_with_cache()` now exposes Q/K/V, causal attention weights, and weighted values for future backprop. Transformer sidecar version 3 persists attention weights and `attention_trained`; old v2 transformer files still load with deterministic untrained attention. `is_finite_model()` now checks attention weights, and `manas inspect` reports `Attention trained : yes/no`.
 - **Attention output projection training (v0.9.1)** — `--train-transformer` now trains only `CausalSelfAttention.w_o` using the cached weighted value vector and the gradient flowing into the attention output. `w_q`, `w_k`, and `w_v` remain frozen; there is no softmax/QK backprop, scoring change, generation change, or sidecar version bump. Training and inspect report partial attention as `Attention trained : partial` and `Attention projections : o`.
 - **Attention value projection training (v0.9.2)** — `--train-transformer` now also trains `CausalSelfAttention.w_v` from cached final-position attention probabilities and the context gradient. `w_q` and `w_k` remain frozen; no softmax/QK backprop, scoring change, generation change, model-size change, or sidecar version bump. Transformer sidecar v3 stores an optional projection bitmask so inspect can report `Attention projections : o,v` while legacy v3 files still load as `o`.
+- **Attention query/key projection training (v0.9.3)** — `--train-transformer` now trains `CausalSelfAttention.w_q` and `CausalSelfAttention.w_k` together through the final-position causal softmax gradient. Output head, FFN, `w_o`, and `w_v` continue training; scoring weights, generation behavior, model dimensions, and sidecar version remain unchanged. Inspect reports partial attention as `Attention projections : o,v,q,k`.
 
 ## Current Limitations
 
 - **Query output is not local-first yet** — currently relies on web search rather than answering from the local network alone
 - **Answer generation is basic** — there is no generative text output; decoded tokens show the closest embeddings
 - **Next-token prediction is experimental** — v0.2 works for short contexts but is not trained on large corpora; generation quality is limited
-- **Attention is experimental (v0.4/v0.9.2)** — single-head causal attention is implemented with forward-cache, persistence, and partial `w_o`/`w_v` training; `w_q` and `w_k` remain frozen, so attention routing is not learned yet
-- **Transformer block is experimental (v0.5+)** — `TinyTransformerBlock` supports trained output-head, FFN, attention output projection, and attention value projection paths, but Q/K softmax backprop is not implemented yet
-- **Transformer-assisted prediction is experimental (v0.6-v0.9.2)** — `--use-transformer` uses the trained output head, FeedForward layer, and partial `w_o`/`w_v` attention training when available; scoring weights and default prediction/generation behavior are unchanged
+- **Attention is experimental (v0.4/v0.9.3)** — single-head causal attention is implemented with forward-cache, persistence, and partial `w_o`/`w_v`/`w_q`/`w_k` training; multi-head attention, layer norm, and dynamic transformer growth are not implemented
+- **Transformer block is experimental (v0.5+)** — `TinyTransformerBlock` supports trained output-head, FFN, and single-head attention projection training, but it is still a tiny custom research block rather than a full LLM stack
+- **Transformer-assisted prediction is experimental (v0.6-v0.9.3)** — `--use-transformer` uses the trained output head, FeedForward layer, and partial attention projection training when available; scoring weights and default prediction/generation behavior are unchanged
 - **Growth control is experimental (v0.7.1)** — `max_new_neurons` cap and first-epoch-only growth help control network explosion; duplicate-text detection via `LanguageMeta` sidecar prevents re-growth on repeated training but is not retroactive
 - **File/chunk learning is experimental** — chunking heuristics and per-chunk learning are still being refined
 - **One neuron per source is an anchor** — the source neuron acts as a pointer, not a full document understanding
@@ -276,7 +277,7 @@ manas train-language "text"              Train next-token prediction
   --max-context 5                        Sliding context window size
   --max-new-neurons 10                   Max new neurons to grow (v0.7.1)
   --no-grow                              Disable all neuron growth (v0.7.1)
-  --train-transformer                    Train output head + FFN + attention w_o/w_v (v0.9.2); q/k remain frozen
+  --train-transformer                    Train output head + FFN + attention w_o/w_v/w_q/w_k (v0.9.3)
 
 manas predict-next "context"             Predict next token(s)
   --top-k 5                              Number of candidates

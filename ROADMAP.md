@@ -25,7 +25,7 @@ Manas is **not** trying to replace large hosted LLMs. It is a learning and resea
 | v0.9.0 | Attention cache + persistence prep | Done |
 | v0.9.1 | Train attention output projection w_o | Done |
 | v0.9.2 | Train attention value projection w_v | Done |
-| v0.9.3 | Train attention query/key projections w_q + w_k | Planned |
+| v0.9.3 | Train attention query/key projections w_q + w_k | Done |
 | v0.9.4 | Attention training safety and metrics cleanup | Planned |
 | v0.9.5 | Improve transformer score weight | Planned |
 
@@ -395,25 +395,33 @@ Goal achieved:
 
 ---
 
-## Next Milestones
+### v0.9.3 — Train Attention Query/Key Projections `w_q + w_k`
 
-## v0.9.3 — Train Attention Query/Key Projections `w_q + w_k`
+Manas now trains attention routing through query/key projections after `w_o` and `w_v`.
 
-Train query and key projections only after `w_o` and `w_v` are stable.
+Completed:
 
-### Scope
+- `CausalSelfAttention::train_query_key_projection_step()` trains `w_q` and `w_k` together
+- Q/K gradients use cached Q/K/V projections and cached final-position causal attention probabilities
+- Softmax score gradients use only allowed positions `j <= i`
+- Output head, FFN, `w_o`, and `w_v` continue training
+- `w_q` and `w_k` gradients participate in norm tracking, clipping, invalid update counting, finite checks, and rollback
+- Existing transformer sidecar version 3 persists changed `w_o`, `w_v`, `w_q`, and `w_k`
+- The optional v3 projection bitmask now records `o,v,q,k` without bumping the sidecar version
+- Legacy v3 files without the projection bitmask still load as `o`-only
+- Existing v3 files with an `o,v` mask still load without claiming `q/k`
+- Finite-difference tests check selected `w_q` and `w_k` parameters
+- Training reports show `attention : partially trained` and `attention projections : o,v,q,k`
+- `manas inspect` shows `Attention trained : partial` and `Attention projections : o,v,q,k`
+- No scoring weight change, generation behavior change, tokenizer change, model size change, multi-head attention, layer norm, dynamic transformer growth, or sidecar version bump
 
-- Train `w_q`
-- Train `w_k`
-- Use causal softmax gradients
-- Add finite-difference checks for selected parameters
-- Keep single-head attention only
-
-### Goal
+Goal achieved:
 
 > Let Manas learn attention routing and context selection directly.
 
 ---
+
+## Next Milestones
 
 ## v0.9.4 — Attention Training Safety and Metrics Cleanup
 
@@ -631,5 +639,5 @@ Manas should continue following these principles:
 The next coding milestone is:
 
 ```text
-v0.9.3 — Train Attention Query/Key Projections w_q + w_k
+v0.9.4 — Attention Training Safety and Metrics Cleanup
 ```
