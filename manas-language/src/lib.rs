@@ -81,7 +81,7 @@ impl SequenceMemory {
                 && !targets.is_empty()
             {
                 let mut result: Vec<(u32, u32)> = targets.iter().map(|(&t, &c)| (t, c)).collect();
-                result.sort_by(|a, b| b.1.cmp(&a.1));
+                result.sort_by_key(|b| std::cmp::Reverse(b.1));
                 return result;
             }
         }
