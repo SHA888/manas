@@ -1438,6 +1438,7 @@ No panics in library code. The CLI converts errors to user-friendly messages.
 | M15 | **Transformer-assisted prediction (v0.6)** — `--use-transformer` flag, hybrid scoring, default path unchanged | `manas-language`, `manas-cli` | Experimental transformer integration |
 | M16 | **Transformer output-head training (v0.7)** — `--train-transformer` flag, cross-entropy, output head only, dynamic weight (0.40 trained / 0.25 untrained) | `manas-language`, `manas-cli` | Transformer learns next-token prediction |
 | M17 | **Neural growth optimization (v0.7.1)** — `max_new_neurons` cap, first-epoch-only growth, `LanguageMeta` sidecar for duplicate-text detection, `--max-new-neurons`/`--no-grow` CLI flags | `manas-language`, `manas-cli` | Controlled network growth |
+| M18 | **Enhanced system inspect (v0.7.2)** — `manas inspect` shows Core Network, Language System, Transformer, Storage, and Total sections; reports sidecar file sizes, transformer param counts, sequence memory status, language metadata; `--verbose` flag | `manas-cli` | Full inspect visibility |
 
 ---
 
@@ -1504,20 +1505,59 @@ manas refresh
 # Refresh only a specific freshness category
 manas refresh --category fast
 
-# Show brain stats
+# Show brain stats (v0.7.2 shows full system state)
 manas inspect
 # Output:
-#  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #   Manas Brain — brain.manas
-#  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#   Neurons       :  4,821
-#   Layers        :  8
-#   Vocab size    :  12,483
-#   Brain size    :  9.4 MB
-#   Texts learned :  31,209
-#   Files ingested:  47
-#   Last updated  :  2 hours ago
-#  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+#  Core Network
+#  ─────────────────────────────────────
+#   Core network layers : 8
+#   Core neurons        : 4,821
+#   Core network params : 128,498
+#
+#  Language System
+#  ─────────────────────────────────────
+#   Vocab size          : 12,483
+#   Embedding dim       : 64
+#   Embedding params    : 798,912
+#   Sequence memory     : enabled
+#   Sequence entries    : 15,342
+#   Training runs       : 31,209
+#   Unique texts        : 4,102
+#   Repeated trainings  : 712
+#
+#  Transformer
+#  ─────────────────────────────────────
+#   Enabled             : yes
+#   Blocks              : 1
+#   Attention heads     : 1
+#   Embed dim           : 64
+#   FFN hidden dim      : 128
+#   Output head trained : yes
+#   Attention params    : 16,384
+#   FFN params          : 16,512
+#   Output head params  : 799,872
+#   Transformer params  : 832,768
+#
+#  Storage
+#  ─────────────────────────────────────
+#   Brain file          : 9,437,184  (9.00 MB)
+#   Sequence file       : 1,245,312  (1.19 MB)
+#   Transformer file    : 3,201,792  (3.05 MB)
+#   Language metadata   : 164,352    (160.50 KB)
+#   Total storage       : 14,048,640 (13.40 MB)
+#
+#  Total
+#  ─────────────────────────────────────
+#   Total params        : 1,760,178
+#   Last updated        : 2 hours ago
+#  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# Show with verbose output
+manas inspect --verbose
 
 # List all ingested files
 manas files

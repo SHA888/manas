@@ -18,6 +18,7 @@ Manas is **not** trying to replace large hosted LLMs. It is a learning and resea
 | v0.6 | Transformer-assisted prediction and generation | Done |
 | v0.7 | Transformer output-head training | Done |
 | v0.7.1 | Controlled neuron growth during language training | Done |
+| v0.7.2 | Better inspect for language and transformer state | Done |
 
 ## Completed Milestones
 
@@ -194,71 +195,26 @@ Goal achieved:
 
 > Manas can keep learning without exploding neuron count on repeated language-training runs.
 
+### v0.7.2 — Better Inspect for Language and Transformer State
+
+Inspect was updated to show the full Manas system state clearly.
+
+Completed:
+
+- `manas inspect` now shows 5 separate sections: Core Network, Language System, Transformer, Storage, and Total
+- Transformer param counting (attention, FFN, output head)
+- Sequence memory status and entry count
+- Sidecar file size reporting for all sidecars
+- Language metadata: unique texts and repeated training counts
+- `--verbose` flag for extended output
+- Renamed labels: "Neurons" → "Core neurons", "Layers" → "Core network layers"
+- Old stats continue to work correctly when sidecars are missing
+
+Goal achieved:
+
+> `manas inspect` accurately shows the full Manas system state including language, transformer, and sidecar visibility.
+
 ## Next Milestones
-
-## v0.7.2 — Better Inspect for Language and Transformer State
-
-Current `inspect` mostly shows the original core network stats. Manas now also has sequence memory, transformer state, language metadata, and sidecar files, so inspect needs to show the full system clearly.
-
-### Goals
-
-- Make `inspect` accurately explain the full Manas state
-- Separate core network stats from language/transformer stats
-- Show transformer and sequence-memory sidecars
-- Make `Layers: 2` less confusing by renaming it to `Core network layers`
-
-### Planned Inspect Sections
-
-```text
-Core Network
-  Core network layers
-  Core neurons
-  Core network params
-  Growth mode
-
-Language System
-  Vocab size
-  Embedding dim
-  Embedding params
-  Sequence memory status
-  Sequence entries
-  Training runs
-  Unique language texts
-  Repeated trainings
-
-Transformer
-  Enabled
-  Transformer blocks
-  Attention heads
-  Embed dim
-  FFN hidden dim
-  Output head trained
-  Attention params
-  FFN params
-  Output head params
-  Total transformer params
-
-Storage
-  brain.manas size
-  brain.manas.seq size
-  brain.manas.transformer size
-  language metadata size
-  total storage size
-
-Total
-  Core params + embedding params + transformer params
-```
-
-### Notes
-
-- Do not add new training behavior in this milestone
-- Do not implement v0.8 yet
-- Do not add layer growth yet
-- This milestone is visibility and debugging only
-
----
-
-## v0.8 — Train Transformer Feed-Forward Layer
 
 Right now, the transformer output head is trained, but the internal transformer block is mostly fixed.
 
@@ -561,7 +517,7 @@ Manas should continue following these principles:
 The next coding milestone is:
 
 ```text
-v0.7.2 — Better inspect for language and transformer state
+v0.8 — Train transformer FeedForward layer
 ```
 
 After that:

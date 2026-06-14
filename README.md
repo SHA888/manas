@@ -219,6 +219,7 @@ Auto-detected from keywords in the text. Stale neurons trigger automatic interne
 - **Transformer-assisted prediction (v0.6)** — `--use-transformer` flag for `predict-next` and `generate`; hybrid scoring (75% memory+neural, 25% transformer); experimental, default path unchanged
 - **Transformer output-head training (v0.7)** — `--train-transformer` flag for `train-language`; cross-entropy training of output projection head; dynamic weighting (40% transformer when trained); block weights frozen
 - **Neural growth optimization (v0.7.1)** — `--max-new-neurons` / `--no-grow` flags; growth capped per call and restricted to first epoch only; duplicate-text detection via `LanguageMeta` sidecar (`brain.manas.langmeta`) prevents re-growth on repeated training
+- **Enhanced system inspect (v0.7.2)** — `manas inspect` now shows separate sections for Core Network, Language System, Transformer, Storage, and Total; reports sidecar file sizes, transformer param counts, sequence memory status, and language metadata; `--verbose` flag for extended output
 
 ## Current Limitations
 
@@ -285,7 +286,8 @@ manas query "question"                    Search web + learn + display results
 manas refresh --category cat              Refresh stale knowledge from web
 
 # Inspection
-manas inspect                             Show brain stats
+manas inspect                             Show brain stats with full system state (v0.7.2)
+manas inspect --verbose                   Extended verbose output (v0.7.2)
 manas files                               List ingested files
 manas trace "topic"                       Show activated neurons + decoded keywords
 manas neurons --all                       List all neurons with metadata

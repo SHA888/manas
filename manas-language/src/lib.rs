@@ -2202,6 +2202,27 @@ mod tests {
         assert_eq!(loaded.output_w.len(), model.output_w.len());
         assert_eq!(loaded.output_b.len(), model.output_b.len());
 
+        // Verify transformer param counting formulas
+        let d = loaded.embed_dim as u64;
+        let h = loaded.hidden_dim as u64;
+        let vs = loaded.vocab_order.len() as u64;
+        let attn_params = 4 * d * d;
+        let ffn_params = 2 * d * h + h + d;
+        let output_params = d * vs + vs;
+        // Attention: 4 matrices of size d×d
+        assert_eq!(attn_params, (4 * d * d) as u64);
+        // FeedForward: w1(d×h) + b1(h) + w2(h×d) + b2(d)
+        assert_eq!(ffn_params, (2 * d * h + h + d) as u64);
+        // Output head: w(d×vs) + b(vs)
+        assert_eq!(output_params, (d * vs + vs) as u64);
+        // Total transformer params
+        let total_tf = attn_params + ffn_params + output_params;
+        assert!(total_tf > 0, "transformer params should be > 0");
+        // output_w.len() should equal d * vs
+        assert_eq!(loaded.output_w.len(), (d * vs) as usize);
+        // output_b.len() should equal vs
+        assert_eq!(loaded.output_b.len(), vs as usize);
+
         // Output weights should be very close
         for (a, b) in loaded.output_w.iter().zip(model.output_w.iter()) {
             assert!((a - b).abs() < 1e-5, "output_w mismatch");

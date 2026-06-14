@@ -47,7 +47,10 @@ enum Commands {
         #[arg(long)]
         category: Option<String>,
     },
-    Inspect,
+    Inspect {
+        #[arg(long)]
+        verbose: bool,
+    },
     Files,
     Trace {
         text: String,
@@ -135,7 +138,7 @@ fn main() {
         ),
         Commands::Query { text } => cmd_query(text, &brain_path),
         Commands::Refresh { category } => cmd_refresh(category.as_deref(), &brain_path),
-        Commands::Inspect => cmd_inspect(&brain_path),
+        Commands::Inspect { verbose } => cmd_inspect(*verbose, &brain_path),
         Commands::Files => cmd_files(&brain_path),
         Commands::Trace { text } => cmd_trace(text, &brain_path),
         Commands::Export { out } => cmd_export(out.as_deref(), &brain_path),
@@ -513,45 +516,241 @@ fn cmd_refresh(category: Option<&str>, brain_path: &Path) -> Result<(), ManasErr
     Ok(())
 }
 
-/// `manas inspect`
-fn cmd_inspect(brain_path: &Path) -> Result<(), ManasError> {
+/// `manas inspect [--verbose]`
+fn cmd_inspect(verbose: bool, brain_path: &Path) -> Result<(), ManasError> {
     let brain = ManasBrain::new(brain_path);
     if !brain.path.exists() {
         println!("No brain file found at {}", brain.path.display());
         return Ok(());
     }
 
-    match brain.inspect() {
-        Ok(stats) => {
-            let network = brain.load().ok();
-            let net_params = network.as_ref().map(|n| n.parameter_count()).unwrap_or(0);
-
-            let embed_params = if let Ok(vocab) = brain.load_vocab() {
-                vocab.values().map(|(_, e)| e.len() as u64).sum::<u64>()
-            } else {
-                0
-            };
-
-            println!("{}", "━".repeat(35));
-            println!(" Manas Brain — {}", stats.file_path);
-            println!("{}", "━".repeat(35));
-            println!(" Neurons        : {}", stats.neuron_count);
-            println!(" Layers         : {}", stats.layer_count);
-            println!(" Vocab size     : {}", stats.vocab_size);
-            println!(" Network params : {}", net_params);
-            println!(" Embedding params: {}", embed_params);
-            println!(" Total params   : {}", net_params + embed_params);
-            println!(" Brain size     : {} bytes", stats.brain_size);
-            println!(" Texts learned  : {}", stats.total_texts_learned);
-            println!(" Last updated   : {}", format_duration(stats.last_modified));
-            println!("{}", "━".repeat(35));
-        }
+    let stats = match brain.inspect() {
+        Ok(s) => s,
         Err(ManasError::FileNotFound(_)) => {
             println!("No brain file found at {}", brain.path.display());
+            return Ok(());
         }
         Err(e) => return Err(e),
+    };
+
+    let network = brain.load().ok();
+    let net_params = network.as_ref().map(|n| n.parameter_count()).unwrap_or(0);
+    let net_neurons = stats.neuron_count;
+    let net_layers = stats.layer_count;
+
+    let embed_params = brain
+        .load_vocab()
+        .ok()
+        .map(|v| v.values().map(|(_, e)| e.len() as u64).sum::<u64>())
+        .unwrap_or(0);
+
+    // ── Sidecar file sizes ──────────────────────────────────────────
+    let seq_path = seq_memory_path(brain_path);
+    let tf_path = transformer_model_path(brain_path);
+    let langmeta_path = language_meta_path(brain_path);
+
+    let seq_bytes = file_size(&seq_path);
+    let tf_bytes = file_size(&tf_path);
+    let langmeta_bytes = file_size(&langmeta_path);
+
+    // ── Sequence memory stats ───────────────────────────────────────
+    let seq_entries = seq_bytes.and_then(|_| {
+        SequenceMemory::load_from_file(&seq_path)
+            .ok()
+            .map(|sm| sm.transitions.len())
+    });
+
+    // ── Language metadata stats ─────────────────────────────────────
+    let langmeta = langmeta_bytes.and_then(|_| LanguageMeta::load_from_file(&langmeta_path).ok());
+    let total_training_runs = langmeta
+        .as_ref()
+        .map(|lm| {
+            lm.texts
+                .values()
+                .map(|t| t.trained_count as u64)
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    let unique_texts = langmeta
+        .as_ref()
+        .map(|lm| lm.texts.len() as u64)
+        .unwrap_or(0);
+    let repeated_trainings = langmeta
+        .as_ref()
+        .map(|lm| {
+            lm.texts
+                .values()
+                .filter(|t| t.trained_count > 1)
+                .map(|t| (t.trained_count - 1) as u64)
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+
+    // ── Transformer stats ───────────────────────────────────────────
+    let (tf_enabled, tf_embed_dim, tf_hidden_dim, tf_vocab_size, tf_output_trained) =
+        match TransformerLanguageModel::load_from_file(&tf_path) {
+            Ok(model) => (
+                true,
+                Some(model.embed_dim),
+                Some(model.hidden_dim),
+                Some(model.vocab_order.len()),
+                model.output_w.iter().any(|&v| v != 0.0)
+                    || model.output_b.iter().any(|&v| v != 0.0),
+            ),
+            Err(_) => (false, None, None, None, false),
+        };
+
+    let attn_params = tf_embed_dim.map(|d| (4 * d * d) as u64).unwrap_or(0);
+    let ffn_params = tf_embed_dim
+        .zip(tf_hidden_dim)
+        .map_or(0, |(d, h)| (2 * d * h + h + d) as u64);
+    let output_head_params = tf_embed_dim
+        .zip(tf_vocab_size)
+        .map(|(d, vs)| (d * vs + vs) as u64)
+        .unwrap_or(0);
+    let transformer_params = attn_params + ffn_params + output_head_params;
+
+    // ── Print output ────────────────────────────────────────────────
+    let sep = "━".repeat(37);
+    let sub = "─".repeat(37);
+
+    println!("{}", sep);
+    println!(" Manas Brain — {}", stats.file_path);
+    println!("{}", sep);
+
+    // Core Network
+    println!("\nCore Network");
+    println!("{}", sub);
+    println!("  Core network layers : {}", net_layers);
+    println!("  Core neurons        : {}", net_neurons);
+    println!("  Core network params : {}", net_params);
+    if verbose {
+        println!("  Growth mode         : width-growth");
+        println!(
+            "  Layer growth        : {}",
+            if net_layers > 0 {
+                "disabled"
+            } else {
+                "enabled"
+            }
+        );
     }
+
+    // Language System
+    println!("\nLanguage System");
+    println!("{}", sub);
+    println!("  Vocab size          : {}", stats.vocab_size);
+    println!(
+        "  Embedding dim       : {}",
+        embed_params / stats.vocab_size.max(1) as u64
+    );
+    println!("  Embedding params    : {}", embed_params);
+    println!(
+        "  Sequence memory     : {}",
+        if seq_bytes.is_some() {
+            "enabled"
+        } else {
+            "missing"
+        }
+    );
+    match seq_entries {
+        Some(n) => println!("  Sequence entries    : {}", n),
+        None => println!("  Sequence entries    : N/A"),
+    }
+    println!("  Training runs       : {}", stats.total_texts_learned);
+    if verbose {
+        println!("  Metadata runs       : {}", total_training_runs);
+    }
+    println!("  Unique texts        : {}", unique_texts);
+    println!("  Repeated trainings  : {}", repeated_trainings);
+
+    // Transformer
+    println!("\nTransformer");
+    println!("{}", sub);
+    if tf_enabled {
+        println!("  Enabled             : yes");
+        println!("  Blocks              : 1");
+        println!("  Attention heads     : 1");
+        if let Some(d) = tf_embed_dim {
+            println!("  Embed dim           : {}", d);
+        }
+        if let Some(h) = tf_hidden_dim {
+            println!("  FFN hidden dim      : {}", h);
+        }
+        println!(
+            "  Output head trained : {}",
+            if tf_output_trained { "yes" } else { "no" }
+        );
+        println!("  Attention params    : {}", attn_params);
+        println!("  FFN params          : {}", ffn_params);
+        println!("  Output head params  : {}", output_head_params);
+        println!("  Transformer params  : {}", transformer_params);
+    } else {
+        println!("  Enabled             : no");
+    }
+
+    // Storage
+    println!("\nStorage");
+    println!("{}", sub);
+    let brain_sz = stats.brain_size;
+    println!(
+        "  Brain file          : {}  ({})",
+        brain_sz,
+        format_file_size(brain_sz)
+    );
+    match seq_bytes {
+        Some(sz) => println!("  Sequence file       : {}  ({})", sz, format_file_size(sz)),
+        None => println!("  Sequence file       : missing"),
+    }
+    match tf_bytes {
+        Some(sz) => println!("  Transformer file    : {}  ({})", sz, format_file_size(sz)),
+        None => println!("  Transformer file    : missing"),
+    }
+    match langmeta_bytes {
+        Some(sz) => println!("  Language metadata   : {}  ({})", sz, format_file_size(sz)),
+        None => println!("  Language metadata   : missing"),
+    }
+    let total_storage =
+        brain_sz + seq_bytes.unwrap_or(0) + tf_bytes.unwrap_or(0) + langmeta_bytes.unwrap_or(0);
+    println!(
+        "  Total storage       : {}  ({})",
+        total_storage,
+        format_file_size(total_storage)
+    );
+
+    // Total
+    println!("\nTotal");
+    println!("{}", sub);
+    let total_params = net_params + embed_params + transformer_params;
+    println!("  Total params        : {}", total_params);
+    println!(
+        "  Last updated        : {}",
+        format_duration(stats.last_modified)
+    );
+    println!("{}", sep);
+
     Ok(())
+}
+
+/// Get file size in bytes, or `None` if the file doesn't exist.
+fn file_size(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|m| m.len())
+}
+
+/// Format bytes into a human-readable string.
+fn format_file_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 /// `manas files`
@@ -1136,5 +1335,69 @@ fn parse_freshness_category(s: &str) -> Result<u8, ManasError> {
                 other
             )))
         }
+    }
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn format_file_size_bytes() {
+        assert_eq!(format_file_size(0), "0 B");
+        assert_eq!(format_file_size(1), "1 B");
+        assert_eq!(format_file_size(1023), "1023 B");
+    }
+
+    #[test]
+    fn format_file_size_kb() {
+        let s = format_file_size(1024);
+        assert!(s.contains("1.00"), "expected 1.00 KB, got {}", s);
+        assert!(s.contains("KB"), "expected KB, got {}", s);
+
+        let s = format_file_size(1536);
+        assert!(s.contains("1.50"), "expected 1.50 KB, got {}", s);
+    }
+
+    #[test]
+    fn format_file_size_mb() {
+        let s = format_file_size(1048576);
+        assert!(s.contains("1.00"), "expected 1.00 MB, got {}", s);
+        assert!(s.contains("MB"), "expected MB, got {}", s);
+    }
+
+    #[test]
+    fn file_size_existing_file() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("manas_test_inspect_file_size");
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        f.write_all(b"hello").unwrap();
+        drop(f);
+
+        let sz = file_size(&tmp);
+        assert_eq!(sz, Some(5));
+
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn file_size_missing_file() {
+        let p = Path::new("/tmp/manas_test_nonexistent_xyz123");
+        assert_eq!(file_size(p), None);
+    }
+
+    #[test]
+    fn file_size_zero_length() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("manas_test_zero_file");
+        std::fs::File::create(&tmp).unwrap();
+
+        let sz = file_size(&tmp);
+        assert_eq!(sz, Some(0));
+
+        std::fs::remove_file(&tmp).unwrap();
     }
 }
