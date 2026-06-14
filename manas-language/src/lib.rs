@@ -325,7 +325,7 @@ use crate::transformer::TinyTransformerBlock;
 
 // Magic constants for the transformer model sidecar file.
 const TRANSFORMER_FILE_MAGIC: u32 = 0x5452464C; // "TRFL"
-const TRANSFORMER_FILE_VERSION: u32 = 1;
+const TRANSFORMER_FILE_VERSION: u32 = 2;
 
 /// Weight given to the transformer score when the output head is **untrained**
 /// (cosine-similarity fallback).
@@ -343,9 +343,7 @@ const TRANSFORMER_SCORE_WEIGHT_TRAINED: f32 = 0.40;
 /// deterministically (sorted) at creation time.  Both training and inference
 /// use this mapping so indices are always correct.
 ///
-/// Weights are deterministic (seeded Box-Muller).  The block is **not**
-/// serialised by default — on load it is rebuilt from `(embed_dim, hidden_dim)`
-/// using the same seeds, which is correct while block weights are frozen.
+/// The transformer block FFN weights are serialised from v0.8 onward.
 pub struct TransformerLanguageModel {
     pub block: TinyTransformerBlock,
     pub output_w: Vec<f32>,
@@ -353,6 +351,8 @@ pub struct TransformerLanguageModel {
     pub embed_dim: usize,
     pub hidden_dim: usize,
     pub vocab_order: Vec<u32>,
+    /// Tracks whether the FFN has been trained (updated after v0.8 training).
+    pub ffn_trained: bool,
 }
 
 impl TransformerLanguageModel {
@@ -372,6 +372,7 @@ impl TransformerLanguageModel {
             embed_dim,
             hidden_dim,
             vocab_order,
+            ffn_trained: false,
         }
     }
 
@@ -436,6 +437,32 @@ impl TransformerLanguageModel {
             buf.extend_from_slice(&id.to_le_bytes());
         }
 
+        // FFN weights (v0.8)
+        let ffn = &self.block.feed_forward;
+        let ffn_trained = if self.ffn_trained { 1u8 } else { 0u8 };
+        buf.push(ffn_trained);
+
+        let w1_len = ffn.w1.len() as u32;
+        buf.extend_from_slice(&w1_len.to_le_bytes());
+        for &v in &ffn.w1 {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let b1_len = ffn.b1.len() as u32;
+        buf.extend_from_slice(&b1_len.to_le_bytes());
+        for &v in &ffn.b1 {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let w2_len = ffn.w2.len() as u32;
+        buf.extend_from_slice(&w2_len.to_le_bytes());
+        for &v in &ffn.w2 {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let b2_len = ffn.b2.len() as u32;
+        buf.extend_from_slice(&b2_len.to_le_bytes());
+        for &v in &ffn.b2 {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+
         std::fs::write(path, &buf).map_err(|e| ManasError::FileReadError {
             path: path.to_path_buf(),
             source: e,
@@ -469,7 +496,7 @@ impl TransformerLanguageModel {
                 magic
             )));
         }
-        let _version = read_u32(&mut cursor);
+        let version = read_u32(&mut cursor);
         let embed_dim = read_u32(&mut cursor) as usize;
         let hidden_dim = read_u32(&mut cursor) as usize;
         let _vocab_size = read_u32(&mut cursor);
@@ -503,6 +530,43 @@ impl TransformerLanguageModel {
             *id = u32::from_le_bytes(bytes);
         }
 
+        // FFN weights (v0.8+)
+        let (block, ffn_trained) = if version >= 2 {
+            let ffn_trained = if cursor.first().copied().unwrap_or(0) != 0 {
+                cursor = &cursor[1..];
+                true
+            } else {
+                cursor = &cursor[1..];
+                false
+            };
+
+            let read_f32_vec = |c: &mut &[u8]| -> Vec<f32> {
+                let len = read_u32(c) as usize;
+                let mut v = vec![0.0; len];
+                for x in &mut v {
+                    let mut bytes = [0u8; 4];
+                    bytes.copy_from_slice(&c[..4]);
+                    *c = &c[4..];
+                    *x = f32::from_le_bytes(bytes);
+                }
+                v
+            };
+
+            let w1 = read_f32_vec(&mut cursor);
+            let b1 = read_f32_vec(&mut cursor);
+            let w2 = read_f32_vec(&mut cursor);
+            let b2 = read_f32_vec(&mut cursor);
+
+            let mut block = block;
+            block.feed_forward.w1 = w1;
+            block.feed_forward.b1 = b1;
+            block.feed_forward.w2 = w2;
+            block.feed_forward.b2 = b2;
+            (block, ffn_trained)
+        } else {
+            (block, false)
+        };
+
         Ok(TransformerLanguageModel {
             block,
             output_w,
@@ -510,6 +574,7 @@ impl TransformerLanguageModel {
             embed_dim,
             hidden_dim,
             vocab_order,
+            ffn_trained,
         })
     }
 }
@@ -549,11 +614,10 @@ impl TransformerPredictor {
 
     /// Create a predictor from a trained `TransformerLanguageModel`.
     ///
-    /// The block is **rebuilt** from the model's dimensions using the same
-    /// deterministic seeds (correct while block weights are frozen).
+    /// The block weights (including trained FFN) are copied from the model.
     pub fn from_model(model: &TransformerLanguageModel, max_context: usize) -> Self {
         TransformerPredictor {
-            block: TinyTransformerBlock::new(model.embed_dim, model.hidden_dim),
+            block: model.block.clone(),
             output_w: model.output_w.clone(),
             output_b: model.output_b.clone(),
             vocab_order: model.vocab_order.clone(),
@@ -950,15 +1014,19 @@ pub fn train_next_token_examples(
     })
 }
 
-// ─── Transformer Output-Head Training (v0.7) ─────────────────────────────────
+// ─── Transformer Training (v0.8) ──────────────────────────────────────────────
 
-/// Train only the **output head** (`output_w`, `output_b`) of a
+/// Train the **output head** and **FeedForward** of a
 /// `TransformerLanguageModel` using cross-entropy loss.
 ///
-/// The transformer block weights remain **frozen** (deterministic from seed).
-/// This is the v0.7 approach — it lets the model learn to map the last hidden
-/// state to the correct next-token probability without full backprop through
-/// the attention/FFN layers.
+/// The causal attention weights remain **frozen**.  Gradients are computed for
+/// the output head (`output_w`, `output_b`) and the FFN (`w1`, `b1`, `w2`, `b2`)
+/// via backpropagation through the last token's block output.
+///
+/// FFN gradients are derived by backpropagating through the output head into
+/// the last hidden state, then through the second residual add into the FFN
+/// output.  Gradients are clipped to `[-1.0, 1.0]` and NaN/inf gradients cause
+/// the weight update to be skipped for that example.
 ///
 /// Returns the average cross-entropy loss over all examples × epochs.
 pub fn train_transformer_output_head(
@@ -989,12 +1057,13 @@ pub fn train_transformer_output_head(
                 continue;
             }
 
-            // Forward through transformer block (frozen)
-            let block_out = match model.block_forward(&seq) {
-                Some(o) => o,
+            // Forward through transformer block (attention frozen, FFN cached)
+            let (block_out, ffn_inputs) = model.block.forward_with_ffn_inputs(&seq);
+            let last = match block_out.last() {
+                Some(v) => v.clone(),
                 None => continue,
             };
-            let last = match block_out.last() {
+            let last_ffn_input = match ffn_inputs.last() {
                 Some(v) => v.clone(),
                 None => continue,
             };
@@ -1020,17 +1089,52 @@ pub fn train_transformer_output_head(
 
             // Gradient for output_w / output_b
             //   dL/d(logit_v) = probs[v] - (v == target_pos)
-            for (v, &prob) in probs.iter().enumerate() {
-                let grad = prob - if v == target_pos { 1.0 } else { 0.0 };
-                if grad.abs() < 1e-10 {
+            let grads: Vec<f32> = probs
+                .iter()
+                .enumerate()
+                .map(|(v, &prob)| prob - if v == target_pos { 1.0 } else { 0.0 })
+                .collect();
+
+            // Compute dL/d(last[i]) = sum_v dL/d(logit_v) * output_w[v,i]
+            let mut grad_block = vec![0.0; embed_dim];
+            for (v, &g) in grads.iter().enumerate() {
+                if g.abs() < 1e-10 {
+                    continue;
+                }
+                let base = v * embed_dim;
+                for (i, gb) in grad_block.iter_mut().enumerate() {
+                    *gb += g * model.output_w[base + i];
+                }
+            }
+
+            // Update output head weights
+            for (v, g) in grads.iter().enumerate() {
+                if g.abs() < 1e-10 {
                     continue;
                 }
                 for (i, &val) in last.iter().enumerate().take(embed_dim) {
                     let idx = v * embed_dim + i;
-                    model.output_w[idx] -= learning_rate * grad * val;
+                    model.output_w[idx] -= learning_rate * g * val;
                 }
-                model.output_b[v] -= learning_rate * grad;
+                model.output_b[v] -= learning_rate * g;
             }
+
+            // Backprop through residual add 2 into FFN output:
+            //   block_output[last] = last_ffn_input + ffn_output
+            //   dL/d(ffn_output)   = dL/d(block_output[last])
+            for g in &mut grad_block {
+                *g = g.clamp(-1.0, 1.0);
+            }
+            if grad_block.iter().any(|&g| !g.is_finite()) {
+                continue;
+            }
+
+            let ffn_lr = learning_rate * 0.5;
+            model
+                .block
+                .feed_forward
+                .train_step(&last_ffn_input, &grad_block, ffn_lr);
+            model.ffn_trained = true;
         }
     }
 
@@ -2201,6 +2305,24 @@ mod tests {
         assert_eq!(loaded.vocab_order, model.vocab_order);
         assert_eq!(loaded.output_w.len(), model.output_w.len());
         assert_eq!(loaded.output_b.len(), model.output_b.len());
+        assert_eq!(loaded.ffn_trained, model.ffn_trained);
+
+        // FFN weights should match
+        let ffn_a = &loaded.block.feed_forward;
+        let ffn_b = &model.block.feed_forward;
+        assert_eq!(ffn_a.w1.len(), ffn_b.w1.len());
+        for (a, b) in ffn_a.w1.iter().zip(ffn_b.w1.iter()) {
+            assert!((a - b).abs() < 1e-5, "FFN w1 mismatch");
+        }
+        for (a, b) in ffn_a.b1.iter().zip(ffn_b.b1.iter()) {
+            assert!((a - b).abs() < 1e-5, "FFN b1 mismatch");
+        }
+        for (a, b) in ffn_a.w2.iter().zip(ffn_b.w2.iter()) {
+            assert!((a - b).abs() < 1e-5, "FFN w2 mismatch");
+        }
+        for (a, b) in ffn_a.b2.iter().zip(ffn_b.b2.iter()) {
+            assert!((a - b).abs() < 1e-5, "FFN b2 mismatch");
+        }
 
         // Verify transformer param counting formulas
         let d = loaded.embed_dim as u64;
@@ -2288,5 +2410,312 @@ mod tests {
 
         // Should not panic; empty or non-empty is acceptable
         let _ = results;
+    }
+
+    // ── v0.8 FFN training tests ─────────────────────────────────────
+
+    /// Test A: FFN weights change after training.
+    #[test]
+    fn ffn_weights_change_after_training() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            5,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+
+        let w1_before = model.block.feed_forward.w1.clone();
+        let b1_before = model.block.feed_forward.b1.clone();
+        let w2_before = model.block.feed_forward.w2.clone();
+        let b2_before = model.block.feed_forward.b2.clone();
+
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 10, 0.01);
+
+        let w1_after = &model.block.feed_forward.w1;
+        let b1_after = &model.block.feed_forward.b1;
+        let w2_after = &model.block.feed_forward.w2;
+        let b2_after = &model.block.feed_forward.b2;
+
+        let w1_diff: f32 = w1_before
+            .iter()
+            .zip(w1_after)
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        let b1_diff: f32 = b1_before
+            .iter()
+            .zip(b1_after)
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        let w2_diff: f32 = w2_before
+            .iter()
+            .zip(w2_after)
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        let b2_diff: f32 = b2_before
+            .iter()
+            .zip(b2_after)
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+
+        let total_diff = w1_diff + b1_diff + w2_diff + b2_diff;
+        assert!(
+            total_diff > 1e-6,
+            "FFN weights should change after training (total_diff={})",
+            total_diff
+        );
+        assert!(model.ffn_trained, "ffn_trained flag should be set");
+    }
+
+    /// Test B: Attention Q/K/V/O stay frozen after training.
+    #[test]
+    fn attention_stays_frozen() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            5,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+
+        let q_before = model.block.attention.w_q.clone();
+        let k_before = model.block.attention.w_k.clone();
+        let v_before = model.block.attention.w_v.clone();
+        let o_before = model.block.attention.w_o.clone();
+
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 10, 0.01);
+
+        assert_eq!(model.block.attention.w_q, q_before, "w_q changed");
+        assert_eq!(model.block.attention.w_k, k_before, "w_k changed");
+        assert_eq!(model.block.attention.w_v, v_before, "w_v changed");
+        assert_eq!(model.block.attention.w_o, o_before, "w_o changed");
+    }
+
+    /// Test C: Prediction still works after FFN training.
+    #[test]
+    fn prediction_still_works_after_ffn_training() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            15,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 30, 0.01);
+
+        let predictor = TransformerPredictor::from_model(&model, 5);
+        let tokens = {
+            let mut t = trainer.tokenizer.clone();
+            t.encode("Rust is a")
+        };
+        let results =
+            predictor.predict_top_k_assisted(&network, &trainer.embedder, &seq_memory, &tokens, 3);
+
+        assert!(!results.is_empty(), "predictions should not be empty");
+        let words: Vec<String> = results
+            .iter()
+            .filter_map(|(id, _)| trainer.tokenizer.decode(*id).map(|s| s.to_string()))
+            .collect();
+        assert!(
+            words.contains(&"systems".to_string()),
+            "'systems' in top 3 after FFN training, got: {:?}",
+            words
+        );
+    }
+
+    /// Test D: Generation still works after FFN training.
+    #[test]
+    fn generation_still_works_after_ffn_training() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            15,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 30, 0.01);
+
+        let predictor = TransformerPredictor::from_model(&model, 5);
+        let output = generate_text_with_transformer(
+            &network,
+            &trainer.embedder,
+            &trainer.tokenizer,
+            &seq_memory,
+            &predictor,
+            "Rust is",
+            10,
+            1,
+        );
+
+        assert!(!output.is_empty(), "generation should produce output");
+        assert!(
+            output.contains("rust"),
+            "output should contain 'rust', got: '{}'",
+            output
+        );
+    }
+
+    /// Test E: FFN roundtrip — save and load FFN weights.
+    #[test]
+    fn ffn_persistence_roundtrip() {
+        let mut network = Network::new();
+        let mut trainer = Trainer::new_with_params(32, 0.01, 0.5);
+        let mut seq_memory = SequenceMemory::new();
+
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            5,
+            0.05,
+            5,
+        )
+        .unwrap();
+
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+        vocab_order.sort();
+        let examples = build_sequence_examples(
+            &trainer
+                .tokenizer
+                .encode("Rust is a systems programming language"),
+            5,
+        );
+        let mut model = TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order);
+        train_transformer_output_head(&mut model, &trainer.embedder, &examples, 5, 10, 0.01);
+
+        let path = std::env::temp_dir().join("ffn_persistence_test.bin");
+        model.save_to_file(&path).unwrap();
+        let loaded = TransformerLanguageModel::load_from_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            loaded.ffn_trained,
+            "ffn_trained should be true after reload"
+        );
+
+        let ffn_a = &loaded.block.feed_forward;
+        let ffn_b = &model.block.feed_forward;
+        for (a, b) in ffn_a.w1.iter().zip(ffn_b.w1.iter()) {
+            assert!((a - b).abs() < 1e-5, "w1 mismatch after roundtrip");
+        }
+        for (a, b) in ffn_a.b1.iter().zip(ffn_b.b1.iter()) {
+            assert!((a - b).abs() < 1e-5, "b1 mismatch after roundtrip");
+        }
+        for (a, b) in ffn_a.w2.iter().zip(ffn_b.w2.iter()) {
+            assert!((a - b).abs() < 1e-5, "w2 mismatch after roundtrip");
+        }
+        for (a, b) in ffn_a.b2.iter().zip(ffn_b.b2.iter()) {
+            assert!((a - b).abs() < 1e-5, "b2 mismatch after roundtrip");
+        }
+
+        // Predictions should still work after FFN roundtrip
+        let mut network = Network::new();
+        let mut seq_memory = SequenceMemory::new();
+        train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            "Rust is a systems programming language",
+            5,
+            15,
+            0.05,
+            5,
+        )
+        .unwrap();
+        let predictor = TransformerPredictor::from_model(&loaded, 5);
+        let tokens = {
+            let mut t = trainer.tokenizer.clone();
+            t.encode("Rust is a")
+        };
+        let results =
+            predictor.predict_top_k_assisted(&network, &trainer.embedder, &seq_memory, &tokens, 3);
+        assert!(
+            !results.is_empty(),
+            "predictions after FFN roundtrip should not be empty"
+        );
     }
 }

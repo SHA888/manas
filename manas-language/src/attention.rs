@@ -40,6 +40,7 @@ pub(crate) fn softmax(scores: &[f32]) -> Vec<f32> {
 ///   w_k: embed_dim × embed_dim
 ///   w_v: embed_dim × embed_dim
 ///   w_o: embed_dim × embed_dim
+#[derive(Clone)]
 pub struct CausalSelfAttention {
     pub embed_dim: usize,
     pub w_q: Vec<f32>,

@@ -31,7 +31,7 @@ manas learn "Rust is a systems programming language with zero-cost abstractions"
 # Train next-token prediction (v0.2)
 manas train-language "Rust is a systems programming language" --epochs 50
 
-# Train next-token prediction with transformer output head (v0.7)
+# Train next-token prediction with transformer output head + FFN (v0.7/v0.8)
 manas train-language "Rust is a systems programming language" --epochs 50 --train-transformer
 
 # Train with growth control (v0.7.1) — cap new neurons, or disable growth entirely
@@ -130,7 +130,7 @@ Manas is built from 7 Rust crates, each with a single responsibility:
 | **manas-ingest** | Input pipeline — 7 file format parsers, folder walker, text chunking |
 | **manas-memory** | Knowledge preservation — importance scoring, protection levels, compression |
 | **manas-agent** | Internet connection — DuckDuckGo search, HTML scraping, freshness checker |
-| **manas-language** | Next-token prediction — sequence memory, hybrid memory+neural predictor, autoregressive generation |
+| **manas-language** | Next-token prediction — sequence memory, hybrid memory+neural predictor, autoregressive generation, custom transformer block with trainable FFN |
 | **manas-cli** | Command-line interface — 16 commands for all operations |
 
 ---
@@ -220,6 +220,7 @@ Auto-detected from keywords in the text. Stale neurons trigger automatic interne
 - **Transformer output-head training (v0.7)** — `--train-transformer` flag for `train-language`; cross-entropy training of output projection head; dynamic weighting (40% transformer when trained); block weights frozen
 - **Neural growth optimization (v0.7.1)** — `--max-new-neurons` / `--no-grow` flags; growth capped per call and restricted to first epoch only; duplicate-text detection via `LanguageMeta` sidecar (`brain.manas.langmeta`) prevents re-growth on repeated training
 - **Enhanced system inspect (v0.7.2)** — `manas inspect` now shows separate sections for Core Network, Language System, Transformer, Storage, and Total; reports sidecar file sizes, transformer param counts, sequence memory status, and language metadata; `--verbose` flag for extended output
+- **Transformer FFN training (v0.8)** — `--train-transformer` now trains both the output head and the FeedForward layer inside the transformer block; gradient clipping to [-1, 1], NaN/inf safety; attention Q/K/V/O remain frozen; `manas inspect` reports `FFN trained : yes/no`
 
 ## Current Limitations
 
@@ -228,7 +229,7 @@ Auto-detected from keywords in the text. Stale neurons trigger automatic interne
 - **Next-token prediction is experimental** — v0.2 works for short contexts but is not trained on large corpora; generation quality is limited
 - **Attention is experimental (v0.4)** — single-head causal attention is implemented but not yet the default predictor
 - **Transformer block is experimental (v0.5)** — `TinyTransformerBlock` exists for forward inference only; no training yet
-- **Transformer-assisted prediction is experimental (v0.6/v0.7)** — `--use-transformer` uses the trained output head when available; output head is trained, transformer block itself is still frozen; default path unchanged
+- **Transformer-assisted prediction is experimental (v0.6/v0.7/v0.8)** — `--use-transformer` uses the trained output head and FeedForward layer when available; attention projections remain frozen; default path unchanged
 - **Growth control is experimental (v0.7.1)** — `max_new_neurons` cap and first-epoch-only growth help control network explosion; duplicate-text detection via `LanguageMeta` sidecar prevents re-growth on repeated training but is not retroactive
 - **File/chunk learning is experimental** — chunking heuristics and per-chunk learning are still being refined
 - **One neuron per source is an anchor** — the source neuron acts as a pointer, not a full document understanding
@@ -270,6 +271,7 @@ manas train-language "text"              Train next-token prediction
   --max-context 5                        Sliding context window size
   --max-new-neurons 10                   Max new neurons to grow (v0.7.1)
   --no-grow                              Disable all neuron growth (v0.7.1)
+  --train-transformer                    Train output head + FFN (v0.7/v0.8)
 
 manas predict-next "context"             Predict next token(s)
   --top-k 5                              Number of candidates

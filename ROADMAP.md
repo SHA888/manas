@@ -19,6 +19,7 @@ Manas is **not** trying to replace large hosted LLMs. It is a learning and resea
 | v0.7 | Transformer output-head training | Done |
 | v0.7.1 | Controlled neuron growth during language training | Done |
 | v0.7.2 | Better inspect for language and transformer state | Done |
+| v0.8 | Train transformer FeedForward layer | Done |
 
 ## Completed Milestones
 
@@ -214,37 +215,41 @@ Goal achieved:
 
 > `manas inspect` accurately shows the full Manas system state including language, transformer, and sidecar visibility.
 
-## Next Milestones
+---
 
-## v0.8 — Train Transformer Feed-Forward Layer
+### v0.8 — Train Transformer Feed-Forward Layer
 
-Right now, the transformer output head is trained, but the internal transformer block is mostly fixed.
+The FeedForward layer inside the transformer block is now trained alongside the output head.
 
-The next safe step is to train the feed-forward part of the transformer block while keeping attention frozen.
+Completed:
 
-### Goals
+- `FeedForward::train_step()` — full forward-cache, backprop through w1/b1/w2/b2, ReLU derivative, gradient clipping [-1, 1], NaN/inf safety
+- `TinyTransformerBlock::forward_with_ffn_inputs()` — returns per-position FFN inputs for backprop
+- `TransformerLanguageModel` gains `ffn_trained: bool` field
+- `TRANSFORMER_FILE_VERSION` bumped to 2 with FFN weight persistence
+- `TransformerPredictor::from_model()` copies the trained block instead of rebuilding it
+- `train_transformer_output_head()` now trains both output head AND FFN
+- `manas inspect` shows `FFN trained : yes/no`
+- 5 new tests (A: FFN weights change, B: attention stays frozen, C: prediction works, D: generation works, E: persistence roundtrip)
+- Attention Q/K/V/O remain frozen
 
-- Train `FeedForward` weights and biases:
-  - `w1`
-  - `b1`
-  - `w2`
-  - `b2`
-- Keep attention Q/K/V/O frozen for now
-- Keep the default generation path stable
-- Continue using `--train-transformer` and `--use-transformer`
+Example behaviour:
 
-### Why FFN First?
+```text
+$ manas train-language "text" --train-transformer
+# Now trains both output head and FFN weights
+$ manas inspect
+  Output head trained : yes
+  FFN trained         : yes
+```
 
-Training attention backprop is more complex. Training the feed-forward layer first is safer and gives the transformer path more learnable capacity without destabilizing the whole system.
+Goal achieved:
 
-### Expected Result
-
-- Transformer-assisted score improves
-- Generation still works
-- No neuron explosion
-- No breaking changes to default prediction/generation
+> The transformer FFN layer learns from next-token signal through backpropagated gradients while attention remains frozen.
 
 ---
+
+## Next Milestones
 
 ## v0.8.1 — Transformer Training Metrics
 
@@ -519,11 +524,5 @@ Manas should continue following these principles:
 The next coding milestone is:
 
 ```text
-v0.8 — Train transformer FeedForward layer
-```
-
-After that:
-
-```text
-v0.8 — Train transformer FeedForward layer
+v0.8.1 — Transformer Training Metrics
 ```
