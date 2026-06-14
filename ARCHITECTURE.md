@@ -789,7 +789,7 @@ impl FreshnessChecker {
 
 ### 6.7 `manas-cli`
 
-The command line interface. The entry point for all user interaction.
+The command line interface. The entry point for all user interaction. `teach` is the high-level local teaching path, while `learn`, `ingest`, and `train-language` remain lower-level commands for direct core memory, source-aware ingestion, and language/transformer training.
 
 Full CLI reference is in [Section 17](#17-cli-reference).
 
@@ -797,7 +797,7 @@ Full CLI reference is in [Section 17](#17-cli-reference).
 
 ### 6.8 `manas-language`
 
-The language modeling crate. Provides next-token prediction, a transition-count sequence memory, a hybrid memory+neural predictor, autoregressive text generation, and a small custom transformer path with trained output-head, FFN, and partial attention output/value projection training.
+The language modeling crate. Provides next-token prediction, a transition-count sequence memory, a hybrid memory+neural predictor, autoregressive text generation, and a small custom transformer path with trained output-head, FFN, partial attention `w_o`/`w_v`/`w_q`/`w_k` projection training, and reliability-aware hybrid score weighting.
 
 #### Key Components
 
@@ -909,6 +909,8 @@ inputs
 **v0.9.4** — attention training safety and observability were tightened without changing training math, scoring weights, generation behavior, model dimensions, or sidecar version. `AttentionTrainStepReport` now records attempted updates and pre-clip gradient norms consistently for `w_o`, `w_v`, and `w_q/w_k`. `TransformerTrainReport` adds attention-specific attempts/applied/clipped/invalid counters plus max/avg attention gradient norms, while global safety counters remain unchanged and are not double-counted. The CLI prints a compact "Attention safety" block. `TransformerLanguageModel::save_to_file()` refuses non-finite transformer models, assisted and transformer-only prediction filter non-finite scores before sorting, and rollback on serious instability restores the output head, FFN, all attention projections, `ffn_trained`, `attention_trained`, and the projection bitmask. Inspect remains conservative: `Attention trained : partial` and `Attention projections : o,v,q,k`.
 
 **v0.9.5** — transformer-assisted prediction now uses reliability-aware score weighting instead of the old fixed 0.25/0.40 blend. `TransformerPredictor` carries runtime metadata copied from `TransformerLanguageModel`: `ffn_trained`, `attention_projection_mask`, and `model_finite`. The base transformer weight is `0.15` for untrained cosine fallback, `0.30` for output-head-only, `0.35` for output head + FFN, `0.45` for attention `o`, `0.50` for attention `o,v`, and `0.55` for attention `o,v,q,k`. A simple confidence factor reduces transformer influence when top probability or top-1/top-2 margin is weak. Strong base-memory candidates cap transformer influence, learned sequence-memory candidates use a stricter cap to preserve exact transitions, and non-finite transformer state falls back to base memory/neural scores. `--transformer-only` remains pure transformer output. No tokenizer, sequence memory format, persistence format, sidecar version, training math, attention architecture, CLI default, or generation CLI behavior changes are included.
+
+**v0.9.6** — `manas teach <INPUT>` unifies local teaching UX without changing the underlying learning systems. Direct text teaching learns core memory and trains sequence memory; file/folder teaching preserves source paths while teaching core/source-aware memory, sequence memory, and optional transformer weights. The command supports `.md` and `.txt` files, recursively teaches folders with deterministic ordering, skips unsupported or empty files safely, and provides `--dry-run` without writing brain or sidecar files. Existing `learn`, `ingest`, and `train-language` commands remain available as lower-level controls. No tokenizer, sequence-memory format, transformer sidecar version, transformer dimensions, training math, scoring weight, attention architecture, generation behavior, or dependency change is included.
 
 #### Single-Head Causal Attention (v0.4)
 
@@ -1485,6 +1487,7 @@ No panics in library code. The CLI converts errors to user-friendly messages.
 | M24 | **Attention query/key projection training (v0.9.3)** — `train_query_key_projection_step()`, causal final-token softmax gradient, combined Q/K clipping, finite-difference tests, partial `o,v,q,k` inspect/report status | `manas-language`, `manas-cli` | Attention routing starts learning |
 | M25 | **Attention safety and metrics cleanup (v0.9.4)** — attention-specific safety counters, finite save guard, non-finite prediction-score filtering, rollback of output head/FFN/attention flags and projections, stable `o,v,q,k` reporting | `manas-language`, `manas-cli` | Attention training is safer and easier to debug |
 | M26 | **Reliability-aware transformer score weighting (v0.9.5)** — runtime reliability metadata, trained-projection weight tiers, confidence factor, sequence-memory cap, non-finite fallback to base scores, deterministic score sorting | `manas-language` | Transformer influence grows only when reliable |
+| M27 | **Unified teaching command (v0.9.6)** — `manas teach <INPUT>` orchestrates core/source-aware memory, sequence memory, optional transformer training, `.md`/`.txt` folder teaching, and dry-run reporting | `manas-cli` | One command teaches text, files, and folders |
 
 ---
 
@@ -1495,6 +1498,11 @@ No panics in library code. The CLI converts errors to user-friendly messages.
 
 # Learn from raw text
 manas learn "Rust is a systems programming language"
+
+# Unified local teaching: core memory + sequence memory + optional transformer
+manas teach "Manas is a local-first AI memory system"
+manas teach ./notes.md --train-transformer
+manas teach ./my-notes/ --dry-run
 
 # Learn from a file
 manas ingest --file ./notes.md

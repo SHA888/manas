@@ -12,6 +12,7 @@ use manas_language::{
 use manas_learn::{Trainer, TrainerSnapshot, decode, detect_freshness_category};
 use manas_store::ManasBrain;
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 // ─── CLI definition ───────────────────────────────────────────────────────────
@@ -38,6 +39,27 @@ enum Commands {
         folder: Option<String>,
         #[arg(long)]
         url: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    Teach {
+        input: String,
+        #[arg(long, default_value = "5")]
+        max_context: usize,
+        #[arg(long, default_value = "10")]
+        epochs: usize,
+        #[arg(long, default_value = "0.05")]
+        learning_rate: f32,
+        #[arg(long)]
+        train_transformer: bool,
+        #[arg(long, default_value = "0.01")]
+        transformer_learning_rate: f32,
+        #[arg(long, default_value = "5.0")]
+        transformer_max_grad_norm: f32,
+        #[arg(long, default_value = "50.0")]
+        transformer_max_loss: f32,
+        #[arg(long)]
+        no_transformer_rollback: bool,
         #[arg(long)]
         dry_run: bool,
     },
@@ -145,6 +167,32 @@ fn main() {
             folder.as_deref(),
             url.as_deref(),
             *dry_run,
+            &brain_path,
+        ),
+        Commands::Teach {
+            input,
+            max_context,
+            epochs,
+            learning_rate,
+            train_transformer,
+            transformer_learning_rate,
+            transformer_max_grad_norm,
+            transformer_max_loss,
+            no_transformer_rollback,
+            dry_run,
+        } => cmd_teach(
+            input,
+            TeachOptions {
+                max_context: *max_context,
+                epochs: *epochs,
+                learning_rate: *learning_rate,
+                train_transformer: *train_transformer,
+                transformer_learning_rate: *transformer_learning_rate,
+                transformer_max_grad_norm: *transformer_max_grad_norm,
+                transformer_max_loss: *transformer_max_loss,
+                no_transformer_rollback: *no_transformer_rollback,
+                dry_run: *dry_run,
+            },
             &brain_path,
         ),
         Commands::Query { text } => cmd_query(text, &brain_path),
@@ -279,6 +327,407 @@ fn format_duration(unix_ts: u64) -> String {
     }
 }
 
+// ─── Teach helpers ────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TeachInputMode {
+    Text,
+    File,
+    Folder,
+}
+
+impl TeachInputMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            TeachInputMode::Text => "text",
+            TeachInputMode::File => "file",
+            TeachInputMode::Folder => "folder",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TeachOptions {
+    max_context: usize,
+    epochs: usize,
+    learning_rate: f32,
+    train_transformer: bool,
+    transformer_learning_rate: f32,
+    transformer_max_grad_norm: f32,
+    transformer_max_loss: f32,
+    no_transformer_rollback: bool,
+    dry_run: bool,
+}
+
+#[derive(Clone, Debug)]
+struct TeachItem {
+    text: String,
+    source: Source,
+}
+
+#[derive(Clone, Debug)]
+struct TeachDiscovery {
+    mode: TeachInputMode,
+    items: Vec<TeachItem>,
+    files_discovered: usize,
+    files_skipped: usize,
+    read_errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TeachTransformerSummary {
+    training_ran: bool,
+    examples: usize,
+    invalid_updates: usize,
+    unstable_updates: usize,
+    rolled_back: bool,
+    output_head_trained: bool,
+    ffn_trained: bool,
+    attention_projection_o_trained: bool,
+    attention_projection_v_trained: bool,
+    attention_projection_q_trained: bool,
+    attention_projection_k_trained: bool,
+}
+
+impl TeachTransformerSummary {
+    fn record(&mut self, report: &manas_language::TransformerTrainReport) {
+        self.training_ran = true;
+        self.examples += report.examples;
+        self.invalid_updates += report.invalid_updates;
+        self.unstable_updates += report.unstable_updates;
+        self.rolled_back |= report.rolled_back;
+        self.output_head_trained = report.output_head_trained;
+        self.ffn_trained = report.ffn_trained;
+        self.attention_projection_o_trained = report.attention_projection_o_trained;
+        self.attention_projection_v_trained = report.attention_projection_v_trained;
+        self.attention_projection_q_trained = report.attention_projection_q_trained;
+        self.attention_projection_k_trained = report.attention_projection_k_trained;
+    }
+
+    fn attention_trained(&self) -> bool {
+        self.attention_projection_o_trained
+            || self.attention_projection_v_trained
+            || self.attention_projection_q_trained
+            || self.attention_projection_k_trained
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TeachReport {
+    mode: TeachInputMode,
+    files_discovered: usize,
+    files_taught: usize,
+    files_skipped: usize,
+    read_errors: Vec<String>,
+    text_chunks_learned: usize,
+    language_examples: usize,
+    language_tokens: u32,
+    transformer: TeachTransformerSummary,
+    dry_run: bool,
+}
+
+fn input_looks_like_path(input: &str) -> bool {
+    input.contains('/')
+        || input.contains('\\')
+        || matches!(
+            teach_file_extension(Path::new(input)).as_str(),
+            "md" | "txt"
+        )
+        || input.ends_with(std::path::MAIN_SEPARATOR)
+}
+
+fn teach_file_extension(path: &Path) -> String {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+}
+
+fn teach_supported_file(path: &Path) -> bool {
+    matches!(teach_file_extension(path).as_str(), "md" | "txt")
+}
+
+fn read_teach_file(path: &Path) -> Result<String, ManasError> {
+    let contents = fs::read_to_string(path).map_err(|e| ManasError::FileReadError {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let ext = teach_file_extension(path);
+    let parsed = manas_ingest::file_reader::parse_by_extension(&contents, &ext)?;
+    Ok(manas_ingest::normalizer::normalize(&parsed))
+}
+
+fn teach_item_from_file(path: &Path) -> Result<Option<TeachItem>, ManasError> {
+    if !teach_supported_file(path) {
+        return Err(ManasError::UnsupportedFileType(teach_file_extension(path)));
+    }
+
+    let text = read_teach_file(path)?;
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let path_str = path.display().to_string();
+    Ok(Some(TeachItem {
+        text,
+        source: Source::LocalFile { path: path_str },
+    }))
+}
+
+fn collect_folder_files(dir: &Path, files: &mut Vec<PathBuf>, errors: &mut Vec<String>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            errors.push(format!("{}: {}", dir.display(), e));
+            return;
+        }
+    };
+
+    let mut paths = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => paths.push(entry.path()),
+            Err(e) => errors.push(format!("{}: {}", dir.display(), e)),
+        }
+    }
+    paths.sort();
+
+    for path in paths {
+        if path.is_dir() {
+            collect_folder_files(&path, files, errors);
+        } else if path.is_file() {
+            files.push(path);
+        }
+    }
+}
+
+fn collect_teach_items(input: &str) -> Result<TeachDiscovery, ManasError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(ManasError::GrowthFailed("no teachable text".to_string()));
+    }
+
+    let input_path = PathBuf::from(trimmed);
+    if input_path.exists() {
+        if input_path.is_file() {
+            let item = teach_item_from_file(&input_path)?.ok_or_else(|| {
+                ManasError::GrowthFailed(format!("no teachable text in {}", input_path.display()))
+            })?;
+            return Ok(TeachDiscovery {
+                mode: TeachInputMode::File,
+                items: vec![item],
+                files_discovered: 1,
+                files_skipped: 0,
+                read_errors: Vec::new(),
+            });
+        }
+
+        if input_path.is_dir() {
+            let mut paths = Vec::new();
+            let mut read_errors = Vec::new();
+            collect_folder_files(&input_path, &mut paths, &mut read_errors);
+
+            let mut items = Vec::new();
+            let mut files_skipped = read_errors.len();
+            for path in &paths {
+                if !teach_supported_file(path) {
+                    files_skipped += 1;
+                    continue;
+                }
+
+                match teach_item_from_file(path) {
+                    Ok(Some(item)) => items.push(item),
+                    Ok(None) => files_skipped += 1,
+                    Err(e) => {
+                        files_skipped += 1;
+                        read_errors.push(format!("{}: {}", path.display(), e));
+                    }
+                }
+            }
+
+            return Ok(TeachDiscovery {
+                mode: TeachInputMode::Folder,
+                items,
+                files_discovered: paths.len(),
+                files_skipped,
+                read_errors,
+            });
+        }
+
+        return Err(ManasError::FileReadError {
+            path: input_path,
+            source: std::io::Error::other("input is neither file nor folder"),
+        });
+    }
+
+    if input_looks_like_path(trimmed) {
+        return Err(ManasError::FileNotFound(input_path));
+    }
+
+    Ok(TeachDiscovery {
+        mode: TeachInputMode::Text,
+        items: vec![TeachItem {
+            text: input.to_string(),
+            source: Source::RawText,
+        }],
+        files_discovered: 0,
+        files_skipped: 0,
+        read_errors: Vec::new(),
+    })
+}
+
+fn item_core_chunks(item: &TeachItem) -> Vec<String> {
+    match item.source {
+        Source::LocalFile { .. } => manas_ingest::chunk_text(
+            &item.text,
+            manas_ingest::CHUNK_SIZE,
+            manas_ingest::CHUNK_OVERLAP,
+        ),
+        _ => vec![item.text.clone()],
+    }
+}
+
+fn print_teach_report(report: &TeachReport, options: TeachOptions) {
+    if report.dry_run {
+        println!("Teaching dry run");
+    } else {
+        println!("Teaching complete");
+    }
+    println!();
+    println!("Input");
+    println!("  mode                  : {}", report.mode.as_str());
+    println!("  files discovered      : {}", report.files_discovered);
+    println!("  files taught          : {}", report.files_taught);
+    println!("  files skipped         : {}", report.files_skipped);
+    if !report.read_errors.is_empty() {
+        println!("  read errors           : {}", report.read_errors.len());
+        for error in &report.read_errors {
+            println!("  warning               : {}", error);
+        }
+    }
+
+    println!();
+    println!("Core memory");
+    println!(
+        "  source ingest         : {}",
+        if matches!(report.mode, TeachInputMode::File | TeachInputMode::Folder) {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!("  text chunks learned   : {}", report.text_chunks_learned);
+    println!(
+        "  source metadata       : {}",
+        if matches!(report.mode, TeachInputMode::File | TeachInputMode::Folder) {
+            "preserved"
+        } else {
+            "raw text"
+        }
+    );
+
+    println!();
+    println!("Language memory");
+    println!(
+        "  sequence training     : {}",
+        if report.dry_run { "planned" } else { "yes" }
+    );
+    println!("  max context           : {}", options.max_context);
+    println!("  epochs                : {}", options.epochs);
+    println!("  total examples        : {}", report.language_examples);
+    println!("  total tokens          : {}", report.language_tokens);
+
+    println!();
+    println!("Transformer");
+    println!(
+        "  transformer training  : {}",
+        if options.train_transformer {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    if options.train_transformer {
+        println!(
+            "  output head           : {}",
+            if report.transformer.output_head_trained {
+                "trained"
+            } else if report.dry_run {
+                "planned"
+            } else {
+                "untrained"
+            }
+        );
+        println!(
+            "  feed-forward          : {}",
+            if report.transformer.ffn_trained {
+                "trained"
+            } else if report.dry_run {
+                "planned"
+            } else {
+                "untrained"
+            }
+        );
+        println!(
+            "  attention             : {}",
+            if report.transformer.attention_trained() {
+                "partial"
+            } else if report.dry_run {
+                "planned"
+            } else {
+                "no"
+            }
+        );
+        println!(
+            "  projections           : {}",
+            format_attention_projections(
+                report.transformer.attention_projection_o_trained,
+                report.transformer.attention_projection_v_trained,
+                report.transformer.attention_projection_q_trained,
+                report.transformer.attention_projection_k_trained,
+            )
+        );
+    }
+
+    println!();
+    println!("Safety");
+    println!(
+        "  invalid updates       : {}",
+        report.transformer.invalid_updates
+    );
+    println!(
+        "  unstable updates      : {}",
+        report.transformer.unstable_updates
+    );
+    println!(
+        "  rolled back           : {}",
+        if report.transformer.rolled_back {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+}
+
+fn initial_teach_report(discovery: &TeachDiscovery, dry_run: bool) -> TeachReport {
+    TeachReport {
+        mode: discovery.mode,
+        files_discovered: discovery.files_discovered,
+        files_taught: if matches!(discovery.mode, TeachInputMode::Text) {
+            0
+        } else {
+            discovery.items.len()
+        },
+        files_skipped: discovery.files_skipped,
+        read_errors: discovery.read_errors.clone(),
+        text_chunks_learned: 0,
+        language_examples: 0,
+        language_tokens: 0,
+        transformer: TeachTransformerSummary::default(),
+        dry_run,
+    }
+}
+
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
 /// `manas learn "some text"`
@@ -409,6 +858,148 @@ fn cmd_ingest(
         "Ingested {} chunks | {} tokens | avg loss: {:.4}",
         chunk_count, total_tokens, avg_loss
     );
+    Ok(())
+}
+
+/// `manas teach <input>`
+fn cmd_teach(input: &str, options: TeachOptions, brain_path: &Path) -> Result<(), ManasError> {
+    const TEACH_MAX_NEW_NEURONS: usize = 10;
+
+    let discovery = collect_teach_items(input)?;
+    let mut report = initial_teach_report(&discovery, options.dry_run);
+
+    for item in &discovery.items {
+        let chunks = item_core_chunks(item);
+        report.text_chunks_learned += chunks.len();
+
+        let mut preview_trainer = Trainer::new();
+        let tokens = preview_trainer.tokenizer.encode(&item.text);
+        report.language_tokens += tokens.len() as u32;
+        report.language_examples += build_sequence_examples(&tokens, options.max_context).len();
+    }
+
+    if options.dry_run {
+        print_teach_report(&report, options);
+        return Ok(());
+    }
+
+    if discovery.items.is_empty() {
+        return Err(ManasError::GrowthFailed(
+            "no teachable .md or .txt content found".to_string(),
+        ));
+    }
+
+    let brain = ManasBrain::new(brain_path);
+    let mut network = load_or_create_network(&brain);
+    let mut trainer = Trainer::new();
+    restore_trainer_from_brain(&mut trainer, &brain);
+
+    let langmeta_path = language_meta_path(brain_path);
+    let mut langmeta = if langmeta_path.exists() {
+        LanguageMeta::load_from_file(&langmeta_path)?
+    } else {
+        LanguageMeta::new()
+    };
+
+    let seq_path = seq_memory_path(brain_path);
+    let mut seq_memory = if seq_path.exists() {
+        SequenceMemory::load_from_file(&seq_path)?
+    } else {
+        SequenceMemory::new()
+    };
+
+    report.text_chunks_learned = 0;
+    report.language_examples = 0;
+    report.language_tokens = 0;
+
+    for item in &discovery.items {
+        for chunk in item_core_chunks(item) {
+            trainer.source = item.source.clone();
+            trainer.freshness_category = detect_freshness_category(&chunk);
+
+            let _learn_report = trainer.learn(&mut network, &chunk)?;
+            report.text_chunks_learned += 1;
+
+            if matches!(trainer.source, Source::LocalFile { .. }) {
+                trainer.ensure_source_neuron(&mut network)?;
+            }
+        }
+
+        trainer.source = item.source.clone();
+        trainer.freshness_category = detect_freshness_category(&item.text);
+
+        let hash = text_hash(&item.text);
+        let effective_max = if langmeta.is_known(hash) {
+            0
+        } else {
+            TEACH_MAX_NEW_NEURONS
+        };
+
+        let language_report = train_next_token_examples(
+            &mut network,
+            &mut trainer,
+            &mut seq_memory,
+            &item.text,
+            options.max_context,
+            options.epochs,
+            options.learning_rate,
+            effective_max,
+        )?;
+
+        langmeta.record(hash, options.max_context, language_report.examples_count);
+        report.language_examples += language_report.examples_count;
+        report.language_tokens += language_report.tokens_learned;
+        network.total_texts_learned += 1;
+    }
+
+    if options.train_transformer {
+        let embed_dim = trainer.embedder.dim;
+        let hidden_dim = (embed_dim * 2).max(8);
+        let transformer_path = transformer_model_path(brain_path);
+        let mut model = if transformer_path.exists() {
+            TransformerLanguageModel::load_from_file(&transformer_path)?
+        } else {
+            let mut vocab_order: Vec<u32> = trainer.embedder.table.keys().copied().collect();
+            vocab_order.sort();
+            TransformerLanguageModel::new(embed_dim, hidden_dim, vocab_order)
+        };
+
+        let tf_epochs = options.epochs.max(10);
+        let safety = TransformerTrainingSafety {
+            max_gradient_norm: options.transformer_max_grad_norm,
+            max_loss: options.transformer_max_loss,
+            rollback_on_unstable: !options.no_transformer_rollback,
+            ..TransformerTrainingSafety::default()
+        };
+
+        for item in &discovery.items {
+            let tokens = trainer.tokenizer.encode(&item.text);
+            let examples = build_sequence_examples(&tokens, options.max_context);
+            let tf_report = train_transformer_output_head_with_safety(
+                &mut model,
+                &trainer.embedder,
+                &examples,
+                options.max_context,
+                tf_epochs,
+                options.transformer_learning_rate,
+                options.learning_rate,
+                &safety,
+            );
+            report.transformer.record(&tf_report);
+        }
+
+        if manas_language::is_finite_model(&model) {
+            model.save_to_file(&transformer_path)?;
+        } else {
+            println!("Warning: transformer model corrupted — not saving");
+        }
+    }
+
+    langmeta.save_to_file(&langmeta_path)?;
+    save_brain(&brain, &network, &trainer)?;
+    seq_memory.save_to_file(&seq_path)?;
+
+    print_teach_report(&report, options);
     Ok(())
 }
 
@@ -866,6 +1457,100 @@ fn format_attention_projections(
     }
 }
 
+fn format_transformer_train_report(tf_report: &manas_language::TransformerTrainReport) -> String {
+    format!(
+        "Transformer training\n\
+         \x20 epochs                           : {}\n\
+         \x20 examples                         : {}\n\
+         \x20 language lr                      : {:.4}\n\
+         \x20 transformer lr                   : {:.4}\n\
+         \x20 avg train loss                   : {:.4}\n\
+         \x20 first epoch loss                 : {}\n\
+         \x20 final epoch loss                 : {}\n\
+         \x20 improvement                      : {}\n\
+         \x20 pure transformer top-1 accuracy  : {:.2}%\n\
+         \x20 pure transformer top-3 accuracy  : {:.2}%\n\
+         \x20 output head                      : {}\n\
+         \x20 feed-forward                     : {}\n\
+         \x20 attention                        : {}\n\
+         \x20 attention projections            : {}\n\
+         \n\
+         Training safety\n\
+         \x20 max grad norm before clipping    : {:.4}\n\
+         \x20 avg grad norm                    : {:.4}\n\
+         \x20 clipped updates                  : {}\n\
+         \x20 invalid updates                  : {}\n\
+         \x20 unstable updates                 : {}\n\
+         \x20 rolled back                      : {}\n\
+         \n\
+         Attention safety\n\
+         \x20 projections trained              : {}\n\
+         \x20 attention update attempts        : {}\n\
+         \x20 attention updates applied        : {}\n\
+         \x20 attention clipped updates        : {}\n\
+         \x20 attention invalid updates        : {}\n\
+         \x20 max attention grad norm          : {:.4}\n\
+         \x20 avg attention grad norm          : {:.4}",
+        tf_report.epochs,
+        tf_report.examples,
+        tf_report.language_lr,
+        tf_report.transformer_lr,
+        tf_report.avg_loss,
+        tf_report
+            .first_loss
+            .map_or("N/A".to_string(), |v| format!("{:.4}", v)),
+        tf_report
+            .final_loss
+            .map_or("N/A".to_string(), |v| format!("{:.4}", v)),
+        tf_report
+            .improvement_pct
+            .map_or("N/A".to_string(), |v| format!("{:.2}%", v)),
+        tf_report.top1_accuracy,
+        tf_report.top3_accuracy,
+        if tf_report.output_head_trained {
+            "trained"
+        } else {
+            "untrained"
+        },
+        if tf_report.ffn_trained {
+            "trained"
+        } else {
+            "untrained"
+        },
+        format_training_attention_status(
+            tf_report.attention_frozen,
+            tf_report.attention_projection_o_trained,
+            tf_report.attention_projection_v_trained,
+            tf_report.attention_projection_q_trained,
+            tf_report.attention_projection_k_trained,
+        ),
+        format_attention_projections(
+            tf_report.attention_projection_o_trained,
+            tf_report.attention_projection_v_trained,
+            tf_report.attention_projection_q_trained,
+            tf_report.attention_projection_k_trained,
+        ),
+        tf_report.max_gradient_norm_seen,
+        tf_report.avg_gradient_norm,
+        tf_report.clipped_updates,
+        tf_report.invalid_updates,
+        tf_report.unstable_updates,
+        if tf_report.rolled_back { "yes" } else { "no" },
+        format_attention_projections(
+            tf_report.attention_projection_o_trained,
+            tf_report.attention_projection_v_trained,
+            tf_report.attention_projection_q_trained,
+            tf_report.attention_projection_k_trained,
+        ),
+        tf_report.attention_update_attempts,
+        tf_report.attention_updates_applied,
+        tf_report.attention_clipped_updates,
+        tf_report.attention_invalid_updates,
+        tf_report.max_attention_grad_norm,
+        tf_report.avg_attention_grad_norm,
+    )
+}
+
 /// `manas files`
 fn cmd_files(brain_path: &Path) -> Result<(), ManasError> {
     let brain = ManasBrain::new(brain_path);
@@ -1285,97 +1970,7 @@ fn cmd_train_language(
             println!("Warning: transformer model corrupted — not saving");
         }
 
-        println!(
-            "Transformer training\n\
-             \x20 epochs                           : {}\n\
-             \x20 examples                         : {}\n\
-             \x20 language lr                      : {:.4}\n\
-             \x20 transformer lr                   : {:.4}\n\
-             \x20 avg train loss                   : {:.4}\n\
-             \x20 first epoch loss                 : {}\n\
-             \x20 final epoch loss                 : {}\n\
-             \x20 improvement                      : {}\n\
-             \x20 pure transformer top-1 accuracy  : {:.2}%\n\
-             \x20 pure transformer top-3 accuracy  : {:.2}%\n\
-             \x20 output head                      : {}\n\
-             \x20 feed-forward                     : {}\n\
-             \x20 attention                        : {}\n\
-             \x20 attention projections            : {}\n\
-             \n\
-             Training safety\n\
-             \x20 max grad norm before clipping    : {:.4}\n\
-             \x20 avg grad norm                    : {:.4}\n\
-             \x20 clipped updates                  : {}\n\
-             \x20 invalid updates                  : {}\n\
-             \x20 unstable updates                 : {}\n\
-             \x20 rolled back                      : {}\n\
-             \n\
-             Attention safety\n\
-             \x20 projections trained              : {}\n\
-             \x20 attention update attempts        : {}\n\
-             \x20 attention updates applied        : {}\n\
-             \x20 attention clipped updates        : {}\n\
-             \x20 attention invalid updates        : {}\n\
-             \x20 max attention grad norm          : {:.4}\n\
-             \x20 avg attention grad norm          : {:.4}",
-            tf_report.epochs,
-            tf_report.examples,
-            tf_report.language_lr,
-            tf_report.transformer_lr,
-            tf_report.avg_loss,
-            tf_report
-                .first_loss
-                .map_or("N/A".to_string(), |v| format!("{:.4}", v)),
-            tf_report
-                .final_loss
-                .map_or("N/A".to_string(), |v| format!("{:.4}", v)),
-            tf_report
-                .improvement_pct
-                .map_or("N/A".to_string(), |v| format!("{:.2}%", v)),
-            tf_report.top1_accuracy,
-            tf_report.top3_accuracy,
-            if tf_report.output_head_trained {
-                "trained"
-            } else {
-                "untrained"
-            },
-            if tf_report.ffn_trained {
-                "trained"
-            } else {
-                "untrained"
-            },
-            format_training_attention_status(
-                tf_report.attention_frozen,
-                tf_report.attention_projection_o_trained,
-                tf_report.attention_projection_v_trained,
-                tf_report.attention_projection_q_trained,
-                tf_report.attention_projection_k_trained,
-            ),
-            format_attention_projections(
-                tf_report.attention_projection_o_trained,
-                tf_report.attention_projection_v_trained,
-                tf_report.attention_projection_q_trained,
-                tf_report.attention_projection_k_trained,
-            ),
-            tf_report.max_gradient_norm_seen,
-            tf_report.avg_gradient_norm,
-            tf_report.clipped_updates,
-            tf_report.invalid_updates,
-            tf_report.unstable_updates,
-            if tf_report.rolled_back { "yes" } else { "no" },
-            format_attention_projections(
-                tf_report.attention_projection_o_trained,
-                tf_report.attention_projection_v_trained,
-                tf_report.attention_projection_q_trained,
-                tf_report.attention_projection_k_trained,
-            ),
-            tf_report.attention_update_attempts,
-            tf_report.attention_updates_applied,
-            tf_report.attention_clipped_updates,
-            tf_report.attention_invalid_updates,
-            tf_report.max_attention_grad_norm,
-            tf_report.avg_attention_grad_norm,
-        );
+        println!("{}", format_transformer_train_report(&tf_report));
     }
 
     println!(
@@ -1566,6 +2161,30 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("manas_cli_{}_{}", name, nanos));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn default_teach_options() -> TeachOptions {
+        TeachOptions {
+            max_context: 5,
+            epochs: 2,
+            learning_rate: 0.05,
+            train_transformer: false,
+            transformer_learning_rate: 0.01,
+            transformer_max_grad_norm: 5.0,
+            transformer_max_loss: 50.0,
+            no_transformer_rollback: false,
+            dry_run: false,
+        }
+    }
+
     #[test]
     fn format_file_size_bytes() {
         assert_eq!(format_file_size(0), "0 B");
@@ -1659,5 +2278,251 @@ mod tests {
         assert_eq!(sz, Some(0));
 
         std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn teach_collects_direct_text_input() {
+        let discovery = collect_teach_items("Manas is written in Rust").unwrap();
+        assert_eq!(discovery.mode, TeachInputMode::Text);
+        assert_eq!(discovery.files_discovered, 0);
+        assert_eq!(discovery.files_skipped, 0);
+        assert_eq!(discovery.items.len(), 1);
+        assert!(matches!(discovery.items[0].source, Source::RawText));
+    }
+
+    #[test]
+    fn teach_missing_path_like_input_errors() {
+        let result = collect_teach_items("/tmp/manas_missing_teach_file.md");
+        assert!(matches!(result, Err(ManasError::FileNotFound(_))));
+    }
+
+    #[test]
+    fn teach_direct_text_with_period_is_not_treated_as_missing_path() {
+        let discovery = collect_teach_items("Manas v0.9.6 teaches local files.").unwrap();
+        assert_eq!(discovery.mode, TeachInputMode::Text);
+        assert_eq!(discovery.items.len(), 1);
+    }
+
+    #[test]
+    fn teach_file_support_is_md_and_txt_only() {
+        assert!(teach_supported_file(Path::new("notes.md")));
+        assert!(teach_supported_file(Path::new("notes.TXT")));
+        assert!(!teach_supported_file(Path::new("notes.rs")));
+        assert!(!teach_supported_file(Path::new("notes.html")));
+    }
+
+    #[test]
+    fn teach_folder_recurses_and_skips_unsupported_and_empty_files() {
+        let dir = temp_test_dir("folder_collect");
+        let nested = dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.join("identity.md"), "Manas is local.").unwrap();
+        std::fs::write(nested.join("goals.txt"), "Manas teaches folders.").unwrap();
+        std::fs::write(dir.join("ignore.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.join("empty.md"), "").unwrap();
+
+        let discovery = collect_teach_items(dir.to_str().unwrap()).unwrap();
+        assert_eq!(discovery.mode, TeachInputMode::Folder);
+        assert_eq!(discovery.files_discovered, 4);
+        assert_eq!(discovery.items.len(), 2);
+        assert_eq!(discovery.files_skipped, 2);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn teach_dry_run_does_not_create_brain_sidecars() {
+        let dir = temp_test_dir("dry_run");
+        let brain = dir.join("brain.manas");
+        let mut options = default_teach_options();
+        options.train_transformer = true;
+        options.dry_run = true;
+
+        cmd_teach("Manas dry run text", options, &brain).unwrap();
+
+        assert!(!brain.exists());
+        assert!(!seq_memory_path(&brain).exists());
+        assert!(!transformer_model_path(&brain).exists());
+        assert!(!language_meta_path(&brain).exists());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn teach_direct_text_learns_core_and_sequence_memory() {
+        let dir = temp_test_dir("direct_text");
+        let brain = dir.join("brain.manas");
+
+        cmd_teach(
+            "Manas is a local first memory system",
+            default_teach_options(),
+            &brain,
+        )
+        .unwrap();
+
+        assert!(brain.exists());
+        assert!(seq_memory_path(&brain).exists());
+        assert!(language_meta_path(&brain).exists());
+
+        let stats = ManasBrain::new(brain.clone()).inspect().unwrap();
+        assert_eq!(stats.total_texts_learned, 1);
+        assert!(stats.vocab_size > 0);
+
+        let seq_memory = SequenceMemory::load_from_file(&seq_memory_path(&brain)).unwrap();
+        assert!(!seq_memory.transitions.is_empty());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn teach_file_preserves_source_metadata() {
+        let dir = temp_test_dir("file_source");
+        let brain = dir.join("brain.manas");
+        let file = dir.join("identity.md");
+        std::fs::write(&file, "Manas is a source aware memory system.").unwrap();
+
+        cmd_teach(file.to_str().unwrap(), default_teach_options(), &brain).unwrap();
+
+        let network = ManasBrain::new(brain.clone()).load().unwrap();
+        let file_path = file.display().to_string();
+        assert!(
+            network
+                .all_neurons()
+                .into_iter()
+                .any(|(_, neuron)| matches!(&neuron.source, Source::LocalFile { path } if path == &file_path)),
+            "expected at least one neuron to preserve the file source path"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn teach_txt_file_trains_sequence_memory() {
+        let dir = temp_test_dir("txt_file");
+        let brain = dir.join("brain.manas");
+        let file = dir.join("goals.txt");
+        std::fs::write(&file, "Manas focuses on local learning and memory.").unwrap();
+
+        cmd_teach(file.to_str().unwrap(), default_teach_options(), &brain).unwrap();
+
+        let seq_memory = SequenceMemory::load_from_file(&seq_memory_path(&brain)).unwrap();
+        assert!(!seq_memory.transitions.is_empty());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn teach_folder_teaches_multiple_supported_files() {
+        let dir = temp_test_dir("folder_teach");
+        let brain = dir.join("brain.manas");
+        let teach_dir = dir.join("teach");
+        let nested = teach_dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            teach_dir.join("identity.md"),
+            "Manas learns from markdown files.",
+        )
+        .unwrap();
+        std::fs::write(nested.join("goals.txt"), "Manas learns from text files.").unwrap();
+        std::fs::write(teach_dir.join("skip.rs"), "let ignored = true;").unwrap();
+
+        cmd_teach(teach_dir.to_str().unwrap(), default_teach_options(), &brain).unwrap();
+
+        let stats = ManasBrain::new(brain.clone()).inspect().unwrap();
+        assert_eq!(stats.total_texts_learned, 2);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn teach_with_transformer_creates_trained_transformer_sidecar() {
+        let dir = temp_test_dir("transformer");
+        let brain = dir.join("brain.manas");
+        let mut options = default_teach_options();
+        options.train_transformer = true;
+        options.transformer_learning_rate = 0.05;
+
+        cmd_teach(
+            "Rust is a systems programming language focused on safety and performance",
+            options,
+            &brain,
+        )
+        .unwrap();
+
+        let transformer_path = transformer_model_path(&brain);
+        assert!(transformer_path.exists());
+        let model = TransformerLanguageModel::load_from_file(&transformer_path).unwrap();
+        assert!(model.ffn_trained);
+        assert!(model.attention_trained);
+        assert!(model.attention_projection_o_trained());
+        assert!(model.attention_projection_v_trained());
+        assert!(model.attention_projection_q_trained());
+        assert!(model.attention_projection_k_trained());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn prediction_works_after_teaching_file() {
+        let dir = temp_test_dir("predict_after_teach");
+        let brain = dir.join("brain.manas");
+        let file = dir.join("identity.md");
+        std::fs::write(&file, "Manas is a local first AI memory system.").unwrap();
+
+        cmd_teach(file.to_str().unwrap(), default_teach_options(), &brain).unwrap();
+
+        let network = ManasBrain::new(brain.clone()).load().unwrap();
+        let mut trainer = Trainer::new();
+        restore_trainer_from_brain(&mut trainer, &ManasBrain::new(brain.clone()));
+        let seq_memory = SequenceMemory::load_from_file(&seq_memory_path(&brain)).unwrap();
+        let tokens = trainer.tokenizer.encode("Manas is");
+        let predictor = NextTokenPredictor::new(5);
+        let predictions = predictor.predict_top_k_with_memory(
+            &network,
+            &trainer.embedder,
+            &seq_memory,
+            &tokens,
+            3,
+        );
+
+        assert!(!predictions.is_empty());
+        let top = trainer.tokenizer.decode(predictions[0].0).unwrap();
+        assert_eq!(top, "a");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn generation_works_after_teaching_file() {
+        let dir = temp_test_dir("generate_after_teach");
+        let brain = dir.join("brain.manas");
+        let file = dir.join("identity.md");
+        std::fs::write(&file, "Manas is a local first AI memory system.").unwrap();
+
+        cmd_teach(file.to_str().unwrap(), default_teach_options(), &brain).unwrap();
+
+        let network = ManasBrain::new(brain.clone()).load().unwrap();
+        let mut trainer = Trainer::new();
+        restore_trainer_from_brain(&mut trainer, &ManasBrain::new(brain.clone()));
+        let seq_memory = SequenceMemory::load_from_file(&seq_memory_path(&brain)).unwrap();
+        let generated = generate_text_with_memory(
+            &network,
+            &trainer.embedder,
+            &trainer.tokenizer,
+            &seq_memory,
+            "Manas is",
+            5,
+            5,
+            1,
+            1.0,
+        );
+
+        assert!(
+            generated.starts_with("manas is a"),
+            "unexpected generated text: {}",
+            generated
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

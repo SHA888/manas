@@ -28,7 +28,12 @@
 # Learn from text
 manas learn "Rust is a systems programming language with zero-cost abstractions"
 
-# Train next-token prediction (v0.2)
+# Teach text, one file, or a folder through core memory + sequence memory
+manas teach "Manas is written in Rust"
+manas teach ./notes.md --train-transformer
+manas teach ./my-notes/ --dry-run
+
+# Low-level next-token training (v0.2)
 manas train-language "Rust is a systems programming language" --epochs 50
 
 # Train next-token prediction with transformer output head + FFN + attention w_o/w_v/w_q/w_k (v0.7-v0.9.5)
@@ -50,7 +55,7 @@ manas generate "Rust is a" --max-tokens 10
 # Generate text with experimental transformer assistance (v0.6)
 manas generate "Rust is a" --use-transformer --max-tokens 10
 
-# Learn from files and folders
+# Low-level source-aware file/folder ingestion
 manas ingest --folder ./my-notes/
 manas ingest --file ./article.md
 
@@ -88,7 +93,7 @@ Manas is built from 7 Rust crates, each with a single responsibility:
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                         manas-cli                            │
-│   learn | query | ingest | predict-next | generate | ...    │
+│ teach | learn | ingest | train-language | generate | ...      │
 └───────────────────────────┬─────────────────────────────────┘
                             │
           ┌─────────────────┼─────────────────┬───────────────┐
@@ -131,7 +136,7 @@ Manas is built from 7 Rust crates, each with a single responsibility:
 | **manas-memory** | Knowledge preservation — importance scoring, protection levels, compression |
 | **manas-agent** | Internet connection — DuckDuckGo search, HTML scraping, freshness checker |
 | **manas-language** | Next-token prediction — sequence memory, hybrid memory+neural predictor, autoregressive generation, custom transformer block with trainable output head, FFN, and partial attention `w_o`/`w_v`/`w_q`/`w_k` training |
-| **manas-cli** | Command-line interface — 16 commands for all operations |
+| **manas-cli** | Command-line interface — 17 commands for all operations |
 
 ---
 
@@ -205,6 +210,7 @@ Auto-detected from keywords in the text. Stale neurons trigger automatic interne
 ## Current Capabilities
 
 - **Learn from raw text** — tokenizes, embeds, forward pass, backprop, grows neurons as needed
+- **Unified teaching command (v0.9.6)** — `manas teach <INPUT>` teaches direct text, one `.md`/`.txt` file, or a folder through core/source-aware memory, sequence memory, and optional transformer training in one command
 - **Ingest local files** — 7 format parsers (txt, md, json, html, csv, yaml, toml), folder walker, text chunking
 - **Persist state** — stores vocab, embeddings, neurons, and metadata in a single `.manas` file
 - **Source-aware growth** — grows a dedicated neuron per unique file or URL, retaining provenance
@@ -240,6 +246,7 @@ Auto-detected from keywords in the text. Stale neurons trigger automatic interne
 - **Transformer-assisted prediction is experimental (v0.6-v0.9.5)** — `--use-transformer` uses reliability-aware blending with trained output head, FeedForward layer, and partial attention projection training when available; exact sequence-memory candidates are still protected
 - **Growth control is experimental (v0.7.1)** — `max_new_neurons` cap and first-epoch-only growth help control network explosion; duplicate-text detection via `LanguageMeta` sidecar prevents re-growth on repeated training but is not retroactive
 - **File/chunk learning is experimental** — chunking heuristics and per-chunk learning are still being refined
+- **Teach file support is intentionally small** — `manas teach` supports `.md` and `.txt` files in v0.9.6; use `ingest` for broader parser coverage
 - **One neuron per source is an anchor** — the source neuron acts as a pointer, not a full document understanding
 - **Not production-ready** — this is a research prototype; APIs, storage, and behavior may change
 
@@ -267,6 +274,9 @@ Append-only — new neurons are added without rewriting the whole file. Starts a
 ```bash
 # Learning
 manas learn "text"                       Learn from raw text
+manas teach "text|path"                  Unified text/file/folder teaching (v0.9.6)
+  --train-transformer                    Also train transformer from taught text
+  --dry-run                              Preview teaching without saving
 manas ingest --file path                  Learn from a file
 manas ingest --folder path                Learn from a folder (recursive)
 manas ingest --url URL                    Learn from a web page

@@ -28,6 +28,7 @@ Manas is **not** trying to replace large hosted LLMs. It is a learning and resea
 | v0.9.3 | Train attention query/key projections w_q + w_k | Done |
 | v0.9.4 | Attention training safety and metrics cleanup | Done |
 | v0.9.5 | Reliability-aware transformer score weighting | Done |
+| v0.9.6 | Unified teaching command | Done |
 
 ## Completed Milestones
 
@@ -481,99 +482,29 @@ Goal achieved:
 
 ---
 
-## Next Milestones
+### v0.9.6 — Unified Teaching Command
 
-Add a future roadmap milestone after v0.9.5:
+Manas now has one high-level local teaching command for text, files, and folders.
 
----
+Completed:
 
-## v0.9.6 — Unified Teaching Command
+- `manas teach <INPUT>` accepts direct text, one file, or a folder
+- Direct text teaching learns into core memory, trains sequence memory, and optionally trains the transformer
+- File teaching preserves `Source::LocalFile` metadata, teaches core/source-aware memory, trains sequence memory, and optionally trains the transformer
+- Folder teaching recursively teaches supported local files with deterministic ordering
+- Supported v0.9.6 file types are intentionally limited to `.md` and `.txt`
+- Unsupported and empty files are skipped safely in folder mode
+- `--dry-run` reports what would be taught without writing `brain.manas`, `.seq`, `.transformer`, or `.langmeta`
+- `teach` reuses the existing learning, sequence-memory, and transformer-training paths
+- Existing `learn`, `ingest`, `train-language`, `predict-next`, `generate`, and `inspect` commands remain available
+- No tokenizer change, sequence memory format change, transformer dimension change, transformer sidecar version bump, training math change, attention architecture change, generation behavior change, scoring-weight change, or dependency change
 
-### Goal
-
-Manas currently has multiple learning commands:
-
-```txt
-learn
-ingest
-train-language
-```
-
-This is powerful but not ideal for normal users because teaching a file/folder requires multiple commands.
-
-Add a unified command:
-
-```bash
-manas teach <PATH_OR_TEXT>
-```
-
-The command should support:
+Examples:
 
 ```bash
 manas teach "Manas is a local-first AI memory system"
 manas teach teach/identity.md
-manas teach teach/
-```
-
-### Behavior
-
-For text input:
-
-```bash
-manas teach "Manas is written in Rust" --train-transformer
-```
-
-It should:
-
-* learn text into core memory
-* train language memory
-* train transformer if `--train-transformer` is passed
-
-For file input:
-
-```bash
-manas teach teach/identity.md --train-transformer
-```
-
-It should:
-
-* ingest the file into source-aware memory
-* extract readable text from the file
-* train language memory from that text
-* train transformer if enabled
-* preserve source path metadata
-
-For folder input:
-
-```bash
 manas teach teach/ --train-transformer
-```
-
-It should:
-
-* recursively read supported files
-* ingest each file
-* train language memory from each file
-* train transformer from each file
-* preserve per-file source metadata
-* show a summary report
-
-### Supported file types
-
-Start simple:
-
-```txt
-.md
-.txt
-```
-
-Do not add PDF/DOCX yet.
-
-### CLI flags
-
-Suggested flags:
-
-```bash
 manas teach <INPUT> \
   --max-context 5 \
   --epochs 100 \
@@ -582,32 +513,31 @@ manas teach <INPUT> \
   --transformer-learning-rate 0.05
 ```
 
-Optional:
+Report shape:
 
-```bash
---recursive
---include "*.md"
---dry-run
-```
-
-### Output report
-
-Example:
-
-```txt
+```text
 Teaching complete
 
+Input
+  mode                  : folder
+  files discovered      : 3
+  files taught          : 3
+  files skipped         : 0
+
 Core memory
-  files ingested        : 3
+  source ingest         : yes
   text chunks learned   : 3
   source metadata       : preserved
 
 Language memory
   sequence training     : yes
-  transformer training  : yes
+  max context           : 5
+  epochs                : 100
+  total examples        : ...
   total tokens          : ...
 
 Transformer
+  transformer training  : yes
   output head           : trained
   feed-forward          : trained
   attention             : partial
@@ -619,94 +549,13 @@ Safety
   rolled back           : no
 ```
 
-### Strict rules
+Goal achieved:
 
-Do not remove existing commands.
-
-Keep these working:
-
-```txt
-learn
-ingest
-train-language
-predict-next
-generate
-```
-
-`teach` is a higher-level convenience command built on top of existing logic.
-
-Do not change transformer math.
-
-Do not change tokenizer.
-
-Do not change generation behavior.
-
-Do not change sidecar version.
-
-### Tests
-
-Add tests for:
-
-* teaching direct text
-* teaching one `.md` file
-* teaching one `.txt` file
-* teaching folder with multiple files
-* unsupported files are skipped safely
-* source metadata is preserved
-* language memory is trained
-* transformer training works from file text
-* predictions work after teaching file
-* dry-run does not mutate brain
-* old commands still work
-
-### Example validation
-
-Create:
-
-```bash
-mkdir -p teach
-cat > teach/identity.md <<'EOF'
-Manas is a local-first AI memory system written in Rust.
-Manas learns from text and files.
-Manas stores persistent memory in a .manas brain file.
-Manas uses custom transformer training.
-Manas is not a ChatGPT clone.
-EOF
-```
-
-Run:
-
-```bash
-./target/release/manas teach teach/identity.md \
-  --max-context 5 \
-  --epochs 100 \
-  --learning-rate 0.05 \
-  --train-transformer \
-  --transformer-learning-rate 0.05
-```
-
-Then test:
-
-```bash
-./target/release/manas predict-next "Manas is" --use-transformer --max-context 5 --top-k 5
-./target/release/manas generate "Manas is" --use-transformer --max-context 5 --max-tokens 30
-./target/release/manas inspect --verbose
-```
-
-Expected:
-
-```txt
-Manas is -> a / local-first
-generate -> manas is a local-first ai memory system written in rust
-```
-
-### Milestone name
-
-```txt
-v0.9.6 — Unified Teaching Command
-```
+> Teaching a local text, markdown file, text file, or folder no longer requires separate `ingest` and `train-language` commands.
 
 ---
+
+## Next Milestones
 
 ## v1.0 — Stable Mini Local Language Model Release
 
@@ -723,7 +572,8 @@ This is the first stable language milestone.
 - Persistent brain + sidecars
 - Better inspect output
 - Transformer output-head training
-- FFN training and partial `w_o`/`w_v` attention training if stable
+- FFN training and partial `w_o`/`w_v`/`w_q`/`w_k` attention training if stable
+- Unified `teach` command for local text/file/folder teaching
 - Clean README examples
 - Strong tests
 
@@ -882,5 +732,5 @@ Manas should continue following these principles:
 The next coding milestone is:
 
 ```text
-v0.9.6 — Unified Teaching Command
+v1.0 — Stable Mini Local Language Model Release
 ```
