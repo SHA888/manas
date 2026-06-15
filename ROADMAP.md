@@ -32,6 +32,9 @@ Manas is **not** trying to replace large hosted LLMs. It is a learning and resea
 | v0.9.7 | Local query answering | Done |
 | v0.9.8 | AI-ready persistent source memory | Done |
 | v0.9.9 | Source memory ranking + inverted index | Done |
+| v1.0.0 | Stable local AI memory release | Done |
+| v1.0.1 | Backprop stability + teach data refresh | Done |
+| v1.1.0 | Transformer answer fallback for learned reasoning | Planned |
 
 ## Completed Milestones
 
@@ -847,9 +850,7 @@ Goal achieved:
 
 ---
 
-## Next Milestones
-
-## v1.0 — Stable Local AI Memory Release
+### v1.0 — Stable Local AI Memory Release
 
 This is the first stable local AI memory release milestone. It should stabilize the current local-first workflow rather than add another experimental storage layer or model architecture.
 
@@ -859,7 +860,7 @@ Stable v1.0 workflow:
 teach -> source memory -> source index -> ask/query --answer
 ```
 
-### Stabilization Goals
+#### Stabilization Goals
 
 - Stable `teach` workflow for text, `.md` files, `.txt` files, and folders
 - Stable `ask` and `query --answer` workflow for local source-backed answers
@@ -875,7 +876,7 @@ teach -> source memory -> source index -> ask/query --answer
 - macOS and Windows source-build instructions
 - GitHub tag-based release automation
 
-### Release Strategy
+#### Release Strategy
 
 v1.0 ships the Linux x86_64 binary release first:
 
@@ -894,17 +895,154 @@ Future releases may add:
 - Docker image
 - crates.io publishing
 
-### Honest Claim
+#### Honest Claim
 
 > Manas can teach local text/files/folders into local memory, persist source-backed evidence, build a local source index, and answer simple questions from local evidence without cloud APIs.
 
-### Not a Claim
+#### Not a Claim
 
 Manas should not claim to be a ChatGPT replacement or a general-purpose hosted LLM.
 
 ---
 
-## v1.1 — Better Tokenizer, Casing, and Punctuation
+## Next Milestones
+
+### v1.0.1 — Backprop Stability and Teach Data Refresh
+
+This patch release stabilizes training after the larger `teach/` dataset exposed a backpropagation target/output length mismatch.
+
+#### Completed
+
+- Fixed backpropagation panic when the output vector is longer than the target vector
+- Added safe fallback target values for unmatched output neurons
+- Guarded gradient application so missing layer deltas do not panic training
+- Refreshed `teach/identity.md` for Manas v1.0.0+ identity knowledge
+- Refreshed `teach/rules.md` for source memory, source index, fallback, and answering rules
+- Replaced fake/generated `teach/basics.md` examples with clean A-to-Z and basic knowledge examples
+- Replaced the huge repetitive `teach/math.md` addition table with concept-based math teaching data
+- Preserved storage format compatibility
+- Preserved CLI compatibility
+
+#### Goal achieved
+
+> Manas can teach a richer `teach/` folder without crashing from target/output length mismatch, and the default teaching data is cleaner for source-backed local answers.
+
+---
+
+### v1.1.0 — Transformer Answer Fallback for Learned Reasoning
+
+The next Manas milestone should make the custom transformer path useful during answering, not only during prediction and generation.
+
+Current `ask` behavior is primarily source-retrieval based:
+
+```txt
+ask question
+-> source index
+-> source memory
+-> original source fallback
+-> no-answer
+```
+
+This works for exact taught facts, but it does not let Manas attempt learned pattern reasoning when an exact source sentence is missing.
+
+Example problem:
+
+```bash
+manas ask "What is 2 + 2?"
+# answers correctly if exact source evidence exists
+
+manas ask "What is 2 + 3?"
+# may retrieve an unrelated counting sentence if exact math evidence is missing
+```
+
+The goal is not to add a hardcoded math evaluator. The goal is to let the local transformer attempt answers from learned patterns when source retrieval cannot find strong evidence.
+
+#### Planned Answer Pipeline
+
+```txt
+ask question
+-> try exact/source-backed retrieval first
+-> if evidence is strong, return source-backed answer
+-> if evidence is weak and the question looks like a learned pattern/reasoning question
+-> build a transformer prompt
+-> generate a local transformer answer
+-> validate the generated answer shape
+-> return transformer answer or fallback to no-answer
+```
+
+#### Planned Transformer Prompt Shape
+
+For learned reasoning questions, Manas can build prompts like:
+
+```txt
+Question: What is 2 + 3?
+Answer:
+```
+
+The transformer should generate a short answer from learned local patterns.
+
+#### Planned Training Data Direction
+
+`teach/math.md` should become a small curriculum for pattern learning, not a hardcoded calculator.
+
+Examples:
+
+```txt
+1 + 1 = 2.
+1 + 2 = 3.
+2 + 1 = 3.
+2 + 2 = 4.
+2 + 3 = 5.
+3 + 2 = 5.
+
+Question: What is 2 + 3?
+Answer: 5.
+
+Question: What is 3 + 2?
+Answer: 5.
+```
+
+The goal is to help the transformer learn arithmetic-like text patterns from examples.
+
+#### Planned Features
+
+- Add transformer answer fallback behind a safe internal path
+- Keep source-backed retrieval as the first priority
+- Add weak-evidence detection before transformer fallback
+- Add short-answer generation mode for `ask`
+- Add answer-shape validation for generated responses
+- Add confidence checks to avoid unsupported hallucination
+- Add no-answer fallback if transformer output is weak or invalid
+- Add tests for transformer fallback routing
+- Add tests proving normal source-backed answering still wins over transformer fallback
+
+#### Non-Goals
+
+Do not add a hardcoded arithmetic evaluator in this milestone.
+
+Do not add external LLMs.
+
+Do not add cloud APIs.
+
+Do not add vector databases.
+
+Do not add external ML frameworks.
+
+Do not claim Manas can do reliable general math yet.
+
+Do not replace source-backed answering with transformer-only answering.
+
+#### Honest Claim
+
+> Manas can attempt learned-pattern answers through its local transformer when exact local source evidence is weak, while still preserving source-backed retrieval as the primary answer path.
+
+#### Goal
+
+> Move Manas from source-only answering toward memory-assisted local transformer answering without adding hardcoded tools or external AI services.
+
+---
+
+### v1.2 — Better Tokenizer, Casing, and Punctuation
 
 Current generation normalizes text heavily.
 
@@ -915,7 +1053,7 @@ Rust is -> rust is
 Ownership -> ownership
 ```
 
-### Planned Improvements
+#### Planned Improvements
 
 - Case preservation
 - Punctuation tokens
@@ -928,24 +1066,24 @@ Ownership -> ownership
   - `<EOS>`
   - `<UNK>`
 
-### Goal
+#### Goal
 
 > Make generated text look more natural and preserve original formatting better.
 
 ---
 
-## v1.2 — Language Training from Files and Folders
+### v1.3 — Language Training from Files and Folders
 
 Add file/folder training for the language model.
 
-### Planned Commands
+#### Planned Commands
 
 ```bash
 manas train-language-file ./docs/rust.md --train-transformer
 manas train-language-folder ./docs --train-transformer
 ```
 
-### Goals
+#### Goals
 
 - Train language sequences from real documents
 - Preserve source metadata
@@ -955,11 +1093,11 @@ manas train-language-folder ./docs --train-transformer
 
 ---
 
-## v1.3 — Retrieval + Generation with Sources
+### v1.4 — Retrieval + Generation with Sources
 
 This milestone connects Manas memory and language generation.
 
-### Planned Pipeline
+#### Planned Pipeline
 
 ```text
 user question
@@ -969,7 +1107,7 @@ user question
 -> show source information
 ```
 
-### Goals
+#### Goals
 
 - Use local learned knowledge during answers
 - Show where answer knowledge came from
@@ -978,11 +1116,11 @@ user question
 
 ---
 
-## v1.4 — Dynamic Transformer Growth
+### v1.5 — Dynamic Transformer Growth
 
 This is one of the most important long-term Manas ideas.
 
-### Planned Growth Behaviors
+#### Planned Growth Behaviors
 
 - If loss stays high, grow FFN hidden dimension
 - If a new topic/source appears, add specialized memory neurons
@@ -990,17 +1128,17 @@ This is one of the most important long-term Manas ideas.
 - If confidence is low, later add another attention head
 - If repeated training is stable, avoid unnecessary growth
 
-### Goal
+#### Goal
 
 > Make Manas a controlled self-growing transformer-style local AI system.
 
 ---
 
-## v1.5 — Benchmarks, Tests, Docs, and Demo Scripts
+### v1.6 — Benchmarks, Tests, Docs, and Demo Scripts
 
 Add stronger project quality before larger releases.
 
-### Planned Work
+#### Planned Work
 
 - Accuracy tests
 - Generation quality tests
@@ -1014,13 +1152,13 @@ Add stronger project quality before larger releases.
 - Architecture diagrams
 - Example datasets
 
-### Goal
+#### Goal
 
 > Make Manas easier to test, explain, benchmark, and demonstrate.
 
-## Long-Term Direction
+### Long-Term Direction
 
-After v1.5, possible future directions:
+After v1.6, possible future directions:
 
 - Multi-head attention
 - Multiple transformer blocks
@@ -1049,5 +1187,13 @@ Manas should continue following these principles:
 The next coding milestone is:
 
 ```text
-v1.0 — Stable Local AI Memory Release
+v1.1.0 — Transformer Answer Fallback for Learned Reasoning
 ```
+
+Immediate focus:
+
+- Keep source-backed retrieval as the first answer path
+- Add transformer fallback only when source evidence is weak
+- Use learned examples in `teach/math.md` as a curriculum
+- Avoid hardcoded arithmetic evaluators for now
+- Keep no-answer fallback when transformer output is weak
