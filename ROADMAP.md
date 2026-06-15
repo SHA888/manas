@@ -30,7 +30,7 @@ Manas is **not** trying to replace large hosted LLMs. It is a learning and resea
 | v0.9.5 | Reliability-aware transformer score weighting | Done |
 | v0.9.6 | Unified teaching command | Done |
 | v0.9.7 | Local query answering | Done |
-| v0.9.8 | AI-ready persistent source memory | Planned |
+| v0.9.8 | AI-ready persistent source memory | Done |
 
 ## Completed Milestones
 
@@ -588,13 +588,9 @@ Goal achieved:
 
 ---
 
-## Next Milestones
+### v0.9.8 — AI-Ready Persistent Source Memory
 
-## v0.9.8 — AI-Ready Persistent Source Memory
-
-### Goal
-
-Persist taught local source knowledge into an AI-ready sidecar so `ask` can answer from taught evidence even when the original file is moved or deleted.
+Manas now persists taught local source knowledge into an AI-ready sidecar so `ask` can answer from taught evidence even when the original file is moved or deleted.
 
 Proposed sidecar:
 
@@ -602,9 +598,9 @@ Proposed sidecar:
 brain.manas.sources
 ```
 
-This should not be only copied raw text. It should preserve source chunks in a structure useful for both human-readable answers and local AI/search/retrieval.
+This is not only copied raw text. It preserves source chunks in a structure useful for both human-readable answers and local AI/search/retrieval.
 
-### Why This Is Needed
+### Why It Was Needed
 
 Current v0.9.7 behavior:
 
@@ -624,9 +620,9 @@ manas ask "What is Manas?"
 
 In that case, Manas may not have enough local source text to answer because `.manas` stores core memory and source metadata, not the full original source chunks.
 
-Raw text alone is also not enough for the next local answer path. Manas should persist each chunk with cleaned searchable text and token strings so local ranking can use the sidecar directly without reparsing source files.
+Raw text alone was also not enough for the local answer path. Manas now persists each chunk with cleaned searchable text and token strings so local ranking can use the sidecar directly without reparsing source files.
 
-### Desired Behavior
+### Behavior
 
 ```txt
 manas teach teach/identity.md
@@ -656,7 +652,7 @@ Sources
 
 ### Source Memory Scope
 
-Each stored source entry should keep enough structured local evidence for retrieval, ranking, answer output, and source display:
+Each stored source entry keeps enough structured local evidence for retrieval, ranking, answer output, and source display:
 
 ```txt
 source entry:
@@ -676,7 +672,7 @@ chunk:
   chunk_fingerprint
 ```
 
-Multiple taught files should accumulate in the same sidecar:
+Multiple taught files accumulate in the same sidecar:
 
 ```txt
 Source: teach/identity.md
@@ -695,11 +691,11 @@ Source: notes/project.txt
   tokens: [...]
 ```
 
-New teaching should append or update source entries without deleting unrelated older sources.
+New teaching appends or updates source entries without deleting unrelated older sources.
 
 ### Repeated Teaching
 
-Use a stable file fingerprint/hash:
+Repeated teaching uses stable deterministic FNV-1a fingerprinting:
 
 ```txt
 same file + same content     -> do not duplicate chunks
@@ -709,11 +705,9 @@ same raw text                -> no duplicate
 different raw text           -> add new raw source entry
 ```
 
-Use stable deterministic fingerprinting, preferably FNV-1a 64-bit or another in-repo deterministic hash if no dependency is already available.
-
 ### Storage Layout
 
-Future local storage:
+Local storage:
 
 ```txt
 brain.manas              -> core neurons + source metadata
@@ -723,11 +717,11 @@ brain.manas.langmeta     -> language training metadata
 brain.manas.sources      -> AI-ready persisted source memory
 ```
 
-`brain.manas.sources` should store original chunk text, normalized searchable text, token strings, source paths, fingerprints, and metadata.
+`brain.manas.sources` stores original chunk text, normalized searchable text, token strings, source paths, fingerprints, and metadata.
 
 ### Ask Behavior
 
-After v0.9.8, `ask` and `query --answer` should prefer persisted source memory:
+`ask` and `query --answer` prefer persisted source memory:
 
 ```txt
 ask question
@@ -737,7 +731,7 @@ ask question
 -> show original source path
 ```
 
-### Strict Non-Goals
+### Strict Non-Goals Preserved
 
 Do not change:
 
@@ -767,6 +761,8 @@ Goal:
 > Persist source knowledge in a local AI-ready structure so source-backed answering survives deleted/moved files and can support better local retrieval.
 
 ---
+
+## Next Milestones
 
 ## v1.0 — Stable Mini Local Language Model Release
 
@@ -943,5 +939,5 @@ Manas should continue following these principles:
 The next coding milestone is:
 
 ```text
-v0.9.8 — AI-Ready Persistent Source Memory
+v1.0 — Stable Mini Local Language Model Release
 ```

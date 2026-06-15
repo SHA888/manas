@@ -11,6 +11,10 @@ use manas_language::{
 };
 use manas_learn::{Trainer, TrainerSnapshot, decode, detect_freshness_category};
 use manas_store::ManasBrain;
+mod source_store;
+use source_store::{
+    SourceStore, SourceStoreSnippet, normalize_source_text, source_store_path, tokenize_source_text,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -803,10 +807,26 @@ struct LocalSourceCandidate {
 #[derive(Clone, Debug)]
 struct LocalEvidenceSnippet {
     text: String,
+    normalized_text: String,
+    tokens: Vec<String>,
     source: String,
     score: f32,
     source_neuron_count: u32,
     source_importance: f32,
+}
+
+impl From<SourceStoreSnippet> for LocalEvidenceSnippet {
+    fn from(snippet: SourceStoreSnippet) -> Self {
+        LocalEvidenceSnippet {
+            text: snippet.text,
+            normalized_text: snippet.normalized_text,
+            tokens: snippet.tokens,
+            source: snippet.source,
+            score: 0.0,
+            source_neuron_count: 0,
+            source_importance: 0.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -831,29 +851,6 @@ fn answer_stopwords() -> HashSet<&'static str> {
     ]
     .into_iter()
     .collect()
-}
-
-fn answer_tokens(text: &str) -> Vec<String> {
-    let stopwords = answer_stopwords();
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-
-    for ch in text.to_lowercase().chars() {
-        if ch.is_alphanumeric() || ch == '-' || ch == '\'' {
-            current.push(ch);
-        } else if !current.is_empty() {
-            if !stopwords.contains(current.as_str()) {
-                tokens.push(current.clone());
-            }
-            current.clear();
-        }
-    }
-
-    if !current.is_empty() && !stopwords.contains(current.as_str()) {
-        tokens.push(current);
-    }
-
-    tokens
 }
 
 fn sentence_split(text: &str) -> Vec<String> {
@@ -928,9 +925,13 @@ fn read_source_snippets(candidates: &[LocalSourceCandidate]) -> Vec<LocalEvidenc
         };
 
         for sentence in sentence_split(&text) {
-            if !sentence.trim().is_empty() {
+            let normalized_text = normalize_source_text(&sentence);
+            let tokens = tokenize_source_text(&sentence);
+            if !sentence.trim().is_empty() && !normalized_text.is_empty() && !tokens.is_empty() {
                 snippets.push(LocalEvidenceSnippet {
                     text: sentence,
+                    normalized_text,
+                    tokens,
                     source: candidate.path.clone(),
                     score: 0.0,
                     source_neuron_count: candidate.neuron_count,
@@ -948,20 +949,27 @@ fn rank_answer_snippets(
     snippets: &[LocalEvidenceSnippet],
     top_k: usize,
 ) -> Vec<LocalEvidenceSnippet> {
-    let query_tokens = answer_tokens(question);
+    let query_tokens = tokenize_source_text(question);
     if query_tokens.is_empty() {
         return Vec::new();
     }
 
     let query_set: HashSet<&str> = query_tokens.iter().map(|s| s.as_str()).collect();
     let focus = query_tokens.last().cloned();
+    let query_phrase = query_tokens.join(" ");
     let lower_question = question.to_lowercase();
     let definitional_question =
         lower_question.starts_with("what ") || lower_question.starts_with("who ");
+    let functional_question =
+        lower_question.starts_with("what does ") || lower_question.starts_with("what do ");
 
     let mut ranked = Vec::new();
     for snippet in snippets {
-        let snippet_tokens = answer_tokens(&snippet.text);
+        let snippet_tokens = if snippet.tokens.is_empty() {
+            tokenize_source_text(&snippet.text)
+        } else {
+            snippet.tokens.clone()
+        };
         if snippet_tokens.is_empty() {
             continue;
         }
@@ -977,7 +985,11 @@ fn rank_answer_snippets(
 
         let mut scored = snippet.clone();
         let mut score = overlap as f32 / query_set.len() as f32;
-        let lower_snippet = snippet.text.to_lowercase();
+        let lower_snippet = if snippet.normalized_text.is_empty() {
+            normalize_source_text(&snippet.text)
+        } else {
+            snippet.normalized_text.clone()
+        };
 
         if let Some(focus) = &focus {
             let starts_with_definition = lower_snippet.starts_with(&format!("{} is ", focus))
@@ -988,6 +1000,15 @@ fn rank_answer_snippets(
             if definitional_question && lower_snippet.starts_with(&format!("{} is not ", focus)) {
                 score -= 0.25;
             }
+        }
+        if functional_question
+            && !query_phrase.is_empty()
+            && lower_snippet.contains(&query_phrase)
+            && [" lets ", " allows ", " enables ", " helps "]
+                .iter()
+                .any(|marker| lower_snippet.contains(marker))
+        {
+            score += 0.20;
         }
 
         let source_count_bonus = (snippet.source_neuron_count.min(10) as f32) * 0.01;
@@ -1052,7 +1073,7 @@ fn compose_local_answer(ranked: &[LocalEvidenceSnippet], options: AskOptions) ->
                 &best.text,
                 options.max_answer_tokens,
             )),
-            sources,
+            sources: vec![best.source.clone()],
         };
     }
 
@@ -1071,6 +1092,17 @@ fn compose_local_answer(ranked: &[LocalEvidenceSnippet], options: AskOptions) ->
     }
 }
 
+fn read_persisted_source_snippets(
+    brain_path: &Path,
+) -> Result<Vec<LocalEvidenceSnippet>, ManasError> {
+    let store = SourceStore::load_from_file(&source_store_path(brain_path))?;
+    Ok(store
+        .all_snippets()
+        .into_iter()
+        .map(LocalEvidenceSnippet::from)
+        .collect())
+}
+
 fn answer_local_question(
     question: &str,
     options: AskOptions,
@@ -1086,6 +1118,25 @@ fn answer_local_question(
 
     let brain = ManasBrain::new(brain_path);
     let network = brain.load()?;
+
+    match read_persisted_source_snippets(brain_path) {
+        Ok(snippets) => {
+            if !snippets.is_empty() {
+                let ranked = rank_answer_snippets(question, &snippets, options.top_k);
+                let report = compose_local_answer(&ranked, options);
+                if matches!(
+                    report.kind,
+                    LocalAnswerKind::Answer | LocalAnswerKind::WeakEvidence
+                ) {
+                    return Ok(report);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: source memory unavailable: {}", e);
+        }
+    }
+
     let candidates = collect_local_source_candidates(&network);
     let snippets = read_source_snippets(&candidates);
     let ranked = rank_answer_snippets(question, &snippets, options.top_k);
@@ -1280,6 +1331,9 @@ fn cmd_teach(input: &str, options: TeachOptions, brain_path: &Path) -> Result<()
         ));
     }
 
+    let source_path = source_store_path(brain_path);
+    let mut source_store = SourceStore::load_from_file(&source_path)?;
+
     let brain = ManasBrain::new(brain_path);
     let mut network = load_or_create_network(&brain);
     let mut trainer = Trainer::new();
@@ -1341,6 +1395,8 @@ fn cmd_teach(input: &str, options: TeachOptions, brain_path: &Path) -> Result<()
         report.language_examples += language_report.examples_count;
         report.language_tokens += language_report.tokens_learned;
         network.total_texts_learned += 1;
+
+        source_store.upsert_teach_item(item);
     }
 
     if options.train_transformer {
@@ -1389,6 +1445,7 @@ fn cmd_teach(input: &str, options: TeachOptions, brain_path: &Path) -> Result<()
     langmeta.save_to_file(&langmeta_path)?;
     save_brain(&brain, &network, &trainer)?;
     seq_memory.save_to_file(&seq_path)?;
+    source_store.save_to_file(&source_path)?;
 
     print_teach_report(&report, options);
     Ok(())
@@ -1535,6 +1592,42 @@ fn cmd_refresh(category: Option<&str>, brain_path: &Path) -> Result<(), ManasErr
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceMemoryStats {
+    status: &'static str,
+    entries: usize,
+    chunks: usize,
+    bytes: Option<u64>,
+}
+
+fn source_memory_stats(brain_path: &Path) -> SourceMemoryStats {
+    let path = source_store_path(brain_path);
+    let bytes = file_size(&path);
+    if bytes.is_none() {
+        return SourceMemoryStats {
+            status: "missing",
+            entries: 0,
+            chunks: 0,
+            bytes,
+        };
+    }
+
+    match SourceStore::load_from_file(&path) {
+        Ok(store) => SourceMemoryStats {
+            status: "enabled",
+            entries: store.entry_count(),
+            chunks: store.chunk_count(),
+            bytes,
+        },
+        Err(_) => SourceMemoryStats {
+            status: "corrupt",
+            entries: 0,
+            chunks: 0,
+            bytes,
+        },
+    }
+}
+
 /// `manas inspect [--verbose]`
 fn cmd_inspect(verbose: bool, brain_path: &Path) -> Result<(), ManasError> {
     let brain = ManasBrain::new(brain_path);
@@ -1571,6 +1664,7 @@ fn cmd_inspect(verbose: bool, brain_path: &Path) -> Result<(), ManasError> {
     let seq_bytes = file_size(&seq_path);
     let tf_bytes = file_size(&tf_path);
     let langmeta_bytes = file_size(&langmeta_path);
+    let source_mem = source_memory_stats(brain_path);
 
     // ── Sequence memory stats ───────────────────────────────────────
     let seq_entries = seq_bytes.and_then(|_| {
@@ -1764,13 +1858,32 @@ fn cmd_inspect(verbose: bool, brain_path: &Path) -> Result<(), ManasError> {
         Some(sz) => println!("  Language metadata   : {}  ({})", sz, format_file_size(sz)),
         None => println!("  Language metadata   : missing"),
     }
-    let total_storage =
-        brain_sz + seq_bytes.unwrap_or(0) + tf_bytes.unwrap_or(0) + langmeta_bytes.unwrap_or(0);
+    match source_mem.bytes {
+        Some(sz) => println!("  Source memory       : {}  ({})", sz, format_file_size(sz)),
+        None => println!("  Source memory       : missing"),
+    }
+    let total_storage = brain_sz
+        + seq_bytes.unwrap_or(0)
+        + tf_bytes.unwrap_or(0)
+        + langmeta_bytes.unwrap_or(0)
+        + source_mem.bytes.unwrap_or(0);
     println!(
         "  Total storage       : {}  ({})",
         total_storage,
         format_file_size(total_storage)
     );
+
+    if verbose {
+        println!("\nSource memory");
+        println!("{}", sub);
+        println!("  Source store        : {}", source_mem.status);
+        println!("  Source entries      : {}", source_mem.entries);
+        println!("  Source chunks       : {}", source_mem.chunks);
+        match source_mem.bytes {
+            Some(sz) => println!("  Source file         : {}  ({})", sz, format_file_size(sz)),
+            None => println!("  Source file         : missing"),
+        }
+    }
 
     // Total
     println!("\nTotal");
@@ -1953,6 +2066,37 @@ fn format_transformer_train_report(tf_report: &manas_language::TransformerTrainR
 }
 
 /// `manas files`
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct FileListing {
+    neuron_count: u32,
+    stored_chunks: usize,
+}
+
+fn collect_file_listings(brain_path: &Path) -> Result<BTreeMap<String, FileListing>, ManasError> {
+    let brain = ManasBrain::new(brain_path);
+    let network = brain.load()?;
+    let mut files: BTreeMap<String, FileListing> = BTreeMap::new();
+
+    for (_, n) in network.all_neurons() {
+        if let Source::LocalFile { path } = &n.source {
+            files.entry(path.clone()).or_default().neuron_count += 1;
+        }
+    }
+
+    match SourceStore::load_from_file(&source_store_path(brain_path)) {
+        Ok(store) => {
+            for (path, chunk_count) in store.file_sources() {
+                files.entry(path).or_default().stored_chunks = chunk_count;
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: source memory unavailable: {}", e);
+        }
+    }
+
+    Ok(files)
+}
+
 fn cmd_files(brain_path: &Path) -> Result<(), ManasError> {
     let brain = ManasBrain::new(brain_path);
     if !brain.path.exists() {
@@ -1960,14 +2104,7 @@ fn cmd_files(brain_path: &Path) -> Result<(), ManasError> {
         return Ok(());
     }
 
-    let network = brain.load()?;
-    let mut files: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
-
-    for (_, n) in network.all_neurons() {
-        if let Source::LocalFile { path } = &n.source {
-            *files.entry(path.clone()).or_insert(0) += 1;
-        }
-    }
+    let files = collect_file_listings(brain_path)?;
 
     if files.is_empty() {
         println!("No files have been ingested yet");
@@ -1975,8 +2112,15 @@ fn cmd_files(brain_path: &Path) -> Result<(), ManasError> {
     }
 
     println!("{} ingested file(s):", files.len());
-    for (path, count) in &files {
-        println!("  {} — {} neuron(s)", path, count);
+    for (path, listing) in &files {
+        if listing.stored_chunks > 0 {
+            println!(
+                "  {} — {} neuron(s), {} stored chunk(s)",
+                path, listing.neuron_count, listing.stored_chunks
+            );
+        } else {
+            println!("  {} — {} neuron(s)", path, listing.neuron_count);
+        }
     }
     Ok(())
 }
@@ -2766,6 +2910,222 @@ mod tests {
         assert!(!seq_memory_path(&brain).exists());
         assert!(!transformer_model_path(&brain).exists());
         assert!(!language_meta_path(&brain).exists());
+        assert!(!source_store_path(&brain).exists());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn teach_file_creates_source_store_with_ai_ready_md_chunks() {
+        let dir = temp_test_dir("source_store_md");
+        let brain = dir.join("brain.manas");
+        let file = dir.join("identity.md");
+        std::fs::write(
+            &file,
+            "Manas is a local-first AI memory system written in Rust.",
+        )
+        .unwrap();
+
+        cmd_teach(file.to_str().unwrap(), default_teach_options(), &brain).unwrap();
+
+        let path = source_store_path(&brain);
+        assert!(path.exists());
+        let store = SourceStore::load_from_file(&path).unwrap();
+        assert_eq!(store.entry_count(), 1);
+        assert_eq!(store.chunk_count(), 1);
+        let snippets = store.all_snippets();
+        assert_eq!(
+            snippets[0].text,
+            "Manas is a local-first AI memory system written in Rust."
+        );
+        assert_eq!(
+            snippets[0].normalized_text,
+            "manas is a local first ai memory system written in rust"
+        );
+        assert!(snippets[0].tokens.contains(&"manas".to_string()));
+        assert!(snippets[0].tokens.contains(&"local".to_string()));
+        assert!(snippets[0].tokens.contains(&"first".to_string()));
+        assert!(snippets[0].tokens.contains(&"rust".to_string()));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn teach_txt_file_persists_ai_ready_source_chunks() {
+        let dir = temp_test_dir("source_store_txt");
+        let brain = dir.join("brain.manas");
+        let file = dir.join("goals.txt");
+        std::fs::write(&file, "Manas stores AI-ready source memory for retrieval.").unwrap();
+
+        cmd_teach(file.to_str().unwrap(), default_teach_options(), &brain).unwrap();
+
+        let store = SourceStore::load_from_file(&source_store_path(&brain)).unwrap();
+        let snippets = store.all_snippets();
+        assert_eq!(store.entry_count(), 1);
+        assert_eq!(snippets[0].source, file.display().to_string());
+        assert_eq!(
+            snippets[0].normalized_text,
+            "manas stores ai ready source memory for retrieval"
+        );
+        assert!(snippets[0].tokens.contains(&"retrieval".to_string()));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn teach_folder_stores_supported_sources_only() {
+        let dir = temp_test_dir("source_store_folder");
+        let brain = dir.join("brain.manas");
+        let teach_dir = dir.join("teach");
+        let nested = teach_dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(teach_dir.join("identity.md"), "Manas learns markdown.").unwrap();
+        std::fs::write(nested.join("goals.txt"), "Manas learns text files.").unwrap();
+        std::fs::write(teach_dir.join("skip.rs"), "let ignored = true;").unwrap();
+        std::fs::write(teach_dir.join("empty.md"), "").unwrap();
+
+        cmd_teach(teach_dir.to_str().unwrap(), default_teach_options(), &brain).unwrap();
+
+        let store = SourceStore::load_from_file(&source_store_path(&brain)).unwrap();
+        assert_eq!(store.entry_count(), 2);
+        let files: Vec<String> = store
+            .file_sources()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        assert!(files.iter().any(|path| path.ends_with("identity.md")));
+        assert!(files.iter().any(|path| path.ends_with("goals.txt")));
+        assert!(!files.iter().any(|path| path.ends_with("skip.rs")));
+        assert!(!files.iter().any(|path| path.ends_with("empty.md")));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repeated_file_teaching_deduplicates_and_changed_file_updates_chunks() {
+        let dir = temp_test_dir("source_store_repeat");
+        let brain = dir.join("brain.manas");
+        let file = dir.join("repeat.md");
+        std::fs::write(
+            &file,
+            "Manas remembers repeated source files without duplicating chunks.",
+        )
+        .unwrap();
+
+        cmd_teach(file.to_str().unwrap(), default_teach_options(), &brain).unwrap();
+        cmd_teach(file.to_str().unwrap(), default_teach_options(), &brain).unwrap();
+
+        let store = SourceStore::load_from_file(&source_store_path(&brain)).unwrap();
+        assert_eq!(store.entry_count(), 1);
+        assert_eq!(store.chunk_count(), 1);
+
+        std::fs::write(&file, "Manas updates changed source files safely.").unwrap();
+        cmd_teach(file.to_str().unwrap(), default_teach_options(), &brain).unwrap();
+
+        let updated = SourceStore::load_from_file(&source_store_path(&brain)).unwrap();
+        assert_eq!(updated.entry_count(), 1);
+        assert_eq!(updated.chunk_count(), 1);
+        assert_eq!(
+            updated.all_snippets()[0].text,
+            "Manas updates changed source files safely."
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn direct_text_source_memory_deduplicates_raw_text() {
+        let dir = temp_test_dir("source_store_raw");
+        let brain = dir.join("brain.manas");
+
+        cmd_teach(
+            "Manas stores raw teaching text.",
+            default_teach_options(),
+            &brain,
+        )
+        .unwrap();
+        cmd_teach(
+            "Manas stores raw teaching text.",
+            default_teach_options(),
+            &brain,
+        )
+        .unwrap();
+        cmd_teach(
+            "Manas stores different raw teaching text.",
+            default_teach_options(),
+            &brain,
+        )
+        .unwrap();
+
+        let store = SourceStore::load_from_file(&source_store_path(&brain)).unwrap();
+        assert_eq!(store.entry_count(), 2);
+        assert!(store.file_sources().is_empty());
+        assert!(
+            store
+                .all_snippets()
+                .iter()
+                .all(|snippet| snippet.source == "raw text")
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn files_include_source_store_only_paths() {
+        let dir = temp_test_dir("files_source_store_only");
+        let brain = dir.join("brain.manas");
+        ManasBrain::new(brain.clone())
+            .save(&Network::new())
+            .unwrap();
+
+        let mut store = SourceStore::new();
+        store.upsert_teach_item(&TeachItem {
+            text: "Manas persists source store only paths.".to_string(),
+            source: Source::LocalFile {
+                path: "deleted/source.md".to_string(),
+            },
+        });
+        store.save_to_file(&source_store_path(&brain)).unwrap();
+
+        let files = collect_file_listings(&brain).unwrap();
+        let listing = files.get("deleted/source.md").unwrap();
+        assert_eq!(listing.neuron_count, 0);
+        assert_eq!(listing.stored_chunks, 1);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inspect_source_memory_stats_report_status_and_counts() {
+        let dir = temp_test_dir("inspect_source_memory");
+        let brain = dir.join("brain.manas");
+
+        let missing = source_memory_stats(&brain);
+        assert_eq!(missing.status, "missing");
+        assert_eq!(missing.entries, 0);
+        assert_eq!(missing.chunks, 0);
+
+        let mut store = SourceStore::new();
+        store.upsert_teach_item(&TeachItem {
+            text: "Manas inspect reports source memory.".to_string(),
+            source: Source::LocalFile {
+                path: "teach/inspect.md".to_string(),
+            },
+        });
+        let source_path = source_store_path(&brain);
+        store.save_to_file(&source_path).unwrap();
+
+        let enabled = source_memory_stats(&brain);
+        assert_eq!(enabled.status, "enabled");
+        assert_eq!(enabled.entries, 1);
+        assert_eq!(enabled.chunks, 1);
+        assert!(enabled.bytes.unwrap() > 0);
+
+        std::fs::write(&source_path, b"bad").unwrap();
+        let corrupt = source_memory_stats(&brain);
+        assert_eq!(corrupt.status, "corrupt");
+        assert_eq!(corrupt.entries, 0);
+        assert_eq!(corrupt.chunks, 0);
 
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2979,6 +3339,96 @@ mod tests {
 
         assert!(formatted.contains("Sources"));
         assert!(formatted.contains(&file.display().to_string()));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ask_answers_from_persisted_chunks_after_original_file_deleted() {
+        let dir = temp_test_dir("ask_persisted_deleted");
+        let brain = dir.join("brain.manas");
+        let file = teach_identity_file(&dir, &brain);
+        std::fs::remove_file(&file).unwrap();
+
+        let report =
+            answer_local_question("What is Manas?", default_ask_options(), &brain).unwrap();
+
+        assert_eq!(report.kind, LocalAnswerKind::Answer);
+        assert_eq!(
+            report.answer.as_deref(),
+            Some("Manas is a local-first AI memory system written in Rust.")
+        );
+        assert_eq!(report.sources, vec![file.display().to_string()]);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn query_answer_uses_persisted_chunks_after_original_file_deleted() {
+        let dir = temp_test_dir("query_answer_persisted_deleted");
+        let brain = dir.join("brain.manas");
+        let file = teach_identity_file(&dir, &brain);
+        std::fs::remove_file(&file).unwrap();
+
+        let cli = Cli::try_parse_from(["manas", "query", "What is Manas?", "--answer"]).unwrap();
+        match cli.command {
+            Commands::Query { answer, .. } => assert!(answer),
+            _ => panic!("expected query command"),
+        }
+
+        let report =
+            answer_local_question("What is Manas?", default_ask_options(), &brain).unwrap();
+        assert_eq!(report.kind, LocalAnswerKind::Answer);
+        assert_eq!(report.sources, vec![file.display().to_string()]);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ask_falls_back_to_original_file_when_source_store_missing() {
+        let dir = temp_test_dir("ask_missing_sources");
+        let brain = dir.join("brain.manas");
+        let file = teach_identity_file(&dir, &brain);
+        std::fs::remove_file(source_store_path(&brain)).unwrap();
+
+        let report =
+            answer_local_question("What is Manas?", default_ask_options(), &brain).unwrap();
+
+        assert_eq!(report.kind, LocalAnswerKind::Answer);
+        assert_eq!(report.sources, vec![file.display().to_string()]);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ask_corrupt_source_store_falls_back_without_panic() {
+        let dir = temp_test_dir("ask_corrupt_sources");
+        let brain = dir.join("brain.manas");
+        let file = teach_identity_file(&dir, &brain);
+        std::fs::write(source_store_path(&brain), b"bad").unwrap();
+
+        let report =
+            answer_local_question("What is Manas?", default_ask_options(), &brain).unwrap();
+
+        assert_eq!(report.kind, LocalAnswerKind::Answer);
+        assert_eq!(report.sources, vec![file.display().to_string()]);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn teach_corrupt_source_store_fails_before_overwrite() {
+        let dir = temp_test_dir("teach_corrupt_sources");
+        let brain = dir.join("brain.manas");
+        let file = dir.join("identity.md");
+        std::fs::write(&file, "Manas should not overwrite corrupt source memory.").unwrap();
+        let source_path = source_store_path(&brain);
+        std::fs::write(&source_path, b"bad").unwrap();
+
+        let result = cmd_teach(file.to_str().unwrap(), default_teach_options(), &brain);
+
+        assert!(matches!(result, Err(ManasError::CorruptFile { .. })));
+        assert_eq!(std::fs::read(&source_path).unwrap(), b"bad");
 
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -914,7 +914,7 @@ inputs
 
 **v0.9.7** — `manas ask "question"` adds local-first answering from taught source memory. The answer path loads the local brain, collects `Source::LocalFile` paths from neurons, re-reads existing `.md` and `.txt` files, splits them into deterministic sentence snippets, ranks snippets by local token overlap and source metadata, and returns a short extracted answer with source paths. If evidence is weak it reports related local memory without answering confidently; if evidence is missing it says there is not enough local memory. `manas query "question" --answer` uses the same helper, while normal `query` remains unchanged. No internet, cloud API, external embedding service, transformer sidecar change, tokenizer change, training math change, scoring-weight change, or teach behavior change is included.
 
-**v0.9.8 planned** — `brain.manas.sources` should become an AI-ready persistent source-memory sidecar. It should store original chunk text for answer output, normalized searchable text for ranking, token strings for local retrieval, source paths or raw labels for display, stable fingerprints for dedup/update behavior, and source/chunk metadata. `teach` should populate this sidecar while continuing the existing core memory, sequence memory, and optional transformer training path. `ask` and `query --answer` should search persisted source memory first, rank with normalized text/tokens, output answers from original chunk text, and only fall back to original file paths when the sidecar is missing or incomplete. This is not a vector database, embedding store, external LLM integration, tokenizer change, transformer sidecar change, or teach/ask UX change.
+**v0.9.8** — `brain.manas.sources` is an AI-ready persistent source-memory sidecar. It stores original chunk text for answer output, normalized searchable text for ranking, token strings for local retrieval, source paths or raw labels for display, stable fingerprints for dedup/update behavior, and source/chunk metadata. `teach` populates this sidecar while continuing the existing core memory, sequence memory, and optional transformer training path. `ask` and `query --answer` search persisted source memory first, rank with normalized text/tokens, output answers from original chunk text, and only fall back to original file paths when the sidecar is missing or incomplete. This is not a vector database, embedding store, external LLM integration, tokenizer change, transformer sidecar change, or teach/ask UX change.
 
 #### Single-Head Causal Attention (v0.4)
 
@@ -1368,8 +1368,8 @@ manas-cli:
           │
           ▼
 local source reader:
-  v0.9.7: re-read existing .md/.txt files → split into sentence snippets
-  v0.9.8 planned: search brain.manas.sources first
+  search brain.manas.sources first
+  fallback to existing .md/.txt files when needed
           │
           ▼
 local ranker:
@@ -1383,7 +1383,7 @@ answer composer:
 
 This path is local-only. It does not construct the agent search pipeline, call web search, use hosted LLM APIs, or use external embedding services.
 
-Planned v0.9.8 source-memory flow:
+v0.9.8 source-memory flow:
 
 ```txt
 teach file/text/folder
@@ -1537,7 +1537,7 @@ No panics in library code. The CLI converts errors to user-friendly messages.
 | M26 | **Reliability-aware transformer score weighting (v0.9.5)** — runtime reliability metadata, trained-projection weight tiers, confidence factor, sequence-memory cap, non-finite fallback to base scores, deterministic score sorting | `manas-language` | Transformer influence grows only when reliable |
 | M27 | **Unified teaching command (v0.9.6)** — `manas teach <INPUT>` orchestrates core/source-aware memory, sequence memory, optional transformer training, `.md`/`.txt` folder teaching, and dry-run reporting | `manas-cli` | One command teaches text, files, and folders |
 | M28 | **Local query answering (v0.9.7)** — `manas ask`, `query --answer`, local `.md`/`.txt` source snippet ranking, extracted answers, source display, and no-evidence fallback | `manas-cli` | Questions can be answered from taught local source memory |
-| M29 | **AI-ready persistent source memory (v0.9.8 planned)** — `brain.manas.sources`, original chunk text, normalized text, token strings, source paths, fingerprints, and sidecar-first answer retrieval | `manas-cli` | Answers survive moved/deleted source files and retrieval has structured local evidence |
+| M29 | **AI-ready persistent source memory (v0.9.8)** — `brain.manas.sources`, original chunk text, normalized text, token strings, source paths, fingerprints, and sidecar-first answer retrieval | `manas-cli` | Answers survive moved/deleted source files and retrieval has structured local evidence |
 
 ---
 
@@ -1662,7 +1662,7 @@ manas inspect
 #   Sequence file       : 1,245,312  (1.19 MB)
 #   Transformer file    : 3,201,792  (3.05 MB)
 #   Language metadata   : 164,352    (160.50 KB)
-#   Source memory       : planned v0.9.8 sidecar (brain.manas.sources)
+#   Source memory       : 28,672     (28.00 KB)
 #   Total storage       : 14,048,640 (13.40 MB)
 #
 #  Total

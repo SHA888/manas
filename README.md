@@ -215,6 +215,7 @@ Auto-detected from keywords in the text. Stale neurons trigger automatic interne
 - **Learn from raw text** — tokenizes, embeds, forward pass, backprop, grows neurons as needed
 - **Unified teaching command (v0.9.6)** — `manas teach <INPUT>` teaches direct text, one `.md`/`.txt` file, or a folder through core/source-aware memory, sequence memory, and optional transformer training in one command
 - **Local query answering (v0.9.7)** — `manas ask "question"` answers from taught local `.md`/`.txt` source evidence, shows source paths, and says when there is not enough local memory. `manas query "question" --answer` uses the same local answer path while normal `query` remains unchanged.
+- **AI-ready persistent source memory (v0.9.8)** — `manas teach` writes `brain.manas.sources` with original chunk text, normalized searchable text, token strings, source paths, fingerprints, and metadata. `ask` searches this sidecar first, so source-backed answers can still work after original taught files are moved or deleted.
 - **Ingest local files** — 7 format parsers (txt, md, json, html, csv, yaml, toml), folder walker, text chunking
 - **Persist state** — stores vocab, embeddings, neurons, and metadata in a single `.manas` file
 - **Source-aware growth** — grows a dedicated neuron per unique file or URL, retaining provenance
@@ -242,8 +243,8 @@ Auto-detected from keywords in the text. Stale neurons trigger automatic interne
 
 ## Current Limitations
 
-- **Local answering is intentionally extractive** — `ask` re-reads taught local `.md`/`.txt` source files, ranks local snippets, and prefers direct source sentences over free generation
-- **AI-ready source memory is planned** — v0.9.7 stores source paths, but `ask` still depends on original local files existing; v0.9.8 plans `brain.manas.sources` with original chunk text, normalized searchable text, tokens, source paths, fingerprints, and metadata
+- **Local answering is intentionally extractive** — `ask` searches persisted source memory first, falls back to taught local `.md`/`.txt` source files when needed, and prefers direct source chunks over free generation
+- **Source memory is intentionally small** — `brain.manas.sources` stores `.md`, `.txt`, and raw-text chunks with token strings, not embeddings, vector indexes, PDFs, DOCX files, or web crawls
 - **Normal query remains the search/retrieval path** — use `ask` or `query --answer` for local source-backed answers
 - **Answer generation is basic** — local answering avoids unsupported claims and says when there is not enough local memory
 - **Next-token prediction is experimental** — v0.2 works for short contexts but is not trained on large corpora; generation quality is limited
@@ -273,13 +274,13 @@ A single file stores the entire brain:
 
 Append-only — new neurons are added without rewriting the whole file. Starts at ~1 KB, grows forever.
 
-Planned v0.9.8 sidecar:
+Source memory sidecar (v0.9.8):
 
 ```txt
 brain.manas.sources      AI-ready persisted source memory for source-backed ask
 ```
 
-Planned v0.9.8 behavior:
+Deleted-file source answering:
 
 ```bash
 manas teach teach/identity.md --train-transformer
@@ -297,7 +298,7 @@ Sources
   - teach/identity.md
 ```
 
-The sidecar is planned to store original chunk text for answer output plus normalized text and token strings for local retrieval, without adding external embeddings, vector databases, or cloud APIs.
+The sidecar stores original chunk text for answer output plus normalized text and token strings for local retrieval, without adding external embeddings, vector databases, or cloud APIs.
 
 ---
 
