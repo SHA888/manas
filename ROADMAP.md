@@ -31,7 +31,7 @@ Manas is **not** trying to replace large hosted LLMs. It is a learning and resea
 | v0.9.6 | Unified teaching command | Done |
 | v0.9.7 | Local query answering | Done |
 | v0.9.8 | AI-ready persistent source memory | Done |
-| v0.9.9 | Source memory ranking + inverted index | Planned |
+| v0.9.9 | Source memory ranking + inverted index | Done |
 
 ## Completed Milestones
 
@@ -763,19 +763,17 @@ Goal:
 
 ---
 
-## Next Milestones
+### v0.9.9 — Source Memory Ranking + Inverted Index
 
-## v0.9.9 — Source Memory Ranking + Inverted Index
+v0.9.8 made source memory persistent through `brain.manas.sources`. v0.9.9 added a small local search/ranking layer over persisted source memory so `ask` does not need to rely only on scanning every stored chunk directly as taught files and chunks grow.
 
-v0.9.8 made source memory persistent through `brain.manas.sources`. As taught files and chunks grow, `ask` should not rely only on scanning every stored chunk directly. v0.9.9 should add a small local search/ranking layer over persisted source memory.
-
-Planned sidecar:
+New derived sidecar:
 
 ```txt
 brain.manas.sourceindex
 ```
 
-`brain.manas.sources` stores chunks. `brain.manas.sourceindex` should map searchable tokens to source/chunk references so local answering can quickly collect candidate evidence before ranking.
+`brain.manas.sources` stores chunks as the source of truth. `brain.manas.sourceindex` maps searchable tokens to source/chunk references so local answering can quickly collect candidate evidence before ranking.
 
 Example:
 
@@ -792,7 +790,7 @@ token: rust
   -> teach/identity.md chunk 1
 ```
 
-Planned storage layout:
+Storage layout:
 
 ```txt
 brain.manas              -> core neurons + source metadata
@@ -803,7 +801,7 @@ brain.manas.sources      -> AI-ready persisted source memory
 brain.manas.sourceindex  -> token-to-source/chunk inverted index
 ```
 
-Planned ask/query-answer priority:
+Ask/query-answer priority:
 
 ```txt
 ask question
@@ -816,7 +814,7 @@ ask question
 -> return existing no-answer message if no evidence exists
 ```
 
-Scope:
+Completed:
 
 - Token-to-chunk inverted index
 - Faster local source retrieval
@@ -824,7 +822,7 @@ Scope:
 - Top-k evidence selection
 - Source confidence score
 - Stale source/chunk detection
-- Index rebuild/refresh strategy
+- Full index rebuild after successful `teach`
 - Safe fallback to scanning `brain.manas.sources` if the index is missing or corrupt
 - No behavior change to normal `query`
 
@@ -843,11 +841,13 @@ Strict non-goals:
 - No `.manas`, `.seq`, `.transformer`, or `.langmeta` format changes
 - No normal `query` behavior changes
 
-Goal:
+Goal achieved:
 
 > Make persisted source-memory retrieval faster and more reliable without leaving the local, custom, small-system design.
 
 ---
+
+## Next Milestones
 
 ## v1.0 — Stable Mini Local Language Model Release
 
@@ -1024,5 +1024,5 @@ Manas should continue following these principles:
 The next coding milestone is:
 
 ```text
-v0.9.9 — Source Memory Ranking + Inverted Index
+v1.0 — Stable Mini Local Language Model Release
 ```

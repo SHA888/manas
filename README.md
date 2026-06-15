@@ -216,6 +216,7 @@ Auto-detected from keywords in the text. Stale neurons trigger automatic interne
 - **Unified teaching command (v0.9.6)** — `manas teach <INPUT>` teaches direct text, one `.md`/`.txt` file, or a folder through core/source-aware memory, sequence memory, and optional transformer training in one command
 - **Local query answering (v0.9.7)** — `manas ask "question"` answers from taught local `.md`/`.txt` source evidence, shows source paths, and says when there is not enough local memory. `manas query "question" --answer` uses the same local answer path while normal `query` remains unchanged.
 - **AI-ready persistent source memory (v0.9.8)** — `manas teach` writes `brain.manas.sources` with original chunk text, normalized searchable text, token strings, source paths, fingerprints, and metadata. `ask` searches this sidecar first, so source-backed answers can still work after original taught files are moved or deleted.
+- **Source memory inverted index (v0.9.9)** — `manas teach` rebuilds `brain.manas.sourceindex`, a token-to-source/chunk index over `brain.manas.sources`. `ask` and `query --answer` use it for faster candidate retrieval and safely fall back to scanning source memory if the index is missing, corrupt, or stale.
 - **Ingest local files** — 7 format parsers (txt, md, json, html, csv, yaml, toml), folder walker, text chunking
 - **Persist state** — stores vocab, embeddings, neurons, and metadata in a single `.manas` file
 - **Source-aware growth** — grows a dedicated neuron per unique file or URL, retaining provenance
@@ -245,7 +246,7 @@ Auto-detected from keywords in the text. Stale neurons trigger automatic interne
 
 - **Local answering is intentionally extractive** — `ask` searches persisted source memory first, falls back to taught local `.md`/`.txt` source files when needed, and prefers direct source chunks over free generation
 - **Source memory is intentionally small** — `brain.manas.sources` stores `.md`, `.txt`, and raw-text chunks with token strings, not embeddings, vector indexes, PDFs, DOCX files, or web crawls
-- **Source-memory search is still simple** — v0.9.9 plans `brain.manas.sourceindex`, a local token-to-source/chunk inverted index for faster top-k evidence retrieval and ranking
+- **Source indexing is local and lexical** — `brain.manas.sourceindex` is a deterministic token-to-source/chunk index, not embeddings, a vector database, or an external search system
 - **Normal query remains the search/retrieval path** — use `ask` or `query --answer` for local source-backed answers
 - **Answer generation is basic** — local answering avoids unsupported claims and says when there is not enough local memory
 - **Next-token prediction is experimental** — v0.2 works for short contexts but is not trained on large corpora; generation quality is limited
@@ -281,7 +282,7 @@ Source memory sidecar (v0.9.8):
 brain.manas.sources      AI-ready persisted source memory for source-backed ask
 ```
 
-Planned source-memory index (v0.9.9):
+Source-memory index sidecar (v0.9.9):
 
 ```txt
 brain.manas.sourceindex  token-to-source/chunk inverted index for faster local evidence retrieval

@@ -916,7 +916,7 @@ inputs
 
 **v0.9.8** — `brain.manas.sources` is an AI-ready persistent source-memory sidecar. It stores original chunk text for answer output, normalized searchable text for ranking, token strings for local retrieval, source paths or raw labels for display, stable fingerprints for dedup/update behavior, and source/chunk metadata. `teach` populates this sidecar while continuing the existing core memory, sequence memory, and optional transformer training path. `ask` and `query --answer` search persisted source memory first, rank with normalized text/tokens, output answers from original chunk text, and only fall back to original file paths when the sidecar is missing or incomplete. This is not a vector database, embedding store, external LLM integration, tokenizer change, transformer sidecar change, or teach/ask UX change.
 
-**v0.9.9 planned** — `brain.manas.sourceindex` should add a local token-to-source/chunk inverted index over `brain.manas.sources`. The index should let `ask` and `query --answer` collect candidate evidence chunks quickly, rank top-k evidence with token overlap and source metadata, track source confidence, detect stale chunks, and safely fall back to scanning `brain.manas.sources` if the index is missing or corrupt. It should not add vector databases, external embeddings, cloud APIs, tokenizer changes, transformer architecture changes, training math changes, or changes to normal `query` behavior.
+**v0.9.9** — `brain.manas.sourceindex` adds a local token-to-source/chunk inverted index over `brain.manas.sources`. The index lets `ask` and `query --answer` collect candidate evidence chunks quickly, rank top-k evidence with token overlap and source metadata, detect stale chunks, and safely fall back to scanning `brain.manas.sources` if the index is missing, corrupt, or stale. It does not add vector databases, external embeddings, cloud APIs, tokenizer changes, transformer architecture changes, training math changes, or changes to normal `query` behavior.
 
 #### Single-Head Causal Attention (v0.4)
 
@@ -1370,7 +1370,7 @@ manas-cli:
           │
           ▼
 local source reader:
-  planned v0.9.9: use brain.manas.sourceindex when available
+  use brain.manas.sourceindex when available and fresh
   search brain.manas.sources first
   fallback to existing .md/.txt files when needed
           │
@@ -1541,7 +1541,7 @@ No panics in library code. The CLI converts errors to user-friendly messages.
 | M27 | **Unified teaching command (v0.9.6)** — `manas teach <INPUT>` orchestrates core/source-aware memory, sequence memory, optional transformer training, `.md`/`.txt` folder teaching, and dry-run reporting | `manas-cli` | One command teaches text, files, and folders |
 | M28 | **Local query answering (v0.9.7)** — `manas ask`, `query --answer`, local `.md`/`.txt` source snippet ranking, extracted answers, source display, and no-evidence fallback | `manas-cli` | Questions can be answered from taught local source memory |
 | M29 | **AI-ready persistent source memory (v0.9.8)** — `brain.manas.sources`, original chunk text, normalized text, token strings, source paths, fingerprints, and sidecar-first answer retrieval | `manas-cli` | Answers survive moved/deleted source files and retrieval has structured local evidence |
-| M30 | **Source memory ranking + inverted index (v0.9.9 planned)** — `brain.manas.sourceindex`, token-to-source/chunk lookup, top-k evidence ranking, confidence scoring, stale chunk detection, and scan fallback | `manas-cli` | Source-backed answers stay fast and reliable as taught chunks grow |
+| M30 | **Source memory ranking + inverted index (v0.9.9)** — `brain.manas.sourceindex`, token-to-source/chunk lookup, top-k evidence ranking, stale chunk detection, and scan fallback | `manas-cli` | Source-backed answers stay fast and reliable as taught chunks grow |
 
 ---
 

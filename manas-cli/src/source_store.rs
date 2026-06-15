@@ -66,6 +66,14 @@ pub(crate) struct SourceStoreSnippet {
     pub(crate) source: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SourceStoreChunkRef {
+    pub(crate) source_id: u64,
+    pub(crate) chunk_id: u64,
+    pub(crate) source_fingerprint: u64,
+    pub(crate) chunk_fingerprint: u64,
+}
+
 pub(crate) fn source_store_path(brain_path: &Path) -> PathBuf {
     let mut p = brain_path.to_path_buf();
     let ext = p
@@ -362,6 +370,10 @@ impl SourceStore {
         self.sources.len()
     }
 
+    pub(crate) fn source_count(&self) -> usize {
+        self.sources.len()
+    }
+
     pub(crate) fn chunk_count(&self) -> usize {
         self.sources
             .values()
@@ -390,6 +402,53 @@ impl SourceStore {
             .filter(|source| source.source_kind == StoredSourceKind::File)
             .map(|source| (source.source_path.clone(), source.chunks.len()))
             .collect()
+    }
+
+    pub(crate) fn source_store_fingerprint(&self) -> u64 {
+        let mut input = String::new();
+        for source in self.sources.values() {
+            input.push_str(&source.source_id.to_string());
+            input.push('\0');
+            input.push_str(&source.fingerprint.to_string());
+            input.push('\0');
+            for chunk in &source.chunks {
+                input.push_str(&chunk.chunk_id.to_string());
+                input.push('\0');
+                input.push_str(&chunk.chunk_fingerprint.to_string());
+                input.push('\0');
+            }
+        }
+        fnv1a64(&input)
+    }
+
+    pub(crate) fn sources(&self) -> impl Iterator<Item = &StoredSource> {
+        self.sources.values()
+    }
+
+    pub(crate) fn resolve_ref(
+        &self,
+        reference: &SourceStoreChunkRef,
+    ) -> Option<SourceStoreSnippet> {
+        for source in self.sources.values() {
+            if source.source_id != reference.source_id
+                || source.fingerprint != reference.source_fingerprint
+            {
+                continue;
+            }
+            for chunk in &source.chunks {
+                if chunk.chunk_id == reference.chunk_id
+                    && chunk.chunk_fingerprint == reference.chunk_fingerprint
+                {
+                    return Some(SourceStoreSnippet {
+                        text: chunk.chunk_text.clone(),
+                        normalized_text: chunk.normalized_text.clone(),
+                        tokens: chunk.tokens.clone(),
+                        source: source.source_path.clone(),
+                    });
+                }
+            }
+        }
+        None
     }
 }
 

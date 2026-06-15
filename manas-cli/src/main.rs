@@ -11,7 +11,9 @@ use manas_language::{
 };
 use manas_learn::{Trainer, TrainerSnapshot, decode, detect_freshness_category};
 use manas_store::ManasBrain;
+mod source_index;
 mod source_store;
+use source_index::{SourceIndex, SourceIndexStats, source_index_path, source_index_stats};
 use source_store::{
     SourceStore, SourceStoreSnippet, normalize_source_text, source_store_path, tokenize_source_text,
 };
@@ -957,11 +959,25 @@ fn rank_answer_snippets(
     let query_set: HashSet<&str> = query_tokens.iter().map(|s| s.as_str()).collect();
     let focus = query_tokens.last().cloned();
     let query_phrase = query_tokens.join(" ");
+    let normalized_question = normalize_source_text(question);
     let lower_question = question.to_lowercase();
     let definitional_question =
         lower_question.starts_with("what ") || lower_question.starts_with("who ");
     let functional_question =
         lower_question.starts_with("what does ") || lower_question.starts_with("what do ");
+    let mut token_frequency: HashMap<String, usize> = HashMap::new();
+    for snippet in snippets {
+        let snippet_tokens = if snippet.tokens.is_empty() {
+            tokenize_source_text(&snippet.text)
+        } else {
+            snippet.tokens.clone()
+        };
+        let snippet_set: HashSet<String> = snippet_tokens.into_iter().collect();
+        for token in snippet_set {
+            *token_frequency.entry(token).or_insert(0) += 1;
+        }
+    }
+    let rare_threshold = (snippets.len() / 3).max(1);
 
     let mut ranked = Vec::new();
     for snippet in snippets {
@@ -985,11 +1001,25 @@ fn rank_answer_snippets(
 
         let mut scored = snippet.clone();
         let mut score = overlap as f32 / query_set.len() as f32;
+        let rare_overlap = query_set
+            .iter()
+            .filter(|token| {
+                snippet_set.contains(**token)
+                    && token_frequency.get(**token).copied().unwrap_or(usize::MAX) <= rare_threshold
+            })
+            .count();
+        score += (rare_overlap as f32) * 0.05;
         let lower_snippet = if snippet.normalized_text.is_empty() {
             normalize_source_text(&snippet.text)
         } else {
             snippet.normalized_text.clone()
         };
+
+        if !normalized_question.is_empty() && lower_snippet.contains(&normalized_question) {
+            score += 0.25;
+        } else if query_phrase.len() > 3 && lower_snippet.contains(&query_phrase) {
+            score += 0.10;
+        }
 
         if let Some(focus) = &focus {
             let starts_with_definition = lower_snippet.starts_with(&format!("{} is ", focus))
@@ -1014,6 +1044,9 @@ fn rank_answer_snippets(
         let source_count_bonus = (snippet.source_neuron_count.min(10) as f32) * 0.01;
         let source_importance_bonus = snippet.source_importance.clamp(0.0, 1.0) * 0.05;
         score += source_count_bonus + source_importance_bonus;
+        if snippet_tokens.len() > 40 {
+            score -= ((snippet_tokens.len() - 40) as f32 * 0.005).min(0.20);
+        }
 
         scored.score = score;
         ranked.push(scored);
@@ -1094,13 +1127,60 @@ fn compose_local_answer(ranked: &[LocalEvidenceSnippet], options: AskOptions) ->
 
 fn read_persisted_source_snippets(
     brain_path: &Path,
+    question: &str,
+    options: AskOptions,
 ) -> Result<Vec<LocalEvidenceSnippet>, ManasError> {
     let store = SourceStore::load_from_file(&source_store_path(brain_path))?;
+    if store.chunk_count() == 0 {
+        return Ok(Vec::new());
+    }
+
+    match read_indexed_source_snippets(brain_path, &store, question, options) {
+        Ok(Some(snippets)) if !snippets.is_empty() => return Ok(snippets),
+        Ok(_) => {}
+        Err(e) => eprintln!("Warning: source index unavailable: {}", e),
+    }
+
     Ok(store
         .all_snippets()
         .into_iter()
         .map(LocalEvidenceSnippet::from)
         .collect())
+}
+
+fn read_indexed_source_snippets(
+    brain_path: &Path,
+    store: &SourceStore,
+    question: &str,
+    options: AskOptions,
+) -> Result<Option<Vec<LocalEvidenceSnippet>>, ManasError> {
+    let index_path = source_index_path(brain_path);
+    if !index_path.exists() {
+        return Ok(None);
+    }
+
+    let index = SourceIndex::load_from_file(&index_path)?;
+    if !index.is_fresh_for(store) {
+        return Ok(None);
+    }
+
+    let query_tokens = tokenize_source_text(question);
+    if query_tokens.is_empty() {
+        return Ok(None);
+    }
+
+    let candidate_limit = (options.top_k.max(1) * 8).max(20);
+    let snippets = index
+        .resolve_candidates(store, &query_tokens, candidate_limit)
+        .into_iter()
+        .map(LocalEvidenceSnippet::from)
+        .collect::<Vec<_>>();
+
+    if snippets.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(snippets))
+    }
 }
 
 fn answer_local_question(
@@ -1119,7 +1199,7 @@ fn answer_local_question(
     let brain = ManasBrain::new(brain_path);
     let network = brain.load()?;
 
-    match read_persisted_source_snippets(brain_path) {
+    match read_persisted_source_snippets(brain_path, question, options) {
         Ok(snippets) => {
             if !snippets.is_empty() {
                 let ranked = rank_answer_snippets(question, &snippets, options.top_k);
@@ -1446,6 +1526,8 @@ fn cmd_teach(input: &str, options: TeachOptions, brain_path: &Path) -> Result<()
     save_brain(&brain, &network, &trainer)?;
     seq_memory.save_to_file(&seq_path)?;
     source_store.save_to_file(&source_path)?;
+    let source_index = SourceIndex::build_from_store(&source_store);
+    source_index.save_to_file(&source_index_path(brain_path))?;
 
     print_teach_report(&report, options);
     Ok(())
@@ -1628,6 +1710,11 @@ fn source_memory_stats(brain_path: &Path) -> SourceMemoryStats {
     }
 }
 
+fn source_index_memory_stats(brain_path: &Path) -> SourceIndexStats {
+    let source_store = SourceStore::load_from_file(&source_store_path(brain_path)).ok();
+    source_index_stats(brain_path, source_store.as_ref())
+}
+
 /// `manas inspect [--verbose]`
 fn cmd_inspect(verbose: bool, brain_path: &Path) -> Result<(), ManasError> {
     let brain = ManasBrain::new(brain_path);
@@ -1665,6 +1752,7 @@ fn cmd_inspect(verbose: bool, brain_path: &Path) -> Result<(), ManasError> {
     let tf_bytes = file_size(&tf_path);
     let langmeta_bytes = file_size(&langmeta_path);
     let source_mem = source_memory_stats(brain_path);
+    let source_index = source_index_memory_stats(brain_path);
 
     // ── Sequence memory stats ───────────────────────────────────────
     let seq_entries = seq_bytes.and_then(|_| {
@@ -1862,11 +1950,16 @@ fn cmd_inspect(verbose: bool, brain_path: &Path) -> Result<(), ManasError> {
         Some(sz) => println!("  Source memory       : {}  ({})", sz, format_file_size(sz)),
         None => println!("  Source memory       : missing"),
     }
+    match source_index.bytes {
+        Some(sz) => println!("  Source index        : {}  ({})", sz, format_file_size(sz)),
+        None => println!("  Source index        : missing"),
+    }
     let total_storage = brain_sz
         + seq_bytes.unwrap_or(0)
         + tf_bytes.unwrap_or(0)
         + langmeta_bytes.unwrap_or(0)
-        + source_mem.bytes.unwrap_or(0);
+        + source_mem.bytes.unwrap_or(0)
+        + source_index.bytes.unwrap_or(0);
     println!(
         "  Total storage       : {}  ({})",
         total_storage,
@@ -1882,6 +1975,16 @@ fn cmd_inspect(verbose: bool, brain_path: &Path) -> Result<(), ManasError> {
         match source_mem.bytes {
             Some(sz) => println!("  Source file         : {}  ({})", sz, format_file_size(sz)),
             None => println!("  Source file         : missing"),
+        }
+
+        println!("\nSource index");
+        println!("{}", sub);
+        println!("  Index store         : {}", source_index.status.as_str());
+        println!("  Indexed tokens      : {}", source_index.indexed_tokens);
+        println!("  Indexed chunks      : {}", source_index.indexed_chunks);
+        match source_index.bytes {
+            Some(sz) => println!("  Index file          : {}  ({})", sz, format_file_size(sz)),
+            None => println!("  Index file          : missing"),
         }
     }
 
@@ -2911,6 +3014,7 @@ mod tests {
         assert!(!transformer_model_path(&brain).exists());
         assert!(!language_meta_path(&brain).exists());
         assert!(!source_store_path(&brain).exists());
+        assert!(!source_index_path(&brain).exists());
 
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2946,6 +3050,13 @@ mod tests {
         assert!(snippets[0].tokens.contains(&"local".to_string()));
         assert!(snippets[0].tokens.contains(&"first".to_string()));
         assert!(snippets[0].tokens.contains(&"rust".to_string()));
+
+        let index_path = source_index_path(&brain);
+        assert!(index_path.exists());
+        let index = SourceIndex::load_from_file(&index_path).unwrap();
+        assert!(index.is_fresh_for(&store));
+        assert_eq!(index.indexed_chunk_count(), 1);
+        assert!(!index.refs_for_token("manas").is_empty());
 
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2997,6 +3108,9 @@ mod tests {
         assert!(files.iter().any(|path| path.ends_with("goals.txt")));
         assert!(!files.iter().any(|path| path.ends_with("skip.rs")));
         assert!(!files.iter().any(|path| path.ends_with("empty.md")));
+        let index = SourceIndex::load_from_file(&source_index_path(&brain)).unwrap();
+        assert!(index.is_fresh_for(&store));
+        assert_eq!(index.indexed_chunk_count(), store.chunk_count());
 
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -3018,6 +3132,9 @@ mod tests {
         let store = SourceStore::load_from_file(&source_store_path(&brain)).unwrap();
         assert_eq!(store.entry_count(), 1);
         assert_eq!(store.chunk_count(), 1);
+        let index = SourceIndex::load_from_file(&source_index_path(&brain)).unwrap();
+        assert_eq!(index.indexed_chunk_count(), 1);
+        assert!(!index.refs_for_token("remembers").is_empty());
 
         std::fs::write(&file, "Manas updates changed source files safely.").unwrap();
         cmd_teach(file.to_str().unwrap(), default_teach_options(), &brain).unwrap();
@@ -3029,6 +3146,10 @@ mod tests {
             updated.all_snippets()[0].text,
             "Manas updates changed source files safely."
         );
+        let updated_index = SourceIndex::load_from_file(&source_index_path(&brain)).unwrap();
+        assert!(updated_index.is_fresh_for(&updated));
+        assert!(updated_index.refs_for_token("remembers").is_empty());
+        assert!(!updated_index.refs_for_token("updates").is_empty());
 
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -3126,6 +3247,52 @@ mod tests {
         assert_eq!(corrupt.status, "corrupt");
         assert_eq!(corrupt.entries, 0);
         assert_eq!(corrupt.chunks, 0);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inspect_source_index_stats_report_status_and_counts() {
+        let dir = temp_test_dir("inspect_source_index");
+        let brain = dir.join("brain.manas");
+
+        let missing = source_index_memory_stats(&brain);
+        assert_eq!(missing.status.as_str(), "missing");
+        assert_eq!(missing.indexed_tokens, 0);
+        assert_eq!(missing.indexed_chunks, 0);
+
+        let mut store = SourceStore::new();
+        store.upsert_teach_item(&TeachItem {
+            text: "Manas inspect reports source index.".to_string(),
+            source: Source::LocalFile {
+                path: "teach/index.md".to_string(),
+            },
+        });
+        store.save_to_file(&source_store_path(&brain)).unwrap();
+        let index_path = source_index_path(&brain);
+        SourceIndex::build_from_store(&store)
+            .save_to_file(&index_path)
+            .unwrap();
+
+        let enabled = source_index_memory_stats(&brain);
+        assert_eq!(enabled.status.as_str(), "enabled");
+        assert!(enabled.indexed_tokens > 0);
+        assert_eq!(enabled.indexed_chunks, 1);
+        assert!(enabled.bytes.unwrap() > 0);
+
+        store.upsert_teach_item(&TeachItem {
+            text: "Manas inspect reports stale source index.".to_string(),
+            source: Source::LocalFile {
+                path: "teach/index.md".to_string(),
+            },
+        });
+        store.save_to_file(&source_store_path(&brain)).unwrap();
+        let stale = source_index_memory_stats(&brain);
+        assert_eq!(stale.status.as_str(), "stale");
+
+        std::fs::write(&index_path, b"bad").unwrap();
+        let corrupt = source_index_memory_stats(&brain);
+        assert_eq!(corrupt.status.as_str(), "corrupt");
 
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -3385,11 +3552,92 @@ mod tests {
     }
 
     #[test]
+    fn ask_uses_fresh_source_index_candidates() {
+        let dir = temp_test_dir("ask_indexed_sources");
+        let brain = dir.join("brain.manas");
+        teach_identity_file(&dir, &brain);
+        let store = SourceStore::load_from_file(&source_store_path(&brain)).unwrap();
+
+        let snippets =
+            read_indexed_source_snippets(&brain, &store, "What is Manas?", default_ask_options())
+                .unwrap()
+                .unwrap();
+
+        assert!(!snippets.is_empty());
+        assert!(snippets.iter().any(|snippet| {
+            snippet
+                .text
+                .contains("local-first AI memory system written in Rust")
+        }));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn ask_falls_back_to_original_file_when_source_store_missing() {
         let dir = temp_test_dir("ask_missing_sources");
         let brain = dir.join("brain.manas");
         let file = teach_identity_file(&dir, &brain);
         std::fs::remove_file(source_store_path(&brain)).unwrap();
+
+        let report =
+            answer_local_question("What is Manas?", default_ask_options(), &brain).unwrap();
+
+        assert_eq!(report.kind, LocalAnswerKind::Answer);
+        assert_eq!(report.sources, vec![file.display().to_string()]);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ask_falls_back_to_source_scan_when_index_missing() {
+        let dir = temp_test_dir("ask_missing_index");
+        let brain = dir.join("brain.manas");
+        let file = teach_identity_file(&dir, &brain);
+        std::fs::remove_file(&file).unwrap();
+        std::fs::remove_file(source_index_path(&brain)).unwrap();
+
+        let report =
+            answer_local_question("What is Manas?", default_ask_options(), &brain).unwrap();
+
+        assert_eq!(report.kind, LocalAnswerKind::Answer);
+        assert_eq!(report.sources, vec![file.display().to_string()]);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ask_falls_back_to_source_scan_when_index_corrupt() {
+        let dir = temp_test_dir("ask_corrupt_index");
+        let brain = dir.join("brain.manas");
+        let file = teach_identity_file(&dir, &brain);
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(source_index_path(&brain), b"bad").unwrap();
+
+        let report =
+            answer_local_question("What is Manas?", default_ask_options(), &brain).unwrap();
+
+        assert_eq!(report.kind, LocalAnswerKind::Answer);
+        assert_eq!(report.sources, vec![file.display().to_string()]);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ask_falls_back_to_source_scan_when_index_stale() {
+        let dir = temp_test_dir("ask_stale_index");
+        let brain = dir.join("brain.manas");
+        let file = teach_identity_file(&dir, &brain);
+        std::fs::remove_file(&file).unwrap();
+
+        let mut store = SourceStore::load_from_file(&source_store_path(&brain)).unwrap();
+        store.upsert_teach_item(&TeachItem {
+            text: "Manas source memory changed after indexing.".to_string(),
+            source: Source::LocalFile {
+                path: "teach/changed.md".to_string(),
+            },
+        });
+        store.save_to_file(&source_store_path(&brain)).unwrap();
 
         let report =
             answer_local_question("What is Manas?", default_ask_options(), &brain).unwrap();
