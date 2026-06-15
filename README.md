@@ -243,6 +243,7 @@ Auto-detected from keywords in the text. Stale neurons trigger automatic interne
 ## Current Limitations
 
 - **Local answering is intentionally extractive** — `ask` re-reads taught local `.md`/`.txt` source files, ranks local snippets, and prefers direct source sentences over free generation
+- **Source text is not persisted yet** — v0.9.7 stores source paths, but `ask` still depends on the original local files existing; v0.9.8 plans `brain.manas.sources` for persisted source chunks
 - **Normal query remains the search/retrieval path** — use `ask` or `query --answer` for local source-backed answers
 - **Answer generation is basic** — local answering avoids unsupported claims and says when there is not enough local memory
 - **Next-token prediction is experimental** — v0.2 works for short contexts but is not trained on large corpora; generation quality is limited
@@ -271,6 +272,12 @@ A single file stores the entire brain:
 ```
 
 Append-only — new neurons are added without rewriting the whole file. Starts at ~1 KB, grows forever.
+
+Planned v0.9.8 sidecar:
+
+```txt
+brain.manas.sources      Persisted local source chunks for source-backed ask
+```
 
 ---
 

@@ -30,6 +30,7 @@ Manas is **not** trying to replace large hosted LLMs. It is a learning and resea
 | v0.9.5 | Reliability-aware transformer score weighting | Done |
 | v0.9.6 | Unified teaching command | Done |
 | v0.9.7 | Local query answering | Done |
+| v0.9.8 | Persistent source chunk store | Planned |
 
 ## Completed Milestones
 
@@ -589,6 +590,163 @@ Goal achieved:
 
 ## Next Milestones
 
+## v0.9.8 — Persistent Source Chunk Store
+
+### Goal
+
+Persist taught local source text and chunks into a dedicated local sidecar so `ask` can answer from taught evidence even when the original file is moved or deleted.
+
+Proposed sidecar:
+
+```txt
+brain.manas.sources
+```
+
+### Why This Is Needed
+
+Current v0.9.7 behavior:
+
+```txt
+manas teach teach/identity.md
+-> stores source path
+-> trains core memory, sequence memory, transformer
+-> ask reads teach/identity.md again for source-backed answer
+```
+
+This means source-backed answering still depends on the original local file remaining readable:
+
+```bash
+rm teach/identity.md
+manas ask "What is Manas?"
+```
+
+In that case, Manas may not have enough local source text to answer because `.manas` stores core memory and source metadata, not the full original source chunks.
+
+### Desired Behavior
+
+```txt
+manas teach teach/identity.md
+-> stores chunks from identity.md into brain.manas.sources
+-> trains core memory, sequence memory, transformer
+-> ask can answer from brain.manas.sources
+-> original file can be deleted or moved and answer still works
+```
+
+Example:
+
+```bash
+manas teach teach/identity.md --train-transformer
+rm teach/identity.md
+manas ask "What is Manas?"
+```
+
+Expected:
+
+```txt
+Answer
+  Manas is a local-first AI memory system written in Rust.
+
+Sources
+  - teach/identity.md
+```
+
+### Source Store Scope
+
+Each stored source entry should keep enough local evidence for retrieval and source display:
+
+```txt
+source id
+source path
+file fingerprint/hash
+file type
+chunk id
+chunk text
+created/updated time if available
+```
+
+Multiple taught files should accumulate in the same sidecar:
+
+```txt
+Source 1
+  path: teach/identity.md
+  chunks:
+    - Manas is a local-first AI memory system written in Rust.
+    - Manas is not a ChatGPT clone.
+
+Source 2
+  path: docs/base.md
+  chunks:
+    - ...
+
+Source 3
+  path: notes/project.txt
+  chunks:
+    - ...
+```
+
+New teaching should append or update source entries without deleting unrelated older sources.
+
+### Repeated Teaching
+
+Use a stable file fingerprint/hash:
+
+```txt
+same file + same content     -> do not duplicate chunks
+same file + changed content  -> update existing source chunks or create a new version safely
+new file                     -> add new source entry
+```
+
+### Storage Layout
+
+Future local storage:
+
+```txt
+brain.manas              -> core neurons + source metadata
+brain.manas.seq          -> sequence memory / token transitions
+brain.manas.transformer  -> transformer weights
+brain.manas.langmeta     -> language training metadata
+brain.manas.sources      -> persisted source chunks/text snippets
+```
+
+### Ask Behavior
+
+After v0.9.8, `ask` should prefer persisted chunks:
+
+```txt
+ask question
+-> search brain.manas.sources first
+-> fallback to existing source file path only if needed
+-> answer with sources
+```
+
+### Strict Non-Goals
+
+Do not change:
+
+- Transformer dimensions
+- Transformer sidecar version
+- Tokenizer
+- Training math
+- Attention architecture
+- Scoring weights
+- `teach` UX
+- `ask` UX
+
+Do not add:
+
+- External database
+- Vector database
+- Cloud APIs
+- External embeddings
+- PDF/DOCX support
+- Web crawling
+
+Goal:
+
+> Make local source-backed answering resilient after original taught files are moved or deleted.
+
+---
+
 ## v1.0 — Stable Mini Local Language Model Release
 
 This is the first stable language milestone.
@@ -764,5 +922,5 @@ Manas should continue following these principles:
 The next coding milestone is:
 
 ```text
-v1.0 — Stable Mini Local Language Model Release
+v0.9.8 — Persistent Source Chunk Store
 ```

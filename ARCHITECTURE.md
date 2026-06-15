@@ -1640,6 +1640,7 @@ manas inspect
 #   Sequence file       : 1,245,312  (1.19 MB)
 #   Transformer file    : 3,201,792  (3.05 MB)
 #   Language metadata   : 164,352    (160.50 KB)
+#   Source chunks       : planned v0.9.8 sidecar (brain.manas.sources)
 #   Total storage       : 14,048,640 (13.40 MB)
 #
 #  Total
