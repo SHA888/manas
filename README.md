@@ -243,7 +243,7 @@ Auto-detected from keywords in the text. Stale neurons trigger automatic interne
 ## Current Limitations
 
 - **Local answering is intentionally extractive** — `ask` re-reads taught local `.md`/`.txt` source files, ranks local snippets, and prefers direct source sentences over free generation
-- **Source text is not persisted yet** — v0.9.7 stores source paths, but `ask` still depends on the original local files existing; v0.9.8 plans `brain.manas.sources` for persisted source chunks
+- **AI-ready source memory is planned** — v0.9.7 stores source paths, but `ask` still depends on original local files existing; v0.9.8 plans `brain.manas.sources` with original chunk text, normalized searchable text, tokens, source paths, fingerprints, and metadata
 - **Normal query remains the search/retrieval path** — use `ask` or `query --answer` for local source-backed answers
 - **Answer generation is basic** — local answering avoids unsupported claims and says when there is not enough local memory
 - **Next-token prediction is experimental** — v0.2 works for short contexts but is not trained on large corpora; generation quality is limited
@@ -276,8 +276,28 @@ Append-only — new neurons are added without rewriting the whole file. Starts a
 Planned v0.9.8 sidecar:
 
 ```txt
-brain.manas.sources      Persisted local source chunks for source-backed ask
+brain.manas.sources      AI-ready persisted source memory for source-backed ask
 ```
+
+Planned v0.9.8 behavior:
+
+```bash
+manas teach teach/identity.md --train-transformer
+rm teach/identity.md
+manas ask "What is Manas?"
+```
+
+Expected:
+
+```txt
+Answer
+  Manas is a local-first AI memory system written in Rust.
+
+Sources
+  - teach/identity.md
+```
+
+The sidecar is planned to store original chunk text for answer output plus normalized text and token strings for local retrieval, without adding external embeddings, vector databases, or cloud APIs.
 
 ---
 

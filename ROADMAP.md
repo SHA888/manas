@@ -30,7 +30,7 @@ Manas is **not** trying to replace large hosted LLMs. It is a learning and resea
 | v0.9.5 | Reliability-aware transformer score weighting | Done |
 | v0.9.6 | Unified teaching command | Done |
 | v0.9.7 | Local query answering | Done |
-| v0.9.8 | Persistent source chunk store | Planned |
+| v0.9.8 | AI-ready persistent source memory | Planned |
 
 ## Completed Milestones
 
@@ -590,17 +590,19 @@ Goal achieved:
 
 ## Next Milestones
 
-## v0.9.8 — Persistent Source Chunk Store
+## v0.9.8 — AI-Ready Persistent Source Memory
 
 ### Goal
 
-Persist taught local source text and chunks into a dedicated local sidecar so `ask` can answer from taught evidence even when the original file is moved or deleted.
+Persist taught local source knowledge into an AI-ready sidecar so `ask` can answer from taught evidence even when the original file is moved or deleted.
 
 Proposed sidecar:
 
 ```txt
 brain.manas.sources
 ```
+
+This should not be only copied raw text. It should preserve source chunks in a structure useful for both human-readable answers and local AI/search/retrieval.
 
 ### Why This Is Needed
 
@@ -622,13 +624,15 @@ manas ask "What is Manas?"
 
 In that case, Manas may not have enough local source text to answer because `.manas` stores core memory and source metadata, not the full original source chunks.
 
+Raw text alone is also not enough for the next local answer path. Manas should persist each chunk with cleaned searchable text and token strings so local ranking can use the sidecar directly without reparsing source files.
+
 ### Desired Behavior
 
 ```txt
 manas teach teach/identity.md
--> stores chunks from identity.md into brain.manas.sources
+-> stores AI-ready chunks from identity.md into brain.manas.sources
 -> trains core memory, sequence memory, transformer
--> ask can answer from brain.manas.sources
+-> ask searches brain.manas.sources first
 -> original file can be deleted or moved and answer still works
 ```
 
@@ -650,38 +654,45 @@ Sources
   - teach/identity.md
 ```
 
-### Source Store Scope
+### Source Memory Scope
 
-Each stored source entry should keep enough local evidence for retrieval and source display:
+Each stored source entry should keep enough structured local evidence for retrieval, ranking, answer output, and source display:
 
 ```txt
-source id
-source path
-file fingerprint/hash
-file type
-chunk id
-chunk text
-created/updated time if available
+source entry:
+  source_id
+  source_kind: file/raw
+  source_path or label
+  file_type: md/txt/raw
+  fingerprint
+  created_at/updated_at if available
+  chunks[]
+
+chunk:
+  chunk_id
+  chunk_text
+  normalized_text
+  tokens: Vec<String>
+  chunk_fingerprint
 ```
 
 Multiple taught files should accumulate in the same sidecar:
 
 ```txt
-Source 1
-  path: teach/identity.md
-  chunks:
-    - Manas is a local-first AI memory system written in Rust.
-    - Manas is not a ChatGPT clone.
+Source: teach/identity.md
+  chunk_text: Manas is a local-first AI memory system written in Rust.
+  normalized_text: manas is a local first ai memory system written in rust
+  tokens: ["manas", "local", "first", "ai", "memory", "system", "rust"]
 
-Source 2
-  path: docs/base.md
-  chunks:
-    - ...
+Source: docs/base.md
+  chunk_text: ...
+  normalized_text: ...
+  tokens: [...]
 
-Source 3
-  path: notes/project.txt
-  chunks:
-    - ...
+Source: notes/project.txt
+  chunk_text: ...
+  normalized_text: ...
+  tokens: [...]
 ```
 
 New teaching should append or update source entries without deleting unrelated older sources.
@@ -692,9 +703,13 @@ Use a stable file fingerprint/hash:
 
 ```txt
 same file + same content     -> do not duplicate chunks
-same file + changed content  -> update existing source chunks or create a new version safely
+same file + changed content  -> update that source entry safely
 new file                     -> add new source entry
+same raw text                -> no duplicate
+different raw text           -> add new raw source entry
 ```
+
+Use stable deterministic fingerprinting, preferably FNV-1a 64-bit or another in-repo deterministic hash if no dependency is already available.
 
 ### Storage Layout
 
@@ -705,18 +720,21 @@ brain.manas              -> core neurons + source metadata
 brain.manas.seq          -> sequence memory / token transitions
 brain.manas.transformer  -> transformer weights
 brain.manas.langmeta     -> language training metadata
-brain.manas.sources      -> persisted source chunks/text snippets
+brain.manas.sources      -> AI-ready persisted source memory
 ```
+
+`brain.manas.sources` should store original chunk text, normalized searchable text, token strings, source paths, fingerprints, and metadata.
 
 ### Ask Behavior
 
-After v0.9.8, `ask` should prefer persisted chunks:
+After v0.9.8, `ask` and `query --answer` should prefer persisted source memory:
 
 ```txt
 ask question
--> search brain.manas.sources first
+-> search AI-ready source memory from brain.manas.sources first
 -> fallback to existing source file path only if needed
--> answer with sources
+-> answer using original chunk text
+-> show original source path
 ```
 
 ### Strict Non-Goals
@@ -731,6 +749,7 @@ Do not change:
 - Scoring weights
 - `teach` UX
 - `ask` UX
+- Normal `query` behavior
 
 Do not add:
 
@@ -738,12 +757,14 @@ Do not add:
 - Vector database
 - Cloud APIs
 - External embeddings
+- External LLMs
+- External ML frameworks
 - PDF/DOCX support
 - Web crawling
 
 Goal:
 
-> Make local source-backed answering resilient after original taught files are moved or deleted.
+> Persist source knowledge in a local AI-ready structure so source-backed answering survives deleted/moved files and can support better local retrieval.
 
 ---
 
@@ -922,5 +943,5 @@ Manas should continue following these principles:
 The next coding milestone is:
 
 ```text
-v0.9.8 — Persistent Source Chunk Store
+v0.9.8 — AI-Ready Persistent Source Memory
 ```
