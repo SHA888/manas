@@ -31,6 +31,7 @@ Manas is **not** trying to replace large hosted LLMs. It is a learning and resea
 | v0.9.6 | Unified teaching command | Done |
 | v0.9.7 | Local query answering | Done |
 | v0.9.8 | AI-ready persistent source memory | Done |
+| v0.9.9 | Source memory ranking + inverted index | Planned |
 
 ## Completed Milestones
 
@@ -764,6 +765,90 @@ Goal:
 
 ## Next Milestones
 
+## v0.9.9 — Source Memory Ranking + Inverted Index
+
+v0.9.8 made source memory persistent through `brain.manas.sources`. As taught files and chunks grow, `ask` should not rely only on scanning every stored chunk directly. v0.9.9 should add a small local search/ranking layer over persisted source memory.
+
+Planned sidecar:
+
+```txt
+brain.manas.sourceindex
+```
+
+`brain.manas.sources` stores chunks. `brain.manas.sourceindex` should map searchable tokens to source/chunk references so local answering can quickly collect candidate evidence before ranking.
+
+Example:
+
+```txt
+token: manas
+  -> teach/identity.md chunk 1
+  -> docs/base.md chunk 2
+
+token: memory
+  -> teach/identity.md chunk 1
+  -> docs/base.md chunk 1
+
+token: rust
+  -> teach/identity.md chunk 1
+```
+
+Planned storage layout:
+
+```txt
+brain.manas              -> core neurons + source metadata
+brain.manas.seq          -> sequence memory / token transitions
+brain.manas.transformer  -> transformer weights
+brain.manas.langmeta     -> language training metadata
+brain.manas.sources      -> AI-ready persisted source memory
+brain.manas.sourceindex  -> token-to-source/chunk inverted index
+```
+
+Planned ask/query-answer priority:
+
+```txt
+ask question
+-> use brain.manas.sourceindex if available
+-> retrieve candidate chunks from brain.manas.sources
+-> rank top-k evidence chunks
+-> produce answer from best source-backed evidence
+-> fallback to scanning brain.manas.sources if index is missing/corrupt
+-> fallback to original source files only if needed
+-> return existing no-answer message if no evidence exists
+```
+
+Scope:
+
+- Token-to-chunk inverted index
+- Faster local source retrieval
+- Better ranking using token overlap and source metadata
+- Top-k evidence selection
+- Source confidence score
+- Stale source/chunk detection
+- Index rebuild/refresh strategy
+- Safe fallback to scanning `brain.manas.sources` if the index is missing or corrupt
+- No behavior change to normal `query`
+
+Strict non-goals:
+
+- No vector database
+- No external embeddings
+- No cloud APIs
+- No external LLMs
+- No external ML frameworks
+- No PDF/DOCX support
+- No web crawling
+- No transformer architecture changes
+- No tokenizer changes
+- No training math changes
+- No `.manas`, `.seq`, `.transformer`, or `.langmeta` format changes
+- No normal `query` behavior changes
+
+Goal:
+
+> Make persisted source-memory retrieval faster and more reliable without leaving the local, custom, small-system design.
+
+---
+
 ## v1.0 — Stable Mini Local Language Model Release
 
 This is the first stable language milestone.
@@ -939,5 +1024,5 @@ Manas should continue following these principles:
 The next coding milestone is:
 
 ```text
-v1.0 — Stable Mini Local Language Model Release
+v0.9.9 — Source Memory Ranking + Inverted Index
 ```

@@ -245,6 +245,7 @@ Auto-detected from keywords in the text. Stale neurons trigger automatic interne
 
 - **Local answering is intentionally extractive** — `ask` searches persisted source memory first, falls back to taught local `.md`/`.txt` source files when needed, and prefers direct source chunks over free generation
 - **Source memory is intentionally small** — `brain.manas.sources` stores `.md`, `.txt`, and raw-text chunks with token strings, not embeddings, vector indexes, PDFs, DOCX files, or web crawls
+- **Source-memory search is still simple** — v0.9.9 plans `brain.manas.sourceindex`, a local token-to-source/chunk inverted index for faster top-k evidence retrieval and ranking
 - **Normal query remains the search/retrieval path** — use `ask` or `query --answer` for local source-backed answers
 - **Answer generation is basic** — local answering avoids unsupported claims and says when there is not enough local memory
 - **Next-token prediction is experimental** — v0.2 works for short contexts but is not trained on large corpora; generation quality is limited
@@ -278,6 +279,12 @@ Source memory sidecar (v0.9.8):
 
 ```txt
 brain.manas.sources      AI-ready persisted source memory for source-backed ask
+```
+
+Planned source-memory index (v0.9.9):
+
+```txt
+brain.manas.sourceindex  token-to-source/chunk inverted index for faster local evidence retrieval
 ```
 
 Deleted-file source answering:
