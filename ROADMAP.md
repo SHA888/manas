@@ -29,7 +29,7 @@ Manas is **not** trying to replace large hosted LLMs. It is a learning and resea
 | v0.9.4 | Attention training safety and metrics cleanup | Done |
 | v0.9.5 | Reliability-aware transformer score weighting | Done |
 | v0.9.6 | Unified teaching command | Done |
-| v0.9.7 | Local query answering | Planned |
+| v0.9.7 | Local query answering | Done |
 
 ## Completed Milestones
 
@@ -556,144 +556,38 @@ Goal achieved:
 
 ---
 
-## Next Milestones
+### v0.9.7 — Local Query Answering
 
-## v0.9.7 — Local Query Answering
+Manas can now answer simple questions from its own taught local source memory.
 
-### Goal
+Completed:
 
-Add local-first query answering so Manas can answer questions from its own local brain and source-aware memory.
+- `manas ask "question"` answers from local `.md` and `.txt` source evidence
+- `manas query "question" --answer` routes through the same local answer path
+- Normal `query` behavior remains unchanged unless `--answer` is passed
+- Local source paths are collected from `Source::LocalFile` metadata stored on neurons
+- Existing local source files are re-read, split into deterministic sentence snippets, ranked locally, and used for short extracted answers
+- Answers display source paths by default
+- Weak evidence reports related local sources without making an unsupported claim
+- Missing evidence prints `Not enough local memory to answer this yet.`
+- The answer path does not construct the agent search pipeline, call the internet, use cloud APIs, use external embeddings, or add ML dependencies
+- No transformer dimension change, sidecar version bump, tokenizer change, training math change, attention architecture change, scoring-weight change, or `teach` behavior change
 
-This milestone bridges:
-
-```txt
-source-aware retrieval
-+
-local language/generation path
-+
-source display
-```
-
-### Problem
-
-Current behavior:
-
-```txt
-teach    -> learns text/file/folder into core + sequence + transformer
-query    -> retrieves/searches core memory
-generate -> uses sequence/transformer generation
-```
-
-After teaching a file, generation can replay learned local text:
+Example:
 
 ```bash
 manas teach teach/identity.md --train-transformer
-manas generate "Manas is" --use-transformer
-```
-
-But local question answering is not yet available:
-
-```bash
-manas query "What is Manas?"
-```
-
-### Planned UX
-
-Preferred new command:
-
-```bash
 manas ask "What is Manas?"
-```
-
-Optional compatibility:
-
-```bash
 manas query "What is Manas?" --answer
 ```
 
-### Planned Pipeline
-
-```txt
-user question
--> retrieve relevant local memory/source snippets
--> build small local answer context
--> generate or compose a short answer from local evidence
--> show source paths
-```
-
-### Initial Scope
-
-- Retrieve relevant local memory/source snippets
-- Answer only when local evidence exists
-- Show source paths
-- If no evidence exists, say there is not enough local memory
-- Keep generated answers short
-- Avoid hallucinating beyond retrieved memory
-
-### Strict Rules
-
-Do not use:
-
-- Cloud APIs
-- Hosted LLMs
-- External embedding APIs
-- External ML frameworks
-
-Do not change:
-
-- Transformer dimensions
-- Transformer sidecar version
-- Tokenizer
-- Training math
-- Attention architecture
-- `teach` behavior
-
-### Example
-
-Given:
-
-```txt
-Manas is a local-first AI memory system written in Rust.
-Manas learns from text and files.
-Manas stores persistent memory in a .manas brain file.
-Manas uses custom transformer training.
-Manas is not a ChatGPT clone.
-```
-
-Run:
-
-```bash
-manas teach teach/identity.md --train-transformer
-manas ask "What is Manas?"
-```
-
-Expected:
-
-```txt
-Manas is a local-first AI memory system written in Rust.
-
-Sources:
-- teach/identity.md
-```
-
-### Tests
-
-Add tests for:
-
-- `ask` answers from taught `.md` file
-- Answer includes source path
-- No-answer case says not enough local memory
-- `query` retrieval still works without answer mode
-- `teach` + `ask` works together
-- Answer uses only local memory
-- No external calls are used
-- Source metadata is preserved
-
-### Goal
+Goal achieved:
 
 > Let Manas answer simple questions from taught local files with visible local sources.
 
 ---
+
+## Next Milestones
 
 ## v1.0 — Stable Mini Local Language Model Release
 
@@ -870,5 +764,5 @@ Manas should continue following these principles:
 The next coding milestone is:
 
 ```text
-v0.9.7 — Local Query Answering
+v1.0 — Stable Mini Local Language Model Release
 ```

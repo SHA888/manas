@@ -789,7 +789,7 @@ impl FreshnessChecker {
 
 ### 6.7 `manas-cli`
 
-The command line interface. The entry point for all user interaction. `teach` is the high-level local teaching path, while `learn`, `ingest`, and `train-language` remain lower-level commands for direct core memory, source-aware ingestion, and language/transformer training.
+The command line interface. The entry point for all user interaction. `teach` is the high-level local teaching path, and `ask` is the local source-backed answering path. `learn`, `ingest`, and `train-language` remain lower-level commands for direct core memory, source-aware ingestion, and language/transformer training. Normal `query` behavior remains the existing retrieval/search flow unless `--answer` routes it into the same local answer helper as `ask`.
 
 Full CLI reference is in [Section 17](#17-cli-reference).
 
@@ -911,6 +911,8 @@ inputs
 **v0.9.5** — transformer-assisted prediction now uses reliability-aware score weighting instead of the old fixed 0.25/0.40 blend. `TransformerPredictor` carries runtime metadata copied from `TransformerLanguageModel`: `ffn_trained`, `attention_projection_mask`, and `model_finite`. The base transformer weight is `0.15` for untrained cosine fallback, `0.30` for output-head-only, `0.35` for output head + FFN, `0.45` for attention `o`, `0.50` for attention `o,v`, and `0.55` for attention `o,v,q,k`. A simple confidence factor reduces transformer influence when top probability or top-1/top-2 margin is weak. Strong base-memory candidates cap transformer influence, learned sequence-memory candidates use a stricter cap to preserve exact transitions, and non-finite transformer state falls back to base memory/neural scores. `--transformer-only` remains pure transformer output. No tokenizer, sequence memory format, persistence format, sidecar version, training math, attention architecture, CLI default, or generation CLI behavior changes are included.
 
 **v0.9.6** — `manas teach <INPUT>` unifies local teaching UX without changing the underlying learning systems. Direct text teaching learns core memory and trains sequence memory; file/folder teaching preserves source paths while teaching core/source-aware memory, sequence memory, and optional transformer weights. The command supports `.md` and `.txt` files, recursively teaches folders with deterministic ordering, skips unsupported or empty files safely, and provides `--dry-run` without writing brain or sidecar files. Existing `learn`, `ingest`, and `train-language` commands remain available as lower-level controls. No tokenizer, sequence-memory format, transformer sidecar version, transformer dimensions, training math, scoring weight, attention architecture, generation behavior, or dependency change is included.
+
+**v0.9.7** — `manas ask "question"` adds local-first answering from taught source memory. The answer path loads the local brain, collects `Source::LocalFile` paths from neurons, re-reads existing `.md` and `.txt` files, splits them into deterministic sentence snippets, ranks snippets by local token overlap and source metadata, and returns a short extracted answer with source paths. If evidence is weak it reports related local memory without answering confidently; if evidence is missing it says there is not enough local memory. `manas query "question" --answer` uses the same helper, while normal `query` remains unchanged. No internet, cloud API, external embedding service, transformer sidecar change, tokenizer change, training math change, scoring-weight change, or teach behavior change is included.
 
 #### Single-Head Causal Attention (v0.4)
 
@@ -1353,7 +1355,32 @@ manas-store:
   append new neurons OR update existing neurons in .manas file
 ```
 
-### Answering a query
+### Answering from local source memory
+
+```
+manas ask "What is Manas?"
+          │
+          ▼
+manas-cli:
+  load local brain → collect Source::LocalFile paths from neurons
+          │
+          ▼
+local source reader:
+  re-read existing .md/.txt files → split into sentence snippets
+          │
+          ▼
+local ranker:
+  score snippets by question-token overlap + source metadata tie-breakers
+          │
+          ▼
+answer composer:
+  high-confidence sentence → short extracted answer + source paths
+  weak/no evidence → conservative no-answer message
+```
+
+This path is local-only. It does not construct the agent search pipeline, call web search, use hosted LLM APIs, or use external embedding services.
+
+### Existing query/search path
 
 ```
 manas query "What is ownership in Rust?"
@@ -1488,6 +1515,7 @@ No panics in library code. The CLI converts errors to user-friendly messages.
 | M25 | **Attention safety and metrics cleanup (v0.9.4)** — attention-specific safety counters, finite save guard, non-finite prediction-score filtering, rollback of output head/FFN/attention flags and projections, stable `o,v,q,k` reporting | `manas-language`, `manas-cli` | Attention training is safer and easier to debug |
 | M26 | **Reliability-aware transformer score weighting (v0.9.5)** — runtime reliability metadata, trained-projection weight tiers, confidence factor, sequence-memory cap, non-finite fallback to base scores, deterministic score sorting | `manas-language` | Transformer influence grows only when reliable |
 | M27 | **Unified teaching command (v0.9.6)** — `manas teach <INPUT>` orchestrates core/source-aware memory, sequence memory, optional transformer training, `.md`/`.txt` folder teaching, and dry-run reporting | `manas-cli` | One command teaches text, files, and folders |
+| M28 | **Local query answering (v0.9.7)** — `manas ask`, `query --answer`, local `.md`/`.txt` source snippet ranking, extracted answers, source display, and no-evidence fallback | `manas-cli` | Questions can be answered from taught local source memory |
 
 ---
 
@@ -1542,8 +1570,15 @@ manas generate "Rust is a" --use-transformer --max-tokens 10
 
 # ── QUERYING ──────────────────────────────────────────────────────
 
-# Ask a question
+# Answer from taught local source memory
+manas ask "What is Manas?"
+manas ask "What is Manas?" --top-k 5 --max-answer-tokens 80
+
+# Existing retrieval/search query
 manas query "What is ownership in Rust?"
+
+# Compatibility: use local answer path through query
+manas query "What is Manas?" --answer
 
 # Ask with forced freshness check
 manas query "Latest Rust version" --refresh

@@ -33,6 +33,9 @@ manas teach "Manas is written in Rust"
 manas teach ./notes.md --train-transformer
 manas teach ./my-notes/ --dry-run
 
+# Ask a local question from taught source memory
+manas ask "What is Manas?"
+
 # Low-level next-token training (v0.2)
 manas train-language "Rust is a systems programming language" --epochs 50
 
@@ -211,6 +214,7 @@ Auto-detected from keywords in the text. Stale neurons trigger automatic interne
 
 - **Learn from raw text** — tokenizes, embeds, forward pass, backprop, grows neurons as needed
 - **Unified teaching command (v0.9.6)** — `manas teach <INPUT>` teaches direct text, one `.md`/`.txt` file, or a folder through core/source-aware memory, sequence memory, and optional transformer training in one command
+- **Local query answering (v0.9.7)** — `manas ask "question"` answers from taught local `.md`/`.txt` source evidence, shows source paths, and says when there is not enough local memory. `manas query "question" --answer` uses the same local answer path while normal `query` remains unchanged.
 - **Ingest local files** — 7 format parsers (txt, md, json, html, csv, yaml, toml), folder walker, text chunking
 - **Persist state** — stores vocab, embeddings, neurons, and metadata in a single `.manas` file
 - **Source-aware growth** — grows a dedicated neuron per unique file or URL, retaining provenance
@@ -238,8 +242,9 @@ Auto-detected from keywords in the text. Stale neurons trigger automatic interne
 
 ## Current Limitations
 
-- **Query output is not local-first yet** — currently relies on web search rather than answering from the local network alone
-- **Answer generation is basic** — there is no generative text output; decoded tokens show the closest embeddings
+- **Local answering is intentionally extractive** — `ask` re-reads taught local `.md`/`.txt` source files, ranks local snippets, and prefers direct source sentences over free generation
+- **Normal query remains the search/retrieval path** — use `ask` or `query --answer` for local source-backed answers
+- **Answer generation is basic** — local answering avoids unsupported claims and says when there is not enough local memory
 - **Next-token prediction is experimental** — v0.2 works for short contexts but is not trained on large corpora; generation quality is limited
 - **Attention is experimental (v0.4/v0.9.5)** — single-head causal attention is implemented with forward-cache, persistence, partial `w_o`/`w_v`/`w_q`/`w_k` training, dedicated safety metrics, and reliability-aware hybrid weighting; multi-head attention, layer norm, and dynamic transformer growth are not implemented
 - **Transformer block is experimental (v0.5+)** — `TinyTransformerBlock` supports trained output-head, FFN, and single-head attention projection training, but it is still a tiny custom research block rather than a full LLM stack
@@ -302,7 +307,14 @@ manas generate "prompt"                  Generate text autoregressively
   --temperature 1.0                      Sampling temperature (reserved)
 
 # Querying
-manas query "question"                    Search web + learn + display results
+manas ask "question"                      Answer from taught local source memory (v0.9.7)
+  --top-k 5                              Number of local evidence snippets to rank
+  --max-answer-tokens 80                 Maximum answer length
+  --hide-sources                         Hide source list
+  --no-generate                          Disable guarded generation fallback
+  --use-transformer                      Allow transformer-backed fallback when evidence exists
+manas query "question"                    Existing search/retrieval behavior
+manas query "question" --answer           Use local answer path from ask
 manas refresh --category cat              Refresh stale knowledge from web
 
 # Inspection

@@ -11,7 +11,7 @@ use manas_language::{
 };
 use manas_learn::{Trainer, TrainerSnapshot, decode, detect_freshness_category};
 use manas_store::ManasBrain;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -65,6 +65,21 @@ enum Commands {
     },
     Query {
         text: String,
+        #[arg(long)]
+        answer: bool,
+    },
+    Ask {
+        text: String,
+        #[arg(long, default_value = "5")]
+        top_k: usize,
+        #[arg(long, default_value = "80")]
+        max_answer_tokens: usize,
+        #[arg(long)]
+        hide_sources: bool,
+        #[arg(long)]
+        no_generate: bool,
+        #[arg(long)]
+        use_transformer: bool,
     },
     Refresh {
         #[arg(long)]
@@ -195,7 +210,31 @@ fn main() {
             },
             &brain_path,
         ),
-        Commands::Query { text } => cmd_query(text, &brain_path),
+        Commands::Query { text, answer } => {
+            if *answer {
+                cmd_ask(text, AskOptions::default(), &brain_path)
+            } else {
+                cmd_query(text, &brain_path)
+            }
+        }
+        Commands::Ask {
+            text,
+            top_k,
+            max_answer_tokens,
+            hide_sources,
+            no_generate,
+            use_transformer,
+        } => cmd_ask(
+            text,
+            AskOptions {
+                top_k: *top_k,
+                max_answer_tokens: *max_answer_tokens,
+                show_sources: !hide_sources,
+                no_generate: *no_generate,
+                use_transformer: *use_transformer,
+            },
+            &brain_path,
+        ),
         Commands::Refresh { category } => cmd_refresh(category.as_deref(), &brain_path),
         Commands::Inspect { verbose } => cmd_inspect(*verbose, &brain_path),
         Commands::Files => cmd_files(&brain_path),
@@ -728,6 +767,358 @@ fn initial_teach_report(discovery: &TeachDiscovery, dry_run: bool) -> TeachRepor
     }
 }
 
+// ─── Local answer helpers ─────────────────────────────────────────────────────
+
+const DIRECT_ANSWER_THRESHOLD: f32 = 0.75;
+const WEAK_EVIDENCE_THRESHOLD: f32 = 0.25;
+
+#[derive(Clone, Copy, Debug)]
+struct AskOptions {
+    top_k: usize,
+    max_answer_tokens: usize,
+    show_sources: bool,
+    no_generate: bool,
+    use_transformer: bool,
+}
+
+impl Default for AskOptions {
+    fn default() -> Self {
+        Self {
+            top_k: 5,
+            max_answer_tokens: 80,
+            show_sources: true,
+            no_generate: false,
+            use_transformer: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LocalSourceCandidate {
+    path: String,
+    neuron_count: u32,
+    max_importance: f32,
+}
+
+#[derive(Clone, Debug)]
+struct LocalEvidenceSnippet {
+    text: String,
+    source: String,
+    score: f32,
+    source_neuron_count: u32,
+    source_importance: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LocalAnswerKind {
+    Answer,
+    WeakEvidence,
+    NoEvidence,
+}
+
+#[derive(Clone, Debug)]
+struct LocalAnswerReport {
+    kind: LocalAnswerKind,
+    answer: Option<String>,
+    sources: Vec<String>,
+}
+
+fn answer_stopwords() -> HashSet<&'static str> {
+    [
+        "a", "an", "and", "are", "as", "be", "by", "do", "does", "for", "from", "how", "i", "in",
+        "into", "is", "it", "of", "on", "or", "tell", "that", "the", "this", "to", "was", "what",
+        "when", "where", "which", "who", "why", "with",
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn answer_tokens(text: &str) -> Vec<String> {
+    let stopwords = answer_stopwords();
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+
+    for ch in text.to_lowercase().chars() {
+        if ch.is_alphanumeric() || ch == '-' || ch == '\'' {
+            current.push(ch);
+        } else if !current.is_empty() {
+            if !stopwords.contains(current.as_str()) {
+                tokens.push(current.clone());
+            }
+            current.clear();
+        }
+    }
+
+    if !current.is_empty() && !stopwords.contains(current.as_str()) {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn sentence_split(text: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut start = 0usize;
+
+    for (idx, ch) in text.char_indices() {
+        let next = text[idx + ch.len_utf8()..].chars().next();
+        let sentence_boundary = match ch {
+            '.' | '!' | '?' => next.is_none_or(|c| c.is_whitespace()),
+            '\n' | '\r' => true,
+            _ => false,
+        };
+
+        if sentence_boundary {
+            let end = if matches!(ch, '.' | '!' | '?') {
+                idx + ch.len_utf8()
+            } else {
+                idx
+            };
+            let sentence = text[start..end].trim();
+            if !sentence.is_empty() {
+                sentences.push(sentence.to_string());
+            }
+            start = idx + ch.len_utf8();
+        }
+    }
+
+    let rest = text[start..].trim();
+    if !rest.is_empty() {
+        sentences.push(rest.to_string());
+    }
+
+    sentences
+}
+
+fn collect_local_source_candidates(network: &Network) -> Vec<LocalSourceCandidate> {
+    let mut by_path: BTreeMap<String, (u32, f32)> = BTreeMap::new();
+
+    for (_, neuron) in network.all_neurons() {
+        if let Source::LocalFile { path } = &neuron.source {
+            let entry = by_path.entry(path.clone()).or_insert((0, 0.0));
+            entry.0 += 1;
+            entry.1 = entry.1.max(neuron.importance_score);
+        }
+    }
+
+    by_path
+        .into_iter()
+        .map(
+            |(path, (neuron_count, max_importance))| LocalSourceCandidate {
+                path,
+                neuron_count,
+                max_importance,
+            },
+        )
+        .collect()
+}
+
+fn read_source_snippets(candidates: &[LocalSourceCandidate]) -> Vec<LocalEvidenceSnippet> {
+    let mut snippets = Vec::new();
+
+    for candidate in candidates {
+        let path = Path::new(&candidate.path);
+        if !path.exists() || !teach_supported_file(path) {
+            continue;
+        }
+
+        let text = match read_teach_file(path) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+
+        for sentence in sentence_split(&text) {
+            if !sentence.trim().is_empty() {
+                snippets.push(LocalEvidenceSnippet {
+                    text: sentence,
+                    source: candidate.path.clone(),
+                    score: 0.0,
+                    source_neuron_count: candidate.neuron_count,
+                    source_importance: candidate.max_importance,
+                });
+            }
+        }
+    }
+
+    snippets
+}
+
+fn rank_answer_snippets(
+    question: &str,
+    snippets: &[LocalEvidenceSnippet],
+    top_k: usize,
+) -> Vec<LocalEvidenceSnippet> {
+    let query_tokens = answer_tokens(question);
+    if query_tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let query_set: HashSet<&str> = query_tokens.iter().map(|s| s.as_str()).collect();
+    let focus = query_tokens.last().cloned();
+    let lower_question = question.to_lowercase();
+    let definitional_question =
+        lower_question.starts_with("what ") || lower_question.starts_with("who ");
+
+    let mut ranked = Vec::new();
+    for snippet in snippets {
+        let snippet_tokens = answer_tokens(&snippet.text);
+        if snippet_tokens.is_empty() {
+            continue;
+        }
+        let snippet_set: HashSet<&str> = snippet_tokens.iter().map(|s| s.as_str()).collect();
+        let overlap = query_set
+            .iter()
+            .filter(|token| snippet_set.contains(**token))
+            .count();
+
+        if overlap == 0 {
+            continue;
+        }
+
+        let mut scored = snippet.clone();
+        let mut score = overlap as f32 / query_set.len() as f32;
+        let lower_snippet = snippet.text.to_lowercase();
+
+        if let Some(focus) = &focus {
+            let starts_with_definition = lower_snippet.starts_with(&format!("{} is ", focus))
+                || lower_snippet.starts_with(&format!("{} are ", focus));
+            if starts_with_definition {
+                score += 0.60;
+            }
+            if definitional_question && lower_snippet.starts_with(&format!("{} is not ", focus)) {
+                score -= 0.25;
+            }
+        }
+
+        let source_count_bonus = (snippet.source_neuron_count.min(10) as f32) * 0.01;
+        let source_importance_bonus = snippet.source_importance.clamp(0.0, 1.0) * 0.05;
+        score += source_count_bonus + source_importance_bonus;
+
+        scored.score = score;
+        ranked.push(scored);
+    }
+
+    ranked.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.source.cmp(&b.source))
+            .then_with(|| a.text.cmp(&b.text))
+    });
+    ranked.truncate(top_k.max(1));
+    ranked
+}
+
+fn truncate_answer_tokens(answer: &str, max_tokens: usize) -> String {
+    if max_tokens == 0 {
+        return String::new();
+    }
+
+    let parts: Vec<&str> = answer.split_whitespace().collect();
+    if parts.len() <= max_tokens {
+        answer.to_string()
+    } else {
+        format!("{}...", parts[..max_tokens].join(" "))
+    }
+}
+
+fn unique_sources(snippets: &[LocalEvidenceSnippet]) -> Vec<String> {
+    let mut sources = Vec::new();
+    for snippet in snippets {
+        if !sources.contains(&snippet.source) {
+            sources.push(snippet.source.clone());
+        }
+    }
+    sources
+}
+
+fn compose_local_answer(ranked: &[LocalEvidenceSnippet], options: AskOptions) -> LocalAnswerReport {
+    let _generation_requested = options.use_transformer && !options.no_generate;
+
+    if ranked.is_empty() {
+        return LocalAnswerReport {
+            kind: LocalAnswerKind::NoEvidence,
+            answer: None,
+            sources: Vec::new(),
+        };
+    }
+
+    let best = &ranked[0];
+    let sources = unique_sources(ranked);
+    if best.score >= DIRECT_ANSWER_THRESHOLD {
+        return LocalAnswerReport {
+            kind: LocalAnswerKind::Answer,
+            answer: Some(truncate_answer_tokens(
+                &best.text,
+                options.max_answer_tokens,
+            )),
+            sources,
+        };
+    }
+
+    if best.score >= WEAK_EVIDENCE_THRESHOLD {
+        return LocalAnswerReport {
+            kind: LocalAnswerKind::WeakEvidence,
+            answer: None,
+            sources,
+        };
+    }
+
+    LocalAnswerReport {
+        kind: LocalAnswerKind::NoEvidence,
+        answer: None,
+        sources: Vec::new(),
+    }
+}
+
+fn answer_local_question(
+    question: &str,
+    options: AskOptions,
+    brain_path: &Path,
+) -> Result<LocalAnswerReport, ManasError> {
+    if question.trim().is_empty() || !brain_path.exists() {
+        return Ok(LocalAnswerReport {
+            kind: LocalAnswerKind::NoEvidence,
+            answer: None,
+            sources: Vec::new(),
+        });
+    }
+
+    let brain = ManasBrain::new(brain_path);
+    let network = brain.load()?;
+    let candidates = collect_local_source_candidates(&network);
+    let snippets = read_source_snippets(&candidates);
+    let ranked = rank_answer_snippets(question, &snippets, options.top_k);
+    Ok(compose_local_answer(&ranked, options))
+}
+
+fn format_local_answer_report(report: &LocalAnswerReport, show_sources: bool) -> String {
+    match report.kind {
+        LocalAnswerKind::Answer => {
+            let mut out = format!("Answer\n  {}", report.answer.as_deref().unwrap_or_default());
+            if show_sources && !report.sources.is_empty() {
+                out.push_str("\n\nSources");
+                for source in &report.sources {
+                    out.push_str(&format!("\n  - {}", source));
+                }
+            }
+            out
+        }
+        LocalAnswerKind::WeakEvidence => {
+            let mut out =
+                "I found related local memory, but not enough to answer confidently.".to_string();
+            if show_sources && !report.sources.is_empty() {
+                out.push_str("\n\nSources");
+                for source in &report.sources {
+                    out.push_str(&format!("\n  - {}", source));
+                }
+            }
+            out
+        }
+        LocalAnswerKind::NoEvidence => "Not enough local memory to answer this yet.".to_string(),
+    }
+}
+
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
 /// `manas learn "some text"`
@@ -1000,6 +1391,16 @@ fn cmd_teach(input: &str, options: TeachOptions, brain_path: &Path) -> Result<()
     seq_memory.save_to_file(&seq_path)?;
 
     print_teach_report(&report, options);
+    Ok(())
+}
+
+/// `manas ask "question"`
+fn cmd_ask(question: &str, options: AskOptions, brain_path: &Path) -> Result<(), ManasError> {
+    let report = answer_local_question(question, options, brain_path)?;
+    println!(
+        "{}",
+        format_local_answer_report(&report, options.show_sources)
+    );
     Ok(())
 }
 
@@ -2185,6 +2586,27 @@ mod tests {
         }
     }
 
+    fn default_ask_options() -> AskOptions {
+        AskOptions::default()
+    }
+
+    fn teach_identity_file(dir: &Path, brain: &Path) -> PathBuf {
+        let teach_dir = dir.join("teach");
+        std::fs::create_dir_all(&teach_dir).unwrap();
+        let file = teach_dir.join("identity.md");
+        std::fs::write(
+            &file,
+            "Manas is a local-first AI memory system written in Rust.\n\
+             Manas learns from text and files.\n\
+             Manas stores persistent memory in a .manas brain file.\n\
+             Manas uses custom transformer training.\n\
+             Manas is not a ChatGPT clone.\n",
+        )
+        .unwrap();
+        cmd_teach(file.to_str().unwrap(), default_teach_options(), brain).unwrap();
+        file
+    }
+
     #[test]
     fn format_file_size_bytes() {
         assert_eq!(format_file_size(0), "0 B");
@@ -2522,6 +2944,223 @@ mod tests {
             "unexpected generated text: {}",
             generated
         );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ask_answers_from_taught_md_file() {
+        let dir = temp_test_dir("ask_md");
+        let brain = dir.join("brain.manas");
+        let file = teach_identity_file(&dir, &brain);
+
+        let report =
+            answer_local_question("What is Manas?", default_ask_options(), &brain).unwrap();
+
+        assert_eq!(report.kind, LocalAnswerKind::Answer);
+        assert_eq!(
+            report.answer.as_deref(),
+            Some("Manas is a local-first AI memory system written in Rust.")
+        );
+        assert_eq!(report.sources, vec![file.display().to_string()]);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ask_answer_includes_source_path() {
+        let dir = temp_test_dir("ask_source");
+        let brain = dir.join("brain.manas");
+        let file = teach_identity_file(&dir, &brain);
+
+        let report =
+            answer_local_question("What is Manas?", default_ask_options(), &brain).unwrap();
+        let formatted = format_local_answer_report(&report, true);
+
+        assert!(formatted.contains("Sources"));
+        assert!(formatted.contains(&file.display().to_string()));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ask_not_enough_memory_without_evidence() {
+        let dir = temp_test_dir("ask_no_evidence");
+        let brain = dir.join("brain.manas");
+        teach_identity_file(&dir, &brain);
+
+        let report =
+            answer_local_question("What is Kubernetes?", default_ask_options(), &brain).unwrap();
+        let formatted = format_local_answer_report(&report, true);
+
+        assert_eq!(report.kind, LocalAnswerKind::NoEvidence);
+        assert_eq!(formatted, "Not enough local memory to answer this yet.");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ask_empty_brain_no_panic() {
+        let dir = temp_test_dir("ask_empty_brain");
+        let brain = dir.join("brain.manas");
+        ManasBrain::new(brain.clone())
+            .save(&Network::new())
+            .unwrap();
+
+        let report =
+            answer_local_question("What is Manas?", default_ask_options(), &brain).unwrap();
+
+        assert_eq!(report.kind, LocalAnswerKind::NoEvidence);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ask_missing_sidecars_no_panic() {
+        let dir = temp_test_dir("ask_missing_sidecars");
+        let brain = dir.join("brain.manas");
+        teach_identity_file(&dir, &brain);
+        let _ = std::fs::remove_file(seq_memory_path(&brain));
+        let _ = std::fs::remove_file(transformer_model_path(&brain));
+        let _ = std::fs::remove_file(language_meta_path(&brain));
+
+        let report =
+            answer_local_question("What is Manas?", default_ask_options(), &brain).unwrap();
+
+        assert_eq!(report.kind, LocalAnswerKind::Answer);
+        assert_eq!(
+            report.answer.as_deref(),
+            Some("Manas is a local-first AI memory system written in Rust.")
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ask_without_transformer_uses_extractive_memory() {
+        let dir = temp_test_dir("ask_no_transformer");
+        let brain = dir.join("brain.manas");
+        teach_identity_file(&dir, &brain);
+
+        assert!(!transformer_model_path(&brain).exists());
+        let report =
+            answer_local_question("Is Manas a ChatGPT clone?", default_ask_options(), &brain)
+                .unwrap();
+
+        assert_eq!(report.kind, LocalAnswerKind::Answer);
+        assert_eq!(
+            report.answer.as_deref(),
+            Some("Manas is not a ChatGPT clone.")
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ask_unrelated_question_does_not_use_wrong_memory() {
+        let dir = temp_test_dir("ask_unrelated");
+        let brain = dir.join("brain.manas");
+        teach_identity_file(&dir, &brain);
+
+        let report =
+            answer_local_question("What is Kubernetes?", default_ask_options(), &brain).unwrap();
+
+        assert_eq!(report.kind, LocalAnswerKind::NoEvidence);
+        assert!(report.answer.is_none());
+        assert!(report.sources.is_empty());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ask_answer_remains_short() {
+        let dir = temp_test_dir("ask_short");
+        let brain = dir.join("brain.manas");
+        let file = dir.join("identity.md");
+        std::fs::write(
+            &file,
+            "Manas is a local-first AI memory system written in Rust with custom local learning, source-aware memory, sequence training, and transformer-assisted prediction.",
+        )
+        .unwrap();
+        cmd_teach(file.to_str().unwrap(), default_teach_options(), &brain).unwrap();
+
+        let mut options = default_ask_options();
+        options.max_answer_tokens = 5;
+        let report = answer_local_question("What is Manas?", options, &brain).unwrap();
+
+        assert_eq!(report.kind, LocalAnswerKind::Answer);
+        assert!(report.answer.as_ref().unwrap().split_whitespace().count() <= 5);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn query_without_answer_keeps_existing_mode() {
+        let cli = Cli::try_parse_from(["manas", "query", "local-first"]).unwrap();
+        match cli.command {
+            Commands::Query { answer, .. } => assert!(!answer),
+            _ => panic!("expected query command"),
+        }
+    }
+
+    #[test]
+    fn query_answer_uses_local_answer_path() {
+        let cli = Cli::try_parse_from(["manas", "query", "What is Manas?", "--answer"]).unwrap();
+        match cli.command {
+            Commands::Query { text, answer } => {
+                assert!(answer);
+                assert_eq!(text, "What is Manas?");
+            }
+            _ => panic!("expected query command"),
+        }
+    }
+
+    #[test]
+    fn teach_then_ask_works_together() {
+        let dir = temp_test_dir("teach_ask");
+        let brain = dir.join("brain.manas");
+        teach_identity_file(&dir, &brain);
+
+        let report =
+            answer_local_question("What is Manas?", default_ask_options(), &brain).unwrap();
+
+        assert_eq!(report.kind, LocalAnswerKind::Answer);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ask_local_answer_path_does_not_need_agent_pipeline() {
+        let dir = temp_test_dir("ask_local_only");
+        let brain = dir.join("brain.manas");
+        teach_identity_file(&dir, &brain);
+
+        let mut options = default_ask_options();
+        options.use_transformer = true;
+        let report = answer_local_question("What is Manas?", options, &brain).unwrap();
+
+        assert_eq!(report.kind, LocalAnswerKind::Answer);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn source_metadata_preserved_for_answer_sources() {
+        let dir = temp_test_dir("ask_source_metadata");
+        let brain = dir.join("brain.manas");
+        let file = teach_identity_file(&dir, &brain);
+
+        let network = ManasBrain::new(brain.clone()).load().unwrap();
+        let candidates = collect_local_source_candidates(&network);
+        let report =
+            answer_local_question("What is Manas?", default_ask_options(), &brain).unwrap();
+
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.path == file.display().to_string())
+        );
+        assert_eq!(report.sources, vec![file.display().to_string()]);
 
         std::fs::remove_dir_all(dir).unwrap();
     }
