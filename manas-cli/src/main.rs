@@ -29,143 +29,213 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    #[arg(short = 'b', long, default_value = "./brain.manas", global = true)]
+    #[arg(
+        short = 'b',
+        long,
+        default_value = "./brain.manas",
+        global = true,
+        help = "Path to the brain file to read from and write to"
+    )]
     brain: String,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Learn from raw text and store it in the brain
     Learn {
+        /// Text to learn from
         text: String,
     },
+    /// Ingest knowledge from a file, folder, or web page
     Ingest {
-        #[arg(long)]
+        #[arg(long, help = "Learn from a single file")]
         file: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Learn from a folder, recursively")]
         folder: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Learn from a web page URL")]
         url: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Preview what would be ingested without saving")]
         dry_run: bool,
     },
+    /// Teach from text, a file, or a folder (unified teaching command)
     Teach {
+        /// Text, file path, or folder path to teach from
         input: String,
-        #[arg(long, default_value = "5")]
+        #[arg(long, default_value = "5", help = "Sliding context window size")]
         max_context: usize,
-        #[arg(long, default_value = "10")]
+        #[arg(long, default_value = "10", help = "Number of training epochs")]
         epochs: usize,
-        #[arg(long, default_value = "0.05")]
+        #[arg(long, default_value = "0.05", help = "Language learning rate")]
         learning_rate: f32,
-        #[arg(long)]
+        #[arg(long, help = "Also train the transformer from the taught text")]
         train_transformer: bool,
-        #[arg(long, default_value = "0.01")]
+        #[arg(long, default_value = "0.01", help = "Transformer learning rate")]
         transformer_learning_rate: f32,
-        #[arg(long, default_value = "5.0")]
+        #[arg(
+            long,
+            default_value = "5.0",
+            help = "Gradient clipping threshold for transformer training"
+        )]
         transformer_max_grad_norm: f32,
-        #[arg(long, default_value = "50.0")]
+        #[arg(
+            long,
+            default_value = "50.0",
+            help = "Maximum allowed transformer loss before a step is rejected"
+        )]
         transformer_max_loss: f32,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Keep unstable transformer updates instead of rolling back"
+        )]
         no_transformer_rollback: bool,
-        #[arg(long)]
+        #[arg(long, help = "Preview teaching without saving")]
         dry_run: bool,
     },
+    /// Search the web for an answer (use --answer for local source memory)
     Query {
+        /// Question or search query
         text: String,
-        #[arg(long)]
+        #[arg(long, help = "Answer from local source memory instead of web search")]
         answer: bool,
     },
+    /// Answer a question from taught local source memory, with citations
     Ask {
+        /// Question to answer
         text: String,
-        #[arg(long, default_value = "5")]
+        #[arg(
+            long,
+            default_value = "5",
+            help = "Number of local evidence snippets to rank"
+        )]
         top_k: usize,
-        #[arg(long, default_value = "80")]
+        #[arg(long, default_value = "80", help = "Maximum answer length in tokens")]
         max_answer_tokens: usize,
-        #[arg(long)]
+        #[arg(long, help = "Hide the list of sources from the answer")]
         hide_sources: bool,
-        #[arg(long)]
+        #[arg(long, help = "Disable guarded generation fallback")]
         no_generate: bool,
-        #[arg(long)]
+        #[arg(long, help = "Allow transformer-backed fallback when evidence exists")]
         use_transformer: bool,
     },
+    /// Refresh stale knowledge from the web
     Refresh {
-        #[arg(long)]
+        #[arg(long, help = "Only refresh sources in this freshness category")]
         category: Option<String>,
     },
+    /// Show brain statistics and full system state
     Inspect {
-        #[arg(long)]
+        #[arg(long, help = "Show extended verbose output")]
         verbose: bool,
     },
+    /// List the files that have been ingested into the brain
     Files,
+    /// Show activated neurons and decoded keywords for a topic
     Trace {
+        /// Topic or text to trace through the network
         text: String,
     },
+    /// Export the brain to a file
     Export {
-        #[arg(long)]
+        #[arg(long, help = "Output file path (defaults to a generated name)")]
         out: Option<String>,
     },
+    /// Import a brain from a file
     Import {
-        #[arg(long)]
+        #[arg(long, help = "Path to the brain file to import")]
         file: String,
     },
+    /// Check brain file integrity
     Verify,
+    /// List neurons and their metadata
     Neurons {
-        #[arg(long)]
+        #[arg(long, help = "List all neurons, including archived ones")]
         all: bool,
     },
+    /// Restore archived neurons
     Restore {
-        #[arg(long)]
+        #[arg(long, help = "Restore all archived neurons")]
         all: bool,
     },
+    /// Set the freshness category for a topic
     Tag {
+        /// Topic or text to tag
         text: String,
-        #[arg(long)]
+        #[arg(long, help = "Freshness category to assign")]
         freshness: String,
     },
+    /// Train next-token language prediction from text
     TrainLanguage {
+        /// Text to train on
         text: String,
-        #[arg(long, default_value = "5")]
+        #[arg(long, default_value = "5", help = "Sliding context window size")]
         max_context: usize,
-        #[arg(long, default_value = "10")]
+        #[arg(long, default_value = "10", help = "Number of training epochs")]
         epochs: usize,
-        #[arg(long, default_value = "0.05")]
+        #[arg(long, default_value = "0.05", help = "Language learning rate")]
         learning_rate: f32,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Also train the transformer output head, FFN, and attention"
+        )]
         train_transformer: bool,
-        #[arg(long, default_value = "0.01")]
+        #[arg(long, default_value = "0.01", help = "Transformer learning rate")]
         transformer_learning_rate: f32,
-        #[arg(long, default_value = "10")]
+        #[arg(long, default_value = "10", help = "Maximum new neurons to grow")]
         max_new_neurons: usize,
-        #[arg(long)]
+        #[arg(long, help = "Disable all neuron growth")]
         no_grow: bool,
-        #[arg(long, default_value = "5.0")]
+        #[arg(
+            long,
+            default_value = "5.0",
+            help = "Gradient clipping threshold for transformer training"
+        )]
         transformer_max_grad_norm: f32,
-        #[arg(long, default_value = "50.0")]
+        #[arg(
+            long,
+            default_value = "50.0",
+            help = "Maximum allowed transformer loss before a step is rejected"
+        )]
         transformer_max_loss: f32,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Keep unstable transformer updates instead of rolling back"
+        )]
         no_transformer_rollback: bool,
     },
+    /// Predict the next token(s) for a given context
     PredictNext {
+        /// Context text to predict from
         text: String,
-        #[arg(long, default_value = "5")]
+        #[arg(long, default_value = "5", help = "Context window size")]
         max_context: usize,
-        #[arg(long, default_value = "10")]
+        #[arg(
+            long,
+            default_value = "10",
+            help = "Number of candidate tokens to show"
+        )]
         top_k: usize,
-        #[arg(long)]
+        #[arg(long, help = "Blend transformer predictions with the base model")]
         use_transformer: bool,
-        #[arg(long)]
+        #[arg(long, help = "Predict using only the transformer")]
         transformer_only: bool,
     },
+    /// Generate text autoregressively from a prompt
     Generate {
+        /// Prompt to generate from
         prompt: String,
-        #[arg(long, default_value = "20")]
+        #[arg(long, default_value = "20", help = "Number of tokens to generate")]
         max_tokens: usize,
-        #[arg(long, default_value = "5")]
+        #[arg(long, default_value = "5", help = "Context window size")]
         max_context: usize,
-        #[arg(long, default_value = "1")]
+        #[arg(
+            long,
+            default_value = "1",
+            help = "Candidates considered per step (top-1 is deterministic)"
+        )]
         top_k: usize,
-        #[arg(long, default_value = "1.0")]
+        #[arg(long, default_value = "1.0", help = "Sampling temperature (reserved)")]
         temperature: f32,
-        #[arg(long)]
+        #[arg(long, help = "Generate using the transformer path")]
         use_transformer: bool,
     },
 }
