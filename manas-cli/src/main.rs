@@ -1543,6 +1543,18 @@ fn cmd_ask(question: &str, options: AskOptions, brain_path: &Path) -> Result<(),
     Ok(())
 }
 
+/// Print a friendly, actionable message when a web-backed command cannot
+/// reach the internet.
+///
+/// `query` and `refresh` depend on web access. When a request fails because
+/// the network is unavailable, the raw transport error (for example
+/// `error sending request for url (...)`) is not actionable, so explain the
+/// cause instead.
+fn report_offline() {
+    println!("Could not reach the web — this command needs an internet connection.");
+    println!("Please check your network connection and try again.");
+}
+
 /// `manas query "question"`
 fn cmd_query(text: &str, brain_path: &Path) -> Result<(), ManasError> {
     let agent = AgentPipeline::new();
@@ -1552,7 +1564,18 @@ fn cmd_query(text: &str, brain_path: &Path) -> Result<(), ManasError> {
     restore_trainer_from_brain(&mut trainer, &brain);
 
     let freshness_cat = detect_freshness_category(text);
-    let results = agent.search(text)?;
+    let results = match agent.search(text) {
+        Ok(results) => results,
+        Err(ManasError::NetworkError(_)) => {
+            report_offline();
+            println!(
+                "To answer from your local taught memory instead, try: manas ask \"{}\"",
+                text
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
 
     if results.is_empty() {
         println!("No search results for: {}", text);
@@ -1635,7 +1658,14 @@ fn cmd_refresh(category: Option<&str>, brain_path: &Path) -> Result<(), ManasErr
     println!("Found {} stale neuron(s)", stale_ids.len());
 
     let search_query = category.unwrap_or("latest updates");
-    let results = agent.search(search_query)?;
+    let results = match agent.search(search_query) {
+        Ok(results) => results,
+        Err(ManasError::NetworkError(_)) => {
+            report_offline();
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     if results.is_empty() {
         println!("No search results to refresh with");
         return Ok(());
