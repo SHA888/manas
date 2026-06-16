@@ -22,62 +22,146 @@
 
 ---
 
-## Quick Start
+## Installation
+
+### Linux: one-command install
 
 ```bash
-# Learn from text
-manas learn "Rust is a systems programming language with zero-cost abstractions"
-
-# Train next-token prediction (v0.2)
-manas train-language "Rust is a systems programming language" --epochs 50
-
-# Train next-token prediction with transformer output head + FFN + attention w_o/w_v/w_q/w_k (v0.7-v0.9.5)
-manas train-language "Rust is a systems programming language" --epochs 50 --train-transformer
-
-# Train with growth control (v0.7.1) — cap new neurons, or disable growth entirely
-manas train-language "Rust is a systems programming language" --epochs 50 --max-new-neurons 5
-manas train-language "Duplicate text" --epochs 50 --no-grow
-
-# Predict the next word (default: hybrid memory + neural)
-manas predict-next "Rust is a" --top-k 5
-
-# Predict next word with experimental transformer assistance (v0.6)
-manas predict-next "Rust is a" --use-transformer --top-k 5
-
-# Generate text (autoregressive, default: stable v0.3)
-manas generate "Rust is a" --max-tokens 10
-
-# Generate text with experimental transformer assistance (v0.6)
-manas generate "Rust is a" --use-transformer --max-tokens 10
-
-# Learn from files and folders
-manas ingest --folder ./my-notes/
-manas ingest --file ./article.md
-
-# Learn from the internet
-manas ingest --url https://doc.rust-lang.org/book/
-
-# Query the web and learn automatically
-manas query "latest Rust version features"
-
-# See brain statistics
-manas inspect
-
-# Keep knowledge fresh
-manas refresh --category fast
-
-# List all ingested files
-manas files
-
-# Show activated neurons + decoded keywords for a topic
-manas trace "Rust ownership"
-
-# Show neurons with their source metadata
-manas neurons --all
-
-# Set freshness category
-manas tag "Rust version" --freshness fast
+curl -fsSL https://raw.githubusercontent.com/AarambhDevHub/manas/main/install.sh | sh
 ```
+
+This downloads the latest Linux x86_64 release binary from GitHub Releases and installs it as:
+
+```txt
+/usr/local/bin/manas
+```
+
+Verify:
+
+```bash
+manas --help
+```
+
+### Linux: manual install
+
+```bash
+curl -fsSL https://github.com/AarambhDevHub/manas/releases/latest/download/manas-linux-x86_64.tar.gz -o manas-linux-x86_64.tar.gz
+tar -xzf manas-linux-x86_64.tar.gz
+chmod +x manas-linux-x86_64
+sudo mv manas-linux-x86_64 /usr/local/bin/manas
+manas --help
+```
+
+### macOS: build from source
+
+Manas does not ship a macOS binary yet.
+
+Install Rust first:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Then build Manas:
+
+```bash
+git clone https://github.com/AarambhDevHub/manas.git
+cd manas
+cargo build --workspace --release
+sudo cp target/release/manas /usr/local/bin/manas
+manas --help
+```
+
+### Windows: build from source
+
+Manas does not ship a Windows binary yet.
+
+Install Rust from:
+
+```txt
+https://rustup.rs/
+```
+
+Then in PowerShell:
+
+```powershell
+git clone https://github.com/AarambhDevHub/manas.git
+cd manas
+cargo build --workspace --release
+.\target\release\manas.exe --help
+```
+
+Optional: add `target\release` to PATH or copy `manas.exe` to a folder already in PATH.
+
+### Build from source on Linux
+
+```bash
+git clone https://github.com/AarambhDevHub/manas.git
+cd manas
+cargo build --workspace --release
+sudo cp target/release/manas /usr/local/bin/manas
+manas --help
+```
+
+---
+
+## Quickstart
+
+Create a local teaching file:
+
+```bash
+mkdir -p teach
+
+cat > teach/identity.md <<'EOF'
+Manas is a local-first AI memory system written in Rust.
+Manas learns from text and files.
+Manas stores persistent memory locally.
+Manas is not a ChatGPT clone.
+EOF
+```
+
+Teach Manas:
+
+```bash
+manas teach teach/identity.md --train-transformer
+```
+
+Ask from local memory:
+
+```bash
+manas ask "What is Manas?"
+```
+
+Use local answer mode through query:
+
+```bash
+manas query "What is Manas?" --answer
+```
+
+Inspect local memory:
+
+```bash
+manas inspect --verbose
+```
+
+---
+
+## Local Storage
+
+Manas stores memory locally using sidecar files:
+
+```txt
+brain.manas              -> core neural memory
+brain.manas.seq          -> sequence memory / token transitions
+brain.manas.transformer  -> transformer weights
+brain.manas.langmeta     -> language metadata
+brain.manas.sources      -> AI-ready persisted source memory
+brain.manas.sourceindex  -> token-to-source/chunk inverted index
+```
+
+`brain.manas.sources` is the source of truth for persisted source chunks.
+
+`brain.manas.sourceindex` is a derived cache/index used for faster local retrieval.
 
 ---
 
@@ -88,7 +172,7 @@ Manas is built from 7 Rust crates, each with a single responsibility:
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                         manas-cli                            │
-│   learn | query | ingest | predict-next | generate | ...    │
+│ teach | learn | ingest | train-language | generate | ...      │
 └───────────────────────────┬─────────────────────────────────┘
                             │
           ┌─────────────────┼─────────────────┬───────────────┐
@@ -131,7 +215,7 @@ Manas is built from 7 Rust crates, each with a single responsibility:
 | **manas-memory** | Knowledge preservation — importance scoring, protection levels, compression |
 | **manas-agent** | Internet connection — DuckDuckGo search, HTML scraping, freshness checker |
 | **manas-language** | Next-token prediction — sequence memory, hybrid memory+neural predictor, autoregressive generation, custom transformer block with trainable output head, FFN, and partial attention `w_o`/`w_v`/`w_q`/`w_k` training |
-| **manas-cli** | Command-line interface — 16 commands for all operations |
+| **manas-cli** | Command-line interface — 17 commands for all operations |
 
 ---
 
@@ -205,6 +289,10 @@ Auto-detected from keywords in the text. Stale neurons trigger automatic interne
 ## Current Capabilities
 
 - **Learn from raw text** — tokenizes, embeds, forward pass, backprop, grows neurons as needed
+- **Unified teaching command (v0.9.6)** — `manas teach <INPUT>` teaches direct text, one `.md`/`.txt` file, or a folder through core/source-aware memory, sequence memory, and optional transformer training in one command
+- **Local query answering (v0.9.7)** — `manas ask "question"` answers from taught local `.md`/`.txt` source evidence, shows source paths, and says when there is not enough local memory. `manas query "question" --answer` uses the same local answer path while normal `query` remains unchanged.
+- **AI-ready persistent source memory (v0.9.8)** — `manas teach` writes `brain.manas.sources` with original chunk text, normalized searchable text, token strings, source paths, fingerprints, and metadata. `ask` searches this sidecar first, so source-backed answers can still work after original taught files are moved or deleted.
+- **Source memory inverted index (v0.9.9)** — `manas teach` rebuilds `brain.manas.sourceindex`, a token-to-source/chunk index over `brain.manas.sources`. `ask` and `query --answer` use it for faster candidate retrieval and safely fall back to scanning source memory if the index is missing, corrupt, or stale.
 - **Ingest local files** — 7 format parsers (txt, md, json, html, csv, yaml, toml), folder walker, text chunking
 - **Persist state** — stores vocab, embeddings, neurons, and metadata in a single `.manas` file
 - **Source-aware growth** — grows a dedicated neuron per unique file or URL, retaining provenance
@@ -232,14 +320,18 @@ Auto-detected from keywords in the text. Stale neurons trigger automatic interne
 
 ## Current Limitations
 
-- **Query output is not local-first yet** — currently relies on web search rather than answering from the local network alone
-- **Answer generation is basic** — there is no generative text output; decoded tokens show the closest embeddings
+- **Local answering is intentionally extractive** — `ask` searches persisted source memory first, falls back to taught local `.md`/`.txt` source files when needed, and prefers direct source chunks over free generation
+- **Source memory is intentionally small** — `brain.manas.sources` stores `.md`, `.txt`, and raw-text chunks with token strings, not embeddings, vector indexes, PDFs, DOCX files, or web crawls
+- **Source indexing is local and lexical** — `brain.manas.sourceindex` is a deterministic token-to-source/chunk index, not embeddings, a vector database, or an external search system
+- **Normal query remains the search/retrieval path** — use `ask` or `query --answer` for local source-backed answers
+- **Answer generation is basic** — local answering avoids unsupported claims and says when there is not enough local memory
 - **Next-token prediction is experimental** — v0.2 works for short contexts but is not trained on large corpora; generation quality is limited
 - **Attention is experimental (v0.4/v0.9.5)** — single-head causal attention is implemented with forward-cache, persistence, partial `w_o`/`w_v`/`w_q`/`w_k` training, dedicated safety metrics, and reliability-aware hybrid weighting; multi-head attention, layer norm, and dynamic transformer growth are not implemented
 - **Transformer block is experimental (v0.5+)** — `TinyTransformerBlock` supports trained output-head, FFN, and single-head attention projection training, but it is still a tiny custom research block rather than a full LLM stack
 - **Transformer-assisted prediction is experimental (v0.6-v0.9.5)** — `--use-transformer` uses reliability-aware blending with trained output head, FeedForward layer, and partial attention projection training when available; exact sequence-memory candidates are still protected
 - **Growth control is experimental (v0.7.1)** — `max_new_neurons` cap and first-epoch-only growth help control network explosion; duplicate-text detection via `LanguageMeta` sidecar prevents re-growth on repeated training but is not retroactive
 - **File/chunk learning is experimental** — chunking heuristics and per-chunk learning are still being refined
+- **Teach file support is intentionally small** — `manas teach` supports `.md` and `.txt` files in v0.9.6; use `ingest` for broader parser coverage
 - **One neuron per source is an anchor** — the source neuron acts as a pointer, not a full document understanding
 - **Not production-ready** — this is a research prototype; APIs, storage, and behavior may change
 
@@ -260,6 +352,38 @@ A single file stores the entire brain:
 
 Append-only — new neurons are added without rewriting the whole file. Starts at ~1 KB, grows forever.
 
+Source memory sidecar (v0.9.8):
+
+```txt
+brain.manas.sources      AI-ready persisted source memory for source-backed ask
+```
+
+Source-memory index sidecar (v0.9.9):
+
+```txt
+brain.manas.sourceindex  token-to-source/chunk inverted index for faster local evidence retrieval
+```
+
+Deleted-file source answering:
+
+```bash
+manas teach teach/identity.md --train-transformer
+rm teach/identity.md
+manas ask "What is Manas?"
+```
+
+Expected:
+
+```txt
+Answer
+  Manas is a local-first AI memory system written in Rust.
+
+Sources
+  - teach/identity.md
+```
+
+The sidecar stores original chunk text for answer output plus normalized text and token strings for local retrieval, without adding external embeddings, vector databases, or cloud APIs.
+
 ---
 
 ## CLI Reference
@@ -267,6 +391,9 @@ Append-only — new neurons are added without rewriting the whole file. Starts a
 ```bash
 # Learning
 manas learn "text"                       Learn from raw text
+manas teach "text|path"                  Unified text/file/folder teaching (v0.9.6)
+  --train-transformer                    Also train transformer from taught text
+  --dry-run                              Preview teaching without saving
 manas ingest --file path                  Learn from a file
 manas ingest --folder path                Learn from a folder (recursive)
 manas ingest --url URL                    Learn from a web page
@@ -292,7 +419,14 @@ manas generate "prompt"                  Generate text autoregressively
   --temperature 1.0                      Sampling temperature (reserved)
 
 # Querying
-manas query "question"                    Search web + learn + display results
+manas ask "question"                      Answer from taught local source memory (v0.9.7)
+  --top-k 5                              Number of local evidence snippets to rank
+  --max-answer-tokens 80                 Maximum answer length
+  --hide-sources                         Hide source list
+  --no-generate                          Disable guarded generation fallback
+  --use-transformer                      Allow transformer-backed fallback when evidence exists
+manas query "question"                    Existing search/retrieval behavior
+manas query "question" --answer           Use local answer path from ask
 manas refresh --category cat              Refresh stale knowledge from web
 
 # Inspection
@@ -312,20 +446,37 @@ manas tag "topic" --freshness cat         Set freshness category
 
 ---
 
-## Installation
+## Release
 
-### Prerequisites
+Manas v1.0.0 ships a Linux x86_64 binary through GitHub Releases.
 
-- Rust 2024 edition (Rust 1.85+)
-- Cargo
-
-### Build from source
+Create a release by pushing a version tag:
 
 ```bash
-git clone https://github.com/AarambhDevHub/manas.git
-cd manas
-cargo build --release
-./target/release/manas --help
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+GitHub Actions will build and attach:
+
+```txt
+manas-linux-x86_64.tar.gz
+```
+
+Do not create the release manually.
+
+## Release Checklist
+
+```bash
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build --workspace --release
+
+git checkout main
+git pull origin main
+git tag v1.0.0
+git push origin v1.0.0
 ```
 
 ---

@@ -79,9 +79,11 @@ pub fn compute_gradients(
 
     let output = &cache.layer_outputs[num_layers - 1];
     let mut delta_out = Vec::with_capacity(output_size);
-    for i in 0..output_size {
-        let da = 2.0 * (output[i] - target[i]) / output_size as f32;
-        let last_layer = &network.layers[num_layers - 1];
+    let last_layer = &network.layers[num_layers - 1];
+
+    for (i, output_value) in output.iter().enumerate() {
+        let target_value = target.get(i).copied().unwrap_or(0.0);
+        let da = 2.0 * (*output_value - target_value) / output_size.max(1) as f32;
         let act = last_layer.neurons[i].activation;
         delta_out.push(da * act.derivative(cache.pre_activations[num_layers - 1][i]));
     }
@@ -115,16 +117,19 @@ pub fn compute_gradients(
         let layer_delta = &deltas[num_layers - 1 - l];
 
         for (i, neuron) in layer.neurons.iter().enumerate() {
+            let delta_i = layer_delta.get(i).copied().unwrap_or(0.0);
+
             let mut weight_delta = Vec::with_capacity(neuron.weights.len());
             for j in 0..neuron.weights.len() {
                 let g = if j < input_a.len() {
-                    layer_delta[i] * input_a[j]
+                    delta_i * input_a[j]
                 } else {
                     0.0
                 };
                 weight_delta.push(g);
             }
-            let bias_delta = layer_delta[i];
+
+            let bias_delta = delta_i;
             result.push((
                 neuron.id,
                 NeuronGradients {

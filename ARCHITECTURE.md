@@ -130,7 +130,8 @@ Input Sources
                              ▼
                    ┌────────────────┐
                    │  manas-store   │  ← custom .manas binary + .manas.seq,
-                   │  (.manas file, │     .manas.transformer, .manas.langmeta
+                   │  (.manas file, │     .manas.transformer, .manas.langmeta,
+                   │                │     .manas.sources, .manas.sourceindex
                    │   read/write,  │     append-only growth
                    │   append)      │     full neuron metadata
                    └────────────────┘
@@ -196,7 +197,7 @@ Input Sources
 │                   │ • .manas.langmeta I/O                 │             │
 │                   └──────────────────────────────────────┘             │
 │                                      │                                 │
-│         [brain.manas + brain.manas.seq + brain.manas.transformer + brain.manas.langmeta]                │
+│         [brain.manas + brain.manas.seq + brain.manas.transformer + brain.manas.langmeta + sources + index]│
 │                    starts: ~1 KB                                       │
 │                    grows:  incrementally                               │
 └────────────────────────────────────────────────────────────────────────┘
@@ -789,7 +790,7 @@ impl FreshnessChecker {
 
 ### 6.7 `manas-cli`
 
-The command line interface. The entry point for all user interaction.
+The command line interface. The entry point for all user interaction. `teach` is the high-level local teaching path, and `ask` is the local source-backed answering path. `learn`, `ingest`, and `train-language` remain lower-level commands for direct core memory, source-aware ingestion, and language/transformer training. Normal `query` behavior remains the existing retrieval/search flow unless `--answer` routes it into the same local answer helper as `ask`.
 
 Full CLI reference is in [Section 17](#17-cli-reference).
 
@@ -797,7 +798,7 @@ Full CLI reference is in [Section 17](#17-cli-reference).
 
 ### 6.8 `manas-language`
 
-The language modeling crate. Provides next-token prediction, a transition-count sequence memory, a hybrid memory+neural predictor, autoregressive text generation, and a small custom transformer path with trained output-head, FFN, and partial attention output/value projection training.
+The language modeling crate. Provides next-token prediction, a transition-count sequence memory, a hybrid memory+neural predictor, autoregressive text generation, and a small custom transformer path with trained output-head, FFN, partial attention `w_o`/`w_v`/`w_q`/`w_k` projection training, and reliability-aware hybrid score weighting.
 
 #### Key Components
 
@@ -909,6 +910,14 @@ inputs
 **v0.9.4** — attention training safety and observability were tightened without changing training math, scoring weights, generation behavior, model dimensions, or sidecar version. `AttentionTrainStepReport` now records attempted updates and pre-clip gradient norms consistently for `w_o`, `w_v`, and `w_q/w_k`. `TransformerTrainReport` adds attention-specific attempts/applied/clipped/invalid counters plus max/avg attention gradient norms, while global safety counters remain unchanged and are not double-counted. The CLI prints a compact "Attention safety" block. `TransformerLanguageModel::save_to_file()` refuses non-finite transformer models, assisted and transformer-only prediction filter non-finite scores before sorting, and rollback on serious instability restores the output head, FFN, all attention projections, `ffn_trained`, `attention_trained`, and the projection bitmask. Inspect remains conservative: `Attention trained : partial` and `Attention projections : o,v,q,k`.
 
 **v0.9.5** — transformer-assisted prediction now uses reliability-aware score weighting instead of the old fixed 0.25/0.40 blend. `TransformerPredictor` carries runtime metadata copied from `TransformerLanguageModel`: `ffn_trained`, `attention_projection_mask`, and `model_finite`. The base transformer weight is `0.15` for untrained cosine fallback, `0.30` for output-head-only, `0.35` for output head + FFN, `0.45` for attention `o`, `0.50` for attention `o,v`, and `0.55` for attention `o,v,q,k`. A simple confidence factor reduces transformer influence when top probability or top-1/top-2 margin is weak. Strong base-memory candidates cap transformer influence, learned sequence-memory candidates use a stricter cap to preserve exact transitions, and non-finite transformer state falls back to base memory/neural scores. `--transformer-only` remains pure transformer output. No tokenizer, sequence memory format, persistence format, sidecar version, training math, attention architecture, CLI default, or generation CLI behavior changes are included.
+
+**v0.9.6** — `manas teach <INPUT>` unifies local teaching UX without changing the underlying learning systems. Direct text teaching learns core memory and trains sequence memory; file/folder teaching preserves source paths while teaching core/source-aware memory, sequence memory, and optional transformer weights. The command supports `.md` and `.txt` files, recursively teaches folders with deterministic ordering, skips unsupported or empty files safely, and provides `--dry-run` without writing brain or sidecar files. Existing `learn`, `ingest`, and `train-language` commands remain available as lower-level controls. No tokenizer, sequence-memory format, transformer sidecar version, transformer dimensions, training math, scoring weight, attention architecture, generation behavior, or dependency change is included.
+
+**v0.9.7** — `manas ask "question"` adds local-first answering from taught source memory. The answer path loads the local brain, collects `Source::LocalFile` paths from neurons, re-reads existing `.md` and `.txt` files, splits them into deterministic sentence snippets, ranks snippets by local token overlap and source metadata, and returns a short extracted answer with source paths. If evidence is weak it reports related local memory without answering confidently; if evidence is missing it says there is not enough local memory. `manas query "question" --answer` uses the same helper, while normal `query` remains unchanged. No internet, cloud API, external embedding service, transformer sidecar change, tokenizer change, training math change, scoring-weight change, or teach behavior change is included.
+
+**v0.9.8** — `brain.manas.sources` is an AI-ready persistent source-memory sidecar. It stores original chunk text for answer output, normalized searchable text for ranking, token strings for local retrieval, source paths or raw labels for display, stable fingerprints for dedup/update behavior, and source/chunk metadata. `teach` populates this sidecar while continuing the existing core memory, sequence memory, and optional transformer training path. `ask` and `query --answer` search persisted source memory first, rank with normalized text/tokens, output answers from original chunk text, and only fall back to original file paths when the sidecar is missing or incomplete. This is not a vector database, embedding store, external LLM integration, tokenizer change, transformer sidecar change, or teach/ask UX change.
+
+**v0.9.9** — `brain.manas.sourceindex` adds a local token-to-source/chunk inverted index over `brain.manas.sources`. The index lets `ask` and `query --answer` collect candidate evidence chunks quickly, rank top-k evidence with token overlap and source metadata, detect stale chunks, and safely fall back to scanning `brain.manas.sources` if the index is missing, corrupt, or stale. It does not add vector databases, external embeddings, cloud APIs, tokenizer changes, transformer architecture changes, training math changes, or changes to normal `query` behavior.
 
 #### Single-Head Causal Attention (v0.4)
 
@@ -1351,7 +1360,72 @@ manas-store:
   append new neurons OR update existing neurons in .manas file
 ```
 
-### Answering a query
+### Answering from local source memory
+
+```
+manas ask "What is Manas?"
+          │
+          ▼
+manas-cli:
+  load local brain → collect Source::LocalFile paths from neurons
+          │
+          ▼
+local source reader:
+  use brain.manas.sourceindex when available and fresh
+  search brain.manas.sources first
+  fallback to existing .md/.txt files when needed
+          │
+          ▼
+local ranker:
+  score snippets by normalized text/tokens + source metadata tie-breakers
+          │
+          ▼
+answer composer:
+  high-confidence chunk text → short extracted answer + source paths
+  weak/no evidence → conservative no-answer message
+```
+
+This path is local-only. It does not construct the agent search pipeline, call web search, use hosted LLM APIs, or use external embedding services.
+
+Stable v1.0 local memory flow:
+
+```txt
+teach file/text/folder
+  -> core memory
+  -> sequence memory
+  -> transformer memory
+  -> split into chunks
+  -> store original chunk text
+  -> store normalized searchable text
+  -> store token strings
+  -> store source path/label + stable fingerprints
+  -> rebuild source index
+
+ask / query --answer
+  -> source index first
+  -> source memory scan fallback
+  -> original file fallback
+  -> no-answer if no evidence
+  -> output answer using original chunk text
+  -> show stored source path
+```
+
+Stable v1.0 storage layout:
+
+```txt
+brain.manas              -> core neural memory
+brain.manas.seq          -> sequence memory / token transitions
+brain.manas.transformer  -> transformer weights
+brain.manas.langmeta     -> language metadata
+brain.manas.sources      -> AI-ready persisted source memory
+brain.manas.sourceindex  -> token-to-source/chunk inverted index
+```
+
+`brain.manas.sources` is the source of truth for persisted source chunks. It stores original chunk text for answer output, normalized searchable text, token strings, source paths, fingerprints, and metadata.
+
+`brain.manas.sourceindex` is a derived cache/index. It maps source-memory tokens to source/chunk references for faster local retrieval and can be rebuilt from `brain.manas.sources`.
+
+### Existing query/search path
 
 ```
 manas query "What is ownership in Rust?"
@@ -1485,6 +1559,11 @@ No panics in library code. The CLI converts errors to user-friendly messages.
 | M24 | **Attention query/key projection training (v0.9.3)** — `train_query_key_projection_step()`, causal final-token softmax gradient, combined Q/K clipping, finite-difference tests, partial `o,v,q,k` inspect/report status | `manas-language`, `manas-cli` | Attention routing starts learning |
 | M25 | **Attention safety and metrics cleanup (v0.9.4)** — attention-specific safety counters, finite save guard, non-finite prediction-score filtering, rollback of output head/FFN/attention flags and projections, stable `o,v,q,k` reporting | `manas-language`, `manas-cli` | Attention training is safer and easier to debug |
 | M26 | **Reliability-aware transformer score weighting (v0.9.5)** — runtime reliability metadata, trained-projection weight tiers, confidence factor, sequence-memory cap, non-finite fallback to base scores, deterministic score sorting | `manas-language` | Transformer influence grows only when reliable |
+| M27 | **Unified teaching command (v0.9.6)** — `manas teach <INPUT>` orchestrates core/source-aware memory, sequence memory, optional transformer training, `.md`/`.txt` folder teaching, and dry-run reporting | `manas-cli` | One command teaches text, files, and folders |
+| M28 | **Local query answering (v0.9.7)** — `manas ask`, `query --answer`, local `.md`/`.txt` source snippet ranking, extracted answers, source display, and no-evidence fallback | `manas-cli` | Questions can be answered from taught local source memory |
+| M29 | **AI-ready persistent source memory (v0.9.8)** — `brain.manas.sources`, original chunk text, normalized text, token strings, source paths, fingerprints, and sidecar-first answer retrieval | `manas-cli` | Answers survive moved/deleted source files and retrieval has structured local evidence |
+| M30 | **Source memory ranking + inverted index (v0.9.9)** — `brain.manas.sourceindex`, token-to-source/chunk lookup, top-k evidence ranking, stale chunk detection, and scan fallback | `manas-cli` | Source-backed answers stay fast and reliable as taught chunks grow |
+| M31 | **Stable Local AI Memory Release (v1.0)** — stable `teach`/`ask`/`query --answer`, source memory/index fallback, storage docs, Linux release binary, install script, and tag-based GitHub release automation | docs, release automation | First stable local AI memory release |
 
 ---
 
@@ -1495,6 +1574,11 @@ No panics in library code. The CLI converts errors to user-friendly messages.
 
 # Learn from raw text
 manas learn "Rust is a systems programming language"
+
+# Unified local teaching: core memory + sequence memory + optional transformer
+manas teach "Manas is a local-first AI memory system"
+manas teach ./notes.md --train-transformer
+manas teach ./my-notes/ --dry-run
 
 # Learn from a file
 manas ingest --file ./notes.md
@@ -1534,8 +1618,15 @@ manas generate "Rust is a" --use-transformer --max-tokens 10
 
 # ── QUERYING ──────────────────────────────────────────────────────
 
-# Ask a question
+# Answer from taught local source memory
+manas ask "What is Manas?"
+manas ask "What is Manas?" --top-k 5 --max-answer-tokens 80
+
+# Existing retrieval/search query
 manas query "What is ownership in Rust?"
+
+# Compatibility: use local answer path through query
+manas query "What is Manas?" --answer
 
 # Ask with forced freshness check
 manas query "Latest Rust version" --refresh
@@ -1597,6 +1688,7 @@ manas inspect
 #   Sequence file       : 1,245,312  (1.19 MB)
 #   Transformer file    : 3,201,792  (3.05 MB)
 #   Language metadata   : 164,352    (160.50 KB)
+#   Source memory       : 28,672     (28.00 KB)
 #   Total storage       : 14,048,640 (13.40 MB)
 #
 #  Total

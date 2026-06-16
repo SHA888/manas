@@ -28,6 +28,13 @@ Manas is **not** trying to replace large hosted LLMs. It is a learning and resea
 | v0.9.3 | Train attention query/key projections w_q + w_k | Done |
 | v0.9.4 | Attention training safety and metrics cleanup | Done |
 | v0.9.5 | Reliability-aware transformer score weighting | Done |
+| v0.9.6 | Unified teaching command | Done |
+| v0.9.7 | Local query answering | Done |
+| v0.9.8 | AI-ready persistent source memory | Done |
+| v0.9.9 | Source memory ranking + inverted index | Done |
+| v1.0.0 | Stable local AI memory release | Done |
+| v1.0.1 | Backprop stability + teach data refresh | Done |
+| v1.1.0 | Transformer answer fallback for learned reasoning | Planned |
 
 ## Completed Milestones
 
@@ -481,99 +488,29 @@ Goal achieved:
 
 ---
 
-## Next Milestones
+### v0.9.6 — Unified Teaching Command
 
-Add a future roadmap milestone after v0.9.5:
+Manas now has one high-level local teaching command for text, files, and folders.
 
----
+Completed:
 
-## v0.9.6 — Unified Teaching Command
+- `manas teach <INPUT>` accepts direct text, one file, or a folder
+- Direct text teaching learns into core memory, trains sequence memory, and optionally trains the transformer
+- File teaching preserves `Source::LocalFile` metadata, teaches core/source-aware memory, trains sequence memory, and optionally trains the transformer
+- Folder teaching recursively teaches supported local files with deterministic ordering
+- Supported v0.9.6 file types are intentionally limited to `.md` and `.txt`
+- Unsupported and empty files are skipped safely in folder mode
+- `--dry-run` reports what would be taught without writing `brain.manas`, `.seq`, `.transformer`, or `.langmeta`
+- `teach` reuses the existing learning, sequence-memory, and transformer-training paths
+- Existing `learn`, `ingest`, `train-language`, `predict-next`, `generate`, and `inspect` commands remain available
+- No tokenizer change, sequence memory format change, transformer dimension change, transformer sidecar version bump, training math change, attention architecture change, generation behavior change, scoring-weight change, or dependency change
 
-### Goal
-
-Manas currently has multiple learning commands:
-
-```txt
-learn
-ingest
-train-language
-```
-
-This is powerful but not ideal for normal users because teaching a file/folder requires multiple commands.
-
-Add a unified command:
-
-```bash
-manas teach <PATH_OR_TEXT>
-```
-
-The command should support:
+Examples:
 
 ```bash
 manas teach "Manas is a local-first AI memory system"
 manas teach teach/identity.md
-manas teach teach/
-```
-
-### Behavior
-
-For text input:
-
-```bash
-manas teach "Manas is written in Rust" --train-transformer
-```
-
-It should:
-
-* learn text into core memory
-* train language memory
-* train transformer if `--train-transformer` is passed
-
-For file input:
-
-```bash
-manas teach teach/identity.md --train-transformer
-```
-
-It should:
-
-* ingest the file into source-aware memory
-* extract readable text from the file
-* train language memory from that text
-* train transformer if enabled
-* preserve source path metadata
-
-For folder input:
-
-```bash
 manas teach teach/ --train-transformer
-```
-
-It should:
-
-* recursively read supported files
-* ingest each file
-* train language memory from each file
-* train transformer from each file
-* preserve per-file source metadata
-* show a summary report
-
-### Supported file types
-
-Start simple:
-
-```txt
-.md
-.txt
-```
-
-Do not add PDF/DOCX yet.
-
-### CLI flags
-
-Suggested flags:
-
-```bash
 manas teach <INPUT> \
   --max-context 5 \
   --epochs 100 \
@@ -582,32 +519,31 @@ manas teach <INPUT> \
   --transformer-learning-rate 0.05
 ```
 
-Optional:
+Report shape:
 
-```bash
---recursive
---include "*.md"
---dry-run
-```
-
-### Output report
-
-Example:
-
-```txt
+```text
 Teaching complete
 
+Input
+  mode                  : folder
+  files discovered      : 3
+  files taught          : 3
+  files skipped         : 0
+
 Core memory
-  files ingested        : 3
+  source ingest         : yes
   text chunks learned   : 3
   source metadata       : preserved
 
 Language memory
   sequence training     : yes
-  transformer training  : yes
+  max context           : 5
+  epochs                : 100
+  total examples        : ...
   total tokens          : ...
 
 Transformer
+  transformer training  : yes
   output head           : trained
   feed-forward          : trained
   attention             : partial
@@ -619,125 +555,494 @@ Safety
   rolled back           : no
 ```
 
-### Strict rules
+Goal achieved:
 
-Do not remove existing commands.
+> Teaching a local text, markdown file, text file, or folder no longer requires separate `ingest` and `train-language` commands.
 
-Keep these working:
+---
+
+### v0.9.7 — Local Query Answering
+
+Manas can now answer simple questions from its own taught local source memory.
+
+Completed:
+
+- `manas ask "question"` answers from local `.md` and `.txt` source evidence
+- `manas query "question" --answer` routes through the same local answer path
+- Normal `query` behavior remains unchanged unless `--answer` is passed
+- Local source paths are collected from `Source::LocalFile` metadata stored on neurons
+- Existing local source files are re-read, split into deterministic sentence snippets, ranked locally, and used for short extracted answers
+- Answers display source paths by default
+- Weak evidence reports related local sources without making an unsupported claim
+- Missing evidence prints `Not enough local memory to answer this yet.`
+- The answer path does not construct the agent search pipeline, call the internet, use cloud APIs, use external embeddings, or add ML dependencies
+- No transformer dimension change, sidecar version bump, tokenizer change, training math change, attention architecture change, scoring-weight change, or `teach` behavior change
+
+Example:
+
+```bash
+manas teach teach/identity.md --train-transformer
+manas ask "What is Manas?"
+manas query "What is Manas?" --answer
+```
+
+Goal achieved:
+
+> Let Manas answer simple questions from taught local files with visible local sources.
+
+---
+
+### v0.9.8 — AI-Ready Persistent Source Memory
+
+Manas now persists taught local source knowledge into an AI-ready sidecar so `ask` can answer from taught evidence even when the original file is moved or deleted.
+
+Proposed sidecar:
 
 ```txt
-learn
-ingest
-train-language
-predict-next
-generate
+brain.manas.sources
 ```
 
-`teach` is a higher-level convenience command built on top of existing logic.
+This is not only copied raw text. It preserves source chunks in a structure useful for both human-readable answers and local AI/search/retrieval.
 
-Do not change transformer math.
+### Why It Was Needed
 
-Do not change tokenizer.
+Current v0.9.7 behavior:
 
-Do not change generation behavior.
-
-Do not change sidecar version.
-
-### Tests
-
-Add tests for:
-
-* teaching direct text
-* teaching one `.md` file
-* teaching one `.txt` file
-* teaching folder with multiple files
-* unsupported files are skipped safely
-* source metadata is preserved
-* language memory is trained
-* transformer training works from file text
-* predictions work after teaching file
-* dry-run does not mutate brain
-* old commands still work
-
-### Example validation
-
-Create:
-
-```bash
-mkdir -p teach
-cat > teach/identity.md <<'EOF'
-Manas is a local-first AI memory system written in Rust.
-Manas learns from text and files.
-Manas stores persistent memory in a .manas brain file.
-Manas uses custom transformer training.
-Manas is not a ChatGPT clone.
-EOF
+```txt
+manas teach teach/identity.md
+-> stores source path
+-> trains core memory, sequence memory, transformer
+-> ask reads teach/identity.md again for source-backed answer
 ```
 
-Run:
+This means source-backed answering still depends on the original local file remaining readable:
 
 ```bash
-./target/release/manas teach teach/identity.md \
-  --max-context 5 \
-  --epochs 100 \
-  --learning-rate 0.05 \
-  --train-transformer \
-  --transformer-learning-rate 0.05
+rm teach/identity.md
+manas ask "What is Manas?"
 ```
 
-Then test:
+In that case, Manas may not have enough local source text to answer because `.manas` stores core memory and source metadata, not the full original source chunks.
+
+Raw text alone was also not enough for the local answer path. Manas now persists each chunk with cleaned searchable text and token strings so local ranking can use the sidecar directly without reparsing source files.
+
+### Behavior
+
+```txt
+manas teach teach/identity.md
+-> stores AI-ready chunks from identity.md into brain.manas.sources
+-> trains core memory, sequence memory, transformer
+-> ask searches brain.manas.sources first
+-> original file can be deleted or moved and answer still works
+```
+
+Example:
 
 ```bash
-./target/release/manas predict-next "Manas is" --use-transformer --max-context 5 --top-k 5
-./target/release/manas generate "Manas is" --use-transformer --max-context 5 --max-tokens 30
-./target/release/manas inspect --verbose
+manas teach teach/identity.md --train-transformer
+rm teach/identity.md
+manas ask "What is Manas?"
 ```
 
 Expected:
 
 ```txt
-Manas is -> a / local-first
-generate -> manas is a local-first ai memory system written in rust
+Answer
+  Manas is a local-first AI memory system written in Rust.
+
+Sources
+  - teach/identity.md
 ```
 
-### Milestone name
+### Source Memory Scope
+
+Each stored source entry keeps enough structured local evidence for retrieval, ranking, answer output, and source display:
 
 ```txt
-v0.9.6 — Unified Teaching Command
+source entry:
+  source_id
+  source_kind: file/raw
+  source_path or label
+  file_type: md/txt/raw
+  fingerprint
+  created_at/updated_at if available
+  chunks[]
+
+chunk:
+  chunk_id
+  chunk_text
+  normalized_text
+  tokens: Vec<String>
+  chunk_fingerprint
 ```
 
+Multiple taught files accumulate in the same sidecar:
+
+```txt
+Source: teach/identity.md
+  chunk_text: Manas is a local-first AI memory system written in Rust.
+  normalized_text: manas is a local first ai memory system written in rust
+  tokens: ["manas", "local", "first", "ai", "memory", "system", "rust"]
+
+Source: docs/base.md
+  chunk_text: ...
+  normalized_text: ...
+  tokens: [...]
+
+Source: notes/project.txt
+  chunk_text: ...
+  normalized_text: ...
+  tokens: [...]
+```
+
+New teaching appends or updates source entries without deleting unrelated older sources.
+
+### Repeated Teaching
+
+Repeated teaching uses stable deterministic FNV-1a fingerprinting:
+
+```txt
+same file + same content     -> do not duplicate chunks
+same file + changed content  -> update that source entry safely
+new file                     -> add new source entry
+same raw text                -> no duplicate
+different raw text           -> add new raw source entry
+```
+
+### Storage Layout
+
+Local storage:
+
+```txt
+brain.manas              -> core neurons + source metadata
+brain.manas.seq          -> sequence memory / token transitions
+brain.manas.transformer  -> transformer weights
+brain.manas.langmeta     -> language training metadata
+brain.manas.sources      -> AI-ready persisted source memory
+```
+
+`brain.manas.sources` stores original chunk text, normalized searchable text, token strings, source paths, fingerprints, and metadata.
+
+### Ask Behavior
+
+`ask` and `query --answer` prefer persisted source memory:
+
+```txt
+ask question
+-> search AI-ready source memory from brain.manas.sources first
+-> fallback to existing source file path only if needed
+-> answer using original chunk text
+-> show original source path
+```
+
+### Strict Non-Goals Preserved
+
+Do not change:
+
+- Transformer dimensions
+- Transformer sidecar version
+- Tokenizer
+- Training math
+- Attention architecture
+- Scoring weights
+- `teach` UX
+- `ask` UX
+- Normal `query` behavior
+
+Do not add:
+
+- External database
+- Vector database
+- Cloud APIs
+- External embeddings
+- External LLMs
+- External ML frameworks
+- PDF/DOCX support
+- Web crawling
+
+Goal:
+
+> Persist source knowledge in a local AI-ready structure so source-backed answering survives deleted/moved files and can support better local retrieval.
+
 ---
 
-## v1.0 — Stable Mini Local Language Model Release
+### v0.9.9 — Source Memory Ranking + Inverted Index
 
-This is the first stable language milestone.
+v0.9.8 made source memory persistent through `brain.manas.sources`. v0.9.9 added a small local search/ranking layer over persisted source memory so `ask` does not need to rely only on scanning every stored chunk directly as taught files and chunks grow.
 
-### Should Include
+New derived sidecar:
 
-- `train-language`
-- `predict-next`
-- `generate`
-- `--use-transformer`
-- `--train-transformer`
-- Controlled neuron growth
-- Persistent brain + sidecars
-- Better inspect output
-- Transformer output-head training
-- FFN training and partial `w_o`/`w_v` attention training if stable
-- Clean README examples
-- Strong tests
+```txt
+brain.manas.sourceindex
+```
 
-### Honest Claim
+`brain.manas.sources` stores chunks as the source of truth. `brain.manas.sourceindex` maps searchable tokens to source/chunk references so local answering can quickly collect candidate evidence before ranking.
 
-> Manas can locally learn small text sequences and generate text using a custom Rust memory + transformer-assisted language path.
+Example:
 
-### Not a Claim
+```txt
+token: manas
+  -> teach/identity.md chunk 1
+  -> docs/base.md chunk 2
 
-Manas should not claim to be a ChatGPT replacement.
+token: memory
+  -> teach/identity.md chunk 1
+  -> docs/base.md chunk 1
+
+token: rust
+  -> teach/identity.md chunk 1
+```
+
+Storage layout:
+
+```txt
+brain.manas              -> core neurons + source metadata
+brain.manas.seq          -> sequence memory / token transitions
+brain.manas.transformer  -> transformer weights
+brain.manas.langmeta     -> language training metadata
+brain.manas.sources      -> AI-ready persisted source memory
+brain.manas.sourceindex  -> token-to-source/chunk inverted index
+```
+
+Ask/query-answer priority:
+
+```txt
+ask question
+-> use brain.manas.sourceindex if available
+-> retrieve candidate chunks from brain.manas.sources
+-> rank top-k evidence chunks
+-> produce answer from best source-backed evidence
+-> fallback to scanning brain.manas.sources if index is missing/corrupt
+-> fallback to original source files only if needed
+-> return existing no-answer message if no evidence exists
+```
+
+Completed:
+
+- Token-to-chunk inverted index
+- Faster local source retrieval
+- Better ranking using token overlap and source metadata
+- Top-k evidence selection
+- Source confidence score
+- Stale source/chunk detection
+- Full index rebuild after successful `teach`
+- Safe fallback to scanning `brain.manas.sources` if the index is missing or corrupt
+- No behavior change to normal `query`
+
+Strict non-goals:
+
+- No vector database
+- No external embeddings
+- No cloud APIs
+- No external LLMs
+- No external ML frameworks
+- No PDF/DOCX support
+- No web crawling
+- No transformer architecture changes
+- No tokenizer changes
+- No training math changes
+- No `.manas`, `.seq`, `.transformer`, or `.langmeta` format changes
+- No normal `query` behavior changes
+
+Goal achieved:
+
+> Make persisted source-memory retrieval faster and more reliable without leaving the local, custom, small-system design.
 
 ---
 
-## v1.1 — Better Tokenizer, Casing, and Punctuation
+### v1.0 — Stable Local AI Memory Release
+
+This is the first stable local AI memory release milestone. It should stabilize the current local-first workflow rather than add another experimental storage layer or model architecture.
+
+Stable v1.0 workflow:
+
+```txt
+teach -> source memory -> source index -> ask/query --answer
+```
+
+#### Stabilization Goals
+
+- Stable `teach` workflow for text, `.md` files, `.txt` files, and folders
+- Stable `ask` and `query --answer` workflow for local source-backed answers
+- Stable local source memory behavior through `brain.manas.sources`
+- Stable source index fallback behavior through `brain.manas.sourceindex`
+- Clean `inspect --verbose` and `files` output for local storage visibility
+- Clean CLI help output
+- Clean README quickstart
+- Storage layout documentation
+- Manual validation guide
+- Linux x86_64 GitHub release binary
+- One-command Linux install script
+- macOS and Windows source-build instructions
+- GitHub tag-based release automation
+
+#### Release Strategy
+
+v1.0 ships the Linux x86_64 binary release first:
+
+```txt
+manas-linux-x86_64.tar.gz
+```
+
+Linux users can install with the release binary or one-command install script.
+
+macOS and Windows prebuilt binaries are future release improvements. macOS and Windows users can build from source for v1.0.
+
+Future releases may add:
+
+- macOS x86_64 / aarch64 release binaries
+- Windows x86_64 release binary
+- Docker image
+- crates.io publishing
+
+#### Honest Claim
+
+> Manas can teach local text/files/folders into local memory, persist source-backed evidence, build a local source index, and answer simple questions from local evidence without cloud APIs.
+
+#### Not a Claim
+
+Manas should not claim to be a ChatGPT replacement or a general-purpose hosted LLM.
+
+---
+
+### v1.0.1 — Backprop Stability and Teach Data Refresh
+
+This patch release stabilizes training after the larger `teach/` dataset exposed a backpropagation target/output length mismatch.
+
+#### Completed
+
+- Fixed backpropagation panic when the output vector is longer than the target vector
+- Added safe fallback target values for unmatched output neurons
+- Guarded gradient application so missing layer deltas do not panic training
+- Refreshed `teach/identity.md` for Manas v1.0.0+ identity knowledge
+- Refreshed `teach/rules.md` for source memory, source index, fallback, and answering rules
+- Replaced fake/generated `teach/basics.md` examples with clean A-to-Z and basic knowledge examples
+- Replaced the huge repetitive `teach/math.md` addition table with concept-based math teaching data
+- Preserved storage format compatibility
+- Preserved CLI compatibility
+
+#### Goal achieved
+
+> Manas can teach a richer `teach/` folder without crashing from target/output length mismatch, and the default teaching data is cleaner for source-backed local answers.
+
+---
+
+## Next Milestones
+
+### v1.1.0 — Transformer Answer Fallback for Learned Reasoning
+
+The next Manas milestone should make the custom transformer path useful during answering, not only during prediction and generation.
+
+Current `ask` behavior is primarily source-retrieval based:
+
+```txt
+ask question
+-> source index
+-> source memory
+-> original source fallback
+-> no-answer
+```
+
+This works for exact taught facts, but it does not let Manas attempt learned pattern reasoning when an exact source sentence is missing.
+
+Example problem:
+
+```bash
+manas ask "What is 2 + 2?"
+# answers correctly if exact source evidence exists
+
+manas ask "What is 2 + 3?"
+# may retrieve an unrelated counting sentence if exact math evidence is missing
+```
+
+The goal is not to add a hardcoded math evaluator. The goal is to let the local transformer attempt answers from learned patterns when source retrieval cannot find strong evidence.
+
+#### Planned Answer Pipeline
+
+```txt
+ask question
+-> try exact/source-backed retrieval first
+-> if evidence is strong, return source-backed answer
+-> if evidence is weak and the question looks like a learned pattern/reasoning question
+-> build a transformer prompt
+-> generate a local transformer answer
+-> validate the generated answer shape
+-> return transformer answer or fallback to no-answer
+```
+
+#### Planned Transformer Prompt Shape
+
+For learned reasoning questions, Manas can build prompts like:
+
+```txt
+Question: What is 2 + 3?
+Answer:
+```
+
+The transformer should generate a short answer from learned local patterns.
+
+#### Planned Training Data Direction
+
+`teach/math.md` should become a small curriculum for pattern learning, not a hardcoded calculator.
+
+Examples:
+
+```txt
+1 + 1 = 2.
+1 + 2 = 3.
+2 + 1 = 3.
+2 + 2 = 4.
+2 + 3 = 5.
+3 + 2 = 5.
+
+Question: What is 2 + 3?
+Answer: 5.
+
+Question: What is 3 + 2?
+Answer: 5.
+```
+
+The goal is to help the transformer learn arithmetic-like text patterns from examples.
+
+#### Planned Features
+
+- Add transformer answer fallback behind a safe internal path
+- Keep source-backed retrieval as the first priority
+- Add weak-evidence detection before transformer fallback
+- Add short-answer generation mode for `ask`
+- Add answer-shape validation for generated responses
+- Add confidence checks to avoid unsupported hallucination
+- Add no-answer fallback if transformer output is weak or invalid
+- Add tests for transformer fallback routing
+- Add tests proving normal source-backed answering still wins over transformer fallback
+
+#### Non-Goals
+
+Do not add a hardcoded arithmetic evaluator in this milestone.
+
+Do not add external LLMs.
+
+Do not add cloud APIs.
+
+Do not add vector databases.
+
+Do not add external ML frameworks.
+
+Do not claim Manas can do reliable general math yet.
+
+Do not replace source-backed answering with transformer-only answering.
+
+#### Honest Claim
+
+> Manas can attempt learned-pattern answers through its local transformer when exact local source evidence is weak, while still preserving source-backed retrieval as the primary answer path.
+
+#### Goal
+
+> Move Manas from source-only answering toward memory-assisted local transformer answering without adding hardcoded tools or external AI services.
+
+---
+
+### v1.2 — Better Tokenizer, Casing, and Punctuation
 
 Current generation normalizes text heavily.
 
@@ -748,7 +1053,7 @@ Rust is -> rust is
 Ownership -> ownership
 ```
 
-### Planned Improvements
+#### Planned Improvements
 
 - Case preservation
 - Punctuation tokens
@@ -761,24 +1066,24 @@ Ownership -> ownership
   - `<EOS>`
   - `<UNK>`
 
-### Goal
+#### Goal
 
 > Make generated text look more natural and preserve original formatting better.
 
 ---
 
-## v1.2 — Language Training from Files and Folders
+### v1.3 — Language Training from Files and Folders
 
 Add file/folder training for the language model.
 
-### Planned Commands
+#### Planned Commands
 
 ```bash
 manas train-language-file ./docs/rust.md --train-transformer
 manas train-language-folder ./docs --train-transformer
 ```
 
-### Goals
+#### Goals
 
 - Train language sequences from real documents
 - Preserve source metadata
@@ -788,11 +1093,11 @@ manas train-language-folder ./docs --train-transformer
 
 ---
 
-## v1.3 — Retrieval + Generation with Sources
+### v1.4 — Retrieval + Generation with Sources
 
 This milestone connects Manas memory and language generation.
 
-### Planned Pipeline
+#### Planned Pipeline
 
 ```text
 user question
@@ -802,7 +1107,7 @@ user question
 -> show source information
 ```
 
-### Goals
+#### Goals
 
 - Use local learned knowledge during answers
 - Show where answer knowledge came from
@@ -811,11 +1116,11 @@ user question
 
 ---
 
-## v1.4 — Dynamic Transformer Growth
+### v1.5 — Dynamic Transformer Growth
 
 This is one of the most important long-term Manas ideas.
 
-### Planned Growth Behaviors
+#### Planned Growth Behaviors
 
 - If loss stays high, grow FFN hidden dimension
 - If a new topic/source appears, add specialized memory neurons
@@ -823,17 +1128,17 @@ This is one of the most important long-term Manas ideas.
 - If confidence is low, later add another attention head
 - If repeated training is stable, avoid unnecessary growth
 
-### Goal
+#### Goal
 
 > Make Manas a controlled self-growing transformer-style local AI system.
 
 ---
 
-## v1.5 — Benchmarks, Tests, Docs, and Demo Scripts
+### v1.6 — Benchmarks, Tests, Docs, and Demo Scripts
 
 Add stronger project quality before larger releases.
 
-### Planned Work
+#### Planned Work
 
 - Accuracy tests
 - Generation quality tests
@@ -847,13 +1152,13 @@ Add stronger project quality before larger releases.
 - Architecture diagrams
 - Example datasets
 
-### Goal
+#### Goal
 
 > Make Manas easier to test, explain, benchmark, and demonstrate.
 
-## Long-Term Direction
+### Long-Term Direction
 
-After v1.5, possible future directions:
+After v1.6, possible future directions:
 
 - Multi-head attention
 - Multiple transformer blocks
@@ -882,5 +1187,13 @@ Manas should continue following these principles:
 The next coding milestone is:
 
 ```text
-v0.9.6 — Unified Teaching Command
+v1.1.0 — Transformer Answer Fallback for Learned Reasoning
 ```
+
+Immediate focus:
+
+- Keep source-backed retrieval as the first answer path
+- Add transformer fallback only when source evidence is weak
+- Use learned examples in `teach/math.md` as a curriculum
+- Avoid hardcoded arithmetic evaluators for now
+- Keep no-answer fallback when transformer output is weak
